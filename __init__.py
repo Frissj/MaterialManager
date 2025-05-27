@@ -2139,7 +2139,6 @@ class MATERIALLIST_OT_rename_material(Operator):
     bl_label = "Rename Material"
     bl_description = "Rename the display name of the selected material (stored in database)"
     bl_options = {'REGISTER', 'UNDO'}
-
     new_name: StringProperty(name="New Name", default="")
 
     def execute(self, context):
@@ -2153,7 +2152,7 @@ class MATERIALLIST_OT_rename_material(Operator):
 
         selected_list_item = scene.material_list_items[idx]
         primary_material_uuid = selected_list_item.material_uuid # UUID of the material user wants to rename
-
+        
         # Get the actual material object for the primary rename
         # It's important to use get_material_by_uuid as the datablock name might not be the UUID
         primary_mat_obj = get_material_by_uuid(primary_material_uuid)
@@ -2178,56 +2177,20 @@ class MATERIALLIST_OT_rename_material(Operator):
             scene.material_list_active_index = idx
             return {'FINISHED'}
 
-        # --- Start DB and Propagation Logic ---
+        # --- Start DB Update Logic for the selected material ---
         needs_db_names_save = False # Flag to track if material_names DB needs to be saved
 
         # 1. Update the primary material's display name in the material_names dictionary (in-memory)
         print(f"[Rename DB] Updating display name for primary UUID {primary_material_uuid} from '{current_primary_display_name}' to '{new_display_name_str}'")
         material_names[primary_material_uuid] = new_display_name_str
         needs_db_names_save = True
-
-        # 2. Propagation Logic:
-        #    If Material B is renamed, and Material A has the same content hash as Material B,
-        #    Material A's display name in the database should also be updated.
-        print(f"[Rename DB] Attempting to propagate rename of '{current_primary_display_name}' -> '{new_display_name_str}' to content-identical materials.")
         
-        # Get the content hash of the (now conceptually renamed) primary material.
-        # Force recalculation (force=True) to ensure we are comparing its absolute current state,
-        # bypassing any cache that might not reflect an immediate preceding change if one occurred.
-        hash_of_primary_mat = get_material_hash(primary_mat_obj, force=True) 
-        propagated_count = 0
+        # 2. Propagation Logic has been REMOVED as per your request.
+        #    The display name change will now only apply to the selected material's UUID.
 
-        if hash_of_primary_mat:
-            # Iterate through all materials currently in bpy.data.materials
-            for other_mat_obj in bpy.data.materials:
-                if not other_mat_obj or other_mat_obj == primary_mat_obj: # Skip if invalid or the same as the primary material
-                    continue
+        # --- End DB Update Logic ---
 
-                other_material_uuid = get_material_uuid(other_mat_obj) # Get (or create) UUID for the "other" material
-                if not other_material_uuid:
-                    # print(f"[Rename DB Propagate] Skipping '{other_mat_obj.name}': Could not get its UUID.")
-                    continue
-
-                # Get the content hash of this "other" material, force recalculation for accurate comparison
-                hash_of_other_mat = get_material_hash(other_mat_obj, force=True)
-
-                if hash_of_other_mat == hash_of_primary_mat:
-                    # This other_mat_obj is content-identical to the primary_mat_obj
-                    current_other_display_name = material_names.get(other_material_uuid) # Get current display name of "other" material from DB
-                    
-                    # If its current display name in the database is different from the new name, update it
-                    if current_other_display_name != new_display_name_str:
-                        print(f"[Rename DB Propagate]   Propagating to UUID {other_material_uuid} ('{other_mat_obj.name}', current display: '{current_other_display_name}'). New display: '{new_display_name_str}'")
-                        material_names[other_material_uuid] = new_display_name_str # Update in-memory dict
-                        needs_db_names_save = True # Mark that DB save is needed due to this change
-                        propagated_count += 1
-        else:
-            # This case should be rare if primary_mat_obj is valid, but good to log.
-            print(f"[Rename DB] Warning: Could not get content hash for primary material '{primary_mat_obj.name}' (UUID: {primary_material_uuid}). Cannot propagate rename.")
-        
-        # --- End Propagation Logic ---
-
-        # 3. Save material_names to DB if any changes were made (either primary or propagated)
+        # 3. Save material_names to DB if any changes were made (primary name was changed)
         if needs_db_names_save:
             print("[Rename DB] Saving updated material display names to database.")
             save_material_names() # This saves the entire material_names dictionary
@@ -2235,13 +2198,11 @@ class MATERIALLIST_OT_rename_material(Operator):
         # 4. Clear display name cache and refresh UI list to reflect all changes
         _display_name_cache.clear()
         populate_material_list(scene) # This will rebuild the list items based on new names from material_names
-
+        
         # 5. Report results to the user
-        report_message = f"Updated display name to '{new_display_name_str}'."
-        if propagated_count > 0:
-            report_message += f" Propagated to {propagated_count} other content-identical material(s)."
+        report_message = f"Updated display name for selected material to '{new_display_name_str}'."
         self.report({'INFO'}, report_message)
-
+        
         # Try to find the originally selected (primary) material in the newly populated list and select it
         new_idx_for_primary = -1
         for i, current_list_item_iter in enumerate(scene.material_list_items):
@@ -2254,8 +2215,6 @@ class MATERIALLIST_OT_rename_material(Operator):
             print(f"[Rename DB] Reselected primary renamed item '{new_display_name_str}' at new index {new_idx_for_primary}.")
         else:
             # Fallback if the primary item (somehow) isn't found after refresh.
-            # This might happen if the material was deleted between selection and execution,
-            # though the initial check for primary_mat_obj should catch that.
             print(f"[Rename DB] Warning: Could not find primary item with UUID {primary_material_uuid} after renaming and list refresh. List may have changed significantly.")
             scene.material_list_active_index = 0 if len(scene.material_list_items) > 0 else -1
             
@@ -2265,6 +2224,7 @@ class MATERIALLIST_OT_rename_material(Operator):
         scene = context.scene
         idx = scene.material_list_active_index
         self.new_name = "" # Default to empty for the dialog
+
         if 0 <= idx < len(scene.material_list_items):
             item = scene.material_list_items[idx]
             # It's better to get the material object and then its display name
@@ -2277,7 +2237,6 @@ class MATERIALLIST_OT_rename_material(Operator):
         
         wm = context.window_manager
         return wm.invoke_props_dialog(self)
-
 class MATERIALLIST_OT_duplicate_material(Operator):
     """Duplicate selected material as a new local material.
 If original is from library, it's made local in the current file.
@@ -4904,29 +4863,14 @@ class MATERIALLIST_PT_panel(Panel):
         row.label(text=f"{scene.workspace_mode}")
         
         workspace_box.operator("materiallist.toggle_workspace_mode", text=f"Switch to {'Editing' if scene.workspace_mode == 'REFERENCE' else 'Reference'}")
-
-        # Duplicate Name Warning Banner
-        if 0 <= scene.material_list_active_index < len(scene.material_list_items):
-            active_list_item = scene.material_list_items[scene.material_list_active_index]
-            name_to_check = active_list_item.original_name # Using the original_name field as requested
-            
-            if not name_to_check.startswith("mat_") and name_to_check != "Material":
-                duplicate_original_name_count = 0
-                for other_item in scene.material_list_items:
-                    if other_item.original_name == name_to_check:
-                        duplicate_original_name_count += 1
-                
-                if duplicate_original_name_count > 1:
-                    warning_box = workspace_box.box() # Add to the same box or a new one
-                    warning_row = warning_box.row(align=True)
-                    warning_row.label(text=f"Warning: Original name '{name_to_check}' is used by {duplicate_original_name_count} materials!", icon='ERROR')
-
+        
+        # Duplicate Name Warning Banner was previously here. It has been moved.
 
         options_box = layout.box()
         options_box.label(text="Material Options", icon='TOOL_SETTINGS')
         row = options_box.row(align=True)
         row.operator("materiallist.rename_to_albedo", text="Rename All to Albedo", icon='FILE_REFRESH')
-        row.operator("materiallist.duplicate_material", text="Duplicate Selected", icon='DUPLICATE') # New Button
+        row.operator("materiallist.duplicate_material", text="Duplicate Selected", icon='DUPLICATE')
         
         row = options_box.row(align=True)
         row.prop(scene, "hide_mat_materials", toggle=True, text="Hide mat_ Materials")
@@ -4936,7 +4880,8 @@ class MATERIALLIST_PT_panel(Panel):
         row.operator("materiallist.rename_material", icon='FONT_DATA', text="Rename Display Name")
         row.operator("materiallist.unassign_mat", icon='PANEL_CLOSE', text="Unassign 'mat_'")
         
-        if (scene.material_list_active_index >= 0 and scene.material_list_active_index < len(scene.material_list_items)):
+        if (scene.material_list_active_index >= 0 and
+                scene.material_list_active_index < len(scene.material_list_items)):
             list_item = scene.material_list_items[scene.material_list_active_index]
             mat = bpy.data.materials.get(list_item.material_uuid) # Use UUID to get material
             if mat and mat.library:
@@ -4952,32 +4897,59 @@ class MATERIALLIST_PT_panel(Panel):
         assign_box.operator("materiallist.assign_selected_material", icon='BRUSH_DATA', text="Assign Selected to Faces/Object")
         assign_box.operator("materiallist.select_dominant", text="Select Dominant Material on Active Object")
 
+        # --- NEW LOCATION FOR DUPLICATE NAME WARNING BANNER ---
+        # Check if an item is selected and if a warning is needed
+        if 0 <= scene.material_list_active_index < len(scene.material_list_items):
+            active_list_item = scene.material_list_items[scene.material_list_active_index]
+            name_to_check = active_list_item.original_name # Using the original_name field from the list item
+            
+            # Conditions for checking: not a "mat_" prefixed name and not the default "Material" name
+            if not name_to_check.startswith("mat_") and name_to_check != "Material":
+                duplicate_original_name_count = 0
+                # Count how many items in the list share this original_name
+                for other_item in scene.material_list_items:
+                    if other_item.original_name == name_to_check:
+                        duplicate_original_name_count += 1
+                
+                # If more than one material uses this original_name, display the warning
+                if duplicate_original_name_count > 1:
+                    # Create the dedicated outer box for the warning
+                    warning_outer_box = layout.box() 
+                    # Inside this outer box, create another box for the warning message itself (for styling consistency)
+                    warning_message_box = warning_outer_box.box() 
+                    warning_row = warning_message_box.row(align=True)
+                    warning_row.label(text=f"{name_to_check} name is taken!", icon='ERROR')
+        # --- END OF NEW WARNING BANNER LOCATION ---
 
         mat_list_box = layout.box()
         row = mat_list_box.row(align=True)
         row.label(text="Materials:", icon='MATERIAL')
         row.prop(scene, "material_list_sort_alpha", text="", toggle=True, icon='SORTALPHA')
-        row.operator("materiallist.scroll_to_top", icon='TRIA_UP', text="") # New Scroll to Top button
-
+        row.operator("materiallist.scroll_to_top", icon='TRIA_UP', text="")
+        
         row = mat_list_box.row()
         row.template_list("MATERIALLIST_UL_materials", "", scene, "material_list_items", scene, "material_list_active_index", rows=8, sort_lock=True)
         
         row = mat_list_box.row()
         row.prop(scene, "material_search", text="", icon='VIEWZOOM')
 
-        if scene.material_list_active_index >= 0 and scene.material_list_active_index < len(scene.material_list_items):
+        if (scene.material_list_active_index >= 0 and
+                scene.material_list_active_index < len(scene.material_list_items)):
             list_item = scene.material_list_items[scene.material_list_active_index]
             mat = bpy.data.materials.get(list_item.material_uuid) # Use UUID to get material
             if mat:
                 try:
                     if not mat.preview: mat.preview_ensure()
-                except Exception: pass
+                except Exception: pass # Ignore preview errors
+
                 preview_box = mat_list_box.box()
-                if ensure_safe_preview(mat):
+                if ensure_safe_preview(mat): # ensure_safe_preview is a helper you have
                     preview_box.template_preview(mat, show_buttons=True)
                 else:
                     preview_box.label(text="Preview not available", icon='ERROR')
-                info_box = preview_box.box()
+                
+                info_box = preview_box.box() # Changed from preview_box.box() to mat_list_box.box() if you want it outside preview area
+                                             # Kept as preview_box.box() to be nested under the preview
                 row = info_box.row(); row.label(text=f"Name: {list_item.material_name}")
                 row = info_box.row(); row.label(text=f"Source: {'Local' if not list_item.is_library else 'Library'}")
                 row = info_box.row(); row.label(text=f"UUID: {list_item.material_uuid[:8]}...")
@@ -4985,7 +4957,7 @@ class MATERIALLIST_PT_panel(Panel):
         library_ops_box = layout.box()
         library_ops_box.label(text="Library Operations", icon='ASSET_MANAGER')
         library_ops_box.operator("materiallist.integrate_library", text="Integrate External Library", icon='IMPORT')
-        library_ops_box.operator("materiallist.pack_library_textures", text="Pack All Library Textures", icon='PACKAGE') # New Button
+        library_ops_box.operator("materiallist.pack_library_textures", text="Pack All Library Textures", icon='PACKAGE')
         
         util_box = layout.box()
         util_box.label(text="Batch Utilities", icon='TOOL_SETTINGS')
