@@ -775,84 +775,6 @@ def _load_and_process_blend_file(filepath, is_target_file): # For background_wri
     
     return mats_loaded_this_call, processed_data
 
-def _ensure_texture_local_to_library(image_datablock, target_library_dir, textures_subfolder="textures"):
-    """
-    Ensures an image's texture is copied to a local 'textures' folder relative to the library
-    and updates the image_datablock's filepath.
-    Returns True if successful or not needed, False on error.
-    """
-    if not image_datablock:
-        print(f"[BG Merge Tex Localize] Passed image_datablock is None. Skipping.", file=sys.stderr)
-        return False # Indicate an issue with input
-    
-    # If image is packed, we currently leave it as is.
-    # Could be extended to unpack if desired.
-    if image_datablock.packed_file:
-        # print(f"[BG Merge Tex Localize] Image '{image_datablock.name}' is packed. Keeping as packed.", file=sys.stderr)
-        image_datablock.source = 'FILE' # Ensure source is FILE even if packed for consistency
-        return True 
-
-    if not image_datablock.filepath_raw:
-        # print(f"[BG Merge Tex Localize] Image '{image_datablock.name}' has no raw filepath (e.g., generated or already handled). Skipping localization.", file=sys.stderr)
-        return True # No path to process, consider it handled or not applicable
-
-    original_abs_path = ""
-    try:
-        # bpy.path.abspath() resolves relative to the current file context of the worker.
-        # When this function is called, materials from the transfer_file are loaded.
-        # So, if image.filepath_raw was `//tex.png` in the transfer file (in Temp),
-        # this will resolve to `Temp/tex.png`.
-        original_abs_path = bpy.path.abspath(image_datablock.filepath_raw)
-    except Exception as e_abs:
-        print(f"[BG Merge Tex Localize] Error getting abspath for '{image_datablock.filepath_raw}' of image '{image_datablock.name}': {e_abs}", file=sys.stderr)
-        return False
-
-    if not os.path.exists(original_abs_path):
-        print(f"[BG Merge Tex Localize] Source texture file NOT FOUND at resolved absolute path '{original_abs_path}' (from raw path '{image_datablock.filepath_raw}' of image '{image_datablock.name}'). CANNOT LOCALIZE.", file=sys.stderr)
-        return False # Critical: if source doesn't exist, we can't copy it.
-
-    library_textures_dir = os.path.join(target_library_dir, textures_subfolder)
-    try:
-        os.makedirs(library_textures_dir, exist_ok=True)
-    except Exception as e_mkdir:
-        print(f"[BG Merge Tex Localize] Error creating textures directory '{library_textures_dir}': {e_mkdir}", file=sys.stderr)
-        return False
-
-    texture_filename = os.path.basename(original_abs_path)
-    # Sanitize filename if necessary, though os.path.basename should be safe.
-    # A more robust approach might be to rename based on image datablock name or a hash.
-    # For now, keep original filename.
-    
-    new_texture_path_abs = os.path.join(library_textures_dir, texture_filename)
-    new_texture_path_relative_to_library = f"//{textures_subfolder}/{texture_filename}" # Blender's relative path format
-
-    try:
-        # Copy if it doesn't exist, or if the source is newer.
-        # (Could add content hash comparison for more robust "is different" check)
-        if not os.path.exists(new_texture_path_abs) or \
-           (os.path.exists(original_abs_path) and os.path.getmtime(original_abs_path) > os.path.getmtime(new_texture_path_abs) + 1): # +1 to avoid float precision issues
-            shutil.copy2(original_abs_path, new_texture_path_abs)
-            print(f"[BG Merge Tex Localize] Copied '{original_abs_path}' to '{new_texture_path_abs}'", file=sys.stderr)
-        # else:
-            # print(f"[BG Merge Tex Localize] Texture '{new_texture_path_abs}' already exists and is current/older. Skipping copy.", file=sys.stderr)
-    except Exception as e_copy:
-        print(f"[BG Merge Tex Localize] Error copying texture from '{original_abs_path}' to '{new_texture_path_abs}': {e_copy}", file=sys.stderr)
-        return False
-
-    # Update the image datablock's filepath
-    try:
-        if image_datablock.filepath != new_texture_path_relative_to_library:
-            image_datablock.filepath = new_texture_path_relative_to_library
-            image_datablock.source = 'FILE' # Ensure it's marked as a file
-            # image_datablock.reload() # Reload can sometimes cause issues if file not fully written or accessible
-            print(f"[BG Merge Tex Localize] Updated image '{image_datablock.name}' filepath to '{new_texture_path_relative_to_library}'", file=sys.stderr)
-        # else:
-            # print(f"[BG Merge Tex Localize] Image '{image_datablock.name}' filepath already correct ('{image_datablock.filepath}'). No change needed.", file=sys.stderr)
-        return True
-    except Exception as e_setpath:
-        print(f"[BG Merge Tex Localize] Error setting filepath for image '{image_datablock.name}' to '{new_texture_path_relative_to_library}': {e_setpath}", file=sys.stderr)
-        return False
-
 def _worker_record_library_material_origin(db_path, lib_uuid, origin_file, origin_name_in_src, origin_uuid_in_src, check_existing=False):
     """Helper to record or update material origin in the database by the worker."""
     if not db_path or not os.path.exists(db_path):
@@ -899,13 +821,13 @@ def main_merge_library(args):
 
     loaded_target_mats_objs = []
     loaded_transfer_mats_objs = []
-
     target_materials_data = {}    # {uuid: {'mat_obj': obj, 'hash': hash_string}}
     transfer_materials_data = {}  # {uuid: {'mat_obj': obj, 'hash': hash_string, 'origin_props': {}}}
 
     transfer_file_abs = os.path.abspath(args.transfer)
     target_file_abs = os.path.abspath(args.target)
     db_path = os.path.abspath(args.db) if args.db and os.path.exists(args.db) else None
+
     if not db_path:
         print(f"[BG Merge - WORKER] WARNING: DB not found at '{args.db}'. Timestamps and origins won't be updated by worker.", file=sys.stderr)
 
@@ -917,7 +839,7 @@ def main_merge_library(args):
         print(f"[BG Merge - WORKER] Target library '{os.path.basename(target_file_abs)}' not found. Will create new.", file=sys.stderr)
         try:
             target_dir = os.path.dirname(target_file_abs)
-            if target_dir: # Ensure directory exists if target_file_abs includes path
+            if target_dir:
                 os.makedirs(target_dir, exist_ok=True)
         except Exception as e_mkdir:
             print(f"[BG Merge - WORKER] Warning: Could not create directory for new target library: {e_mkdir}", file=sys.stderr)
@@ -928,69 +850,54 @@ def main_merge_library(args):
         loaded_transfer_mats_objs, transfer_materials_data = _load_and_process_blend_file(transfer_file_abs, is_target_file=False)
         if not transfer_materials_data and not loaded_transfer_mats_objs :
             print(f"[BG Merge - WORKER] No materials loaded or processed from transfer file '{transfer_file_abs}'. Nothing to merge.", file=sys.stderr)
-            # If target also had nothing, we might just write an empty library or do nothing.
-            # For now, if transfer is empty, effectively exit.
-            if not target_materials_data: # If target was also empty/new
+            if not target_materials_data:
                  print(f"[BG Merge - WORKER] Both transfer and target are empty. No operation needed.", file=sys.stderr)
                  return 0 # Success, nothing to do.
-            # else, target had items, transfer had none, so just rewrite target.
     else:
         print(f"[BG Merge - WORKER] Transfer file '{os.path.basename(transfer_file_abs)}' not found. Cannot merge.", file=sys.stderr)
         return 1 # Error condition
 
     # --- Merge Logic ---
     final_materials_to_write_map = {} # {uuid_in_library: material_object_to_write}
-
-    # Initialize with all materials from the target library
     for u, data in target_materials_data.items():
         final_materials_to_write_map[u] = data['mat_obj']
 
     mats_added_count = 0
     mats_updated_count = 0
     mats_skipped_failed_hash_transfer_count = 0
-    # mats_skipped_duplicate_content_count is no longer relevant for blocking.
 
     print(f"[BG Merge - WORKER] Starting merge. Target materials initially in map: {len(final_materials_to_write_map)}, Transfer materials to process: {len(transfer_materials_data)}", file=sys.stderr)
 
     for t_uuid, t_data_dict in transfer_materials_data.items():
         t_mat_obj = t_data_dict['mat_obj']
-        t_hash = t_data_dict['hash'] # This is now a pure content hash
-
+        t_hash = t_data_dict['hash']
         if not t_hash:
             mats_skipped_failed_hash_transfer_count += 1
             print(f"  Skipping transfer mat with lib UUID {t_uuid[:8]} ('{getattr(t_mat_obj, 'name', 'N/A')}') due to missing hash.", file=sys.stderr)
             continue
 
-        # Extract origin properties stamped by the main addon
         origin_blend_file = t_mat_obj.get("ml_origin_blend_file", "UnknownSourceFile")
-        origin_mat_name_in_source = t_mat_obj.get("ml_origin_mat_name", "UnknownSourceName") # Original display name
-        origin_mat_uuid_in_source = t_mat_obj.get("ml_origin_mat_uuid", "UnknownSourceUUID") # UUID of the source datablock
-
-        existing_target_data = target_materials_data.get(t_uuid) # t_uuid is the intended UUID in the library
+        origin_mat_name_in_source = t_mat_obj.get("ml_origin_mat_name", "UnknownSourceName")
+        origin_mat_uuid_in_source = t_mat_obj.get("ml_origin_mat_uuid", "UnknownSourceUUID")
+        existing_target_data = target_materials_data.get(t_uuid)
 
         if not existing_target_data:
-            # This t_uuid (from transfer, which is the local material's UUID) is NEW to the library.
-            # Add it. Content hash duplication with other UUIDs is now allowed.
             print(f"  ADDING new material to library: UUID {t_uuid[:8]} (ContentHash {t_hash[:8]}). Origin: '{os.path.basename(origin_blend_file)}' ({origin_mat_uuid_in_source[:8]})", file=sys.stderr)
             final_materials_to_write_map[t_uuid] = t_mat_obj
             mats_added_count += 1
             if db_path:
-                update_material_timestamp_in_db(db_path, t_uuid) # Update recency timestamp
+                update_material_timestamp_in_db(db_path, t_uuid)
                 _worker_record_library_material_origin(db_path, t_uuid, origin_blend_file, origin_mat_name_in_source, origin_mat_uuid_in_source)
         else:
-            # This t_uuid ALREADY EXISTS in the target library.
             target_hash_for_this_uuid = existing_target_data['hash']
             if t_hash != target_hash_for_this_uuid:
-                # Content has changed for this existing library UUID. Update it.
                 print(f"  UPDATING existing library material: UUID {t_uuid[:8]}. OldHash: {target_hash_for_this_uuid[:8] if target_hash_for_this_uuid else 'None'}, NewHash: {t_hash[:8]}. Origin: '{os.path.basename(origin_blend_file)}' ({origin_mat_uuid_in_source[:8]})", file=sys.stderr)
-                final_materials_to_write_map[t_uuid] = t_mat_obj # Replace with the new material object
+                final_materials_to_write_map[t_uuid] = t_mat_obj
                 mats_updated_count += 1
                 if db_path:
                     update_material_timestamp_in_db(db_path, t_uuid)
                     _worker_record_library_material_origin(db_path, t_uuid, origin_blend_file, origin_mat_name_in_source, origin_mat_uuid_in_source)
             else:
-                # Content hash is the same. Material content has not changed.
-                # Still, update the origin record as this "push" might be from a different file or a re-save.
                 print(f"  Content for library material UUID {t_uuid[:8]} is IDENTICAL (Hash {t_hash[:8]}). Updating origin record. Origin: '{os.path.basename(origin_blend_file)}' ({origin_mat_uuid_in_source[:8]})", file=sys.stderr)
                 if db_path:
                     _worker_record_library_material_origin(db_path, t_uuid, origin_blend_file, origin_mat_name_in_source, origin_mat_uuid_in_source, check_existing=True)
@@ -999,19 +906,12 @@ def main_merge_library(args):
     final_set_for_bpy_write = set()
     mats_prepared_for_write = 0
     for lib_uuid, mat_object_to_write in final_materials_to_write_map.items():
-        # Ensure the material object is valid and still in bpy.data (it should be, as they were loaded)
-        # Also ensure its datablock name matches the library UUID it's being stored under.
         if mat_object_to_write and hasattr(mat_object_to_write, 'name') and mat_object_to_write.name in bpy.data.materials:
-            if bpy.data.materials[mat_object_to_write.name] == mat_object_to_write: # Verify it's the correct instance
+            if bpy.data.materials[mat_object_to_write.name] == mat_object_to_write:
                 try:
                     if mat_object_to_write.name != lib_uuid:
-                        # This can happen if a material from target_materials_data had a non-UUID name
-                        # (which shouldn't be the case if target lib is managed by this addon)
-                        # or if a material from transfer_materials_data somehow didn't get its name set to its UUID.
-                        # print(f"    Correcting datablock name for lib UUID '{lib_uuid[:8]}' from '{mat_object_to_write.name}' before write.", file=sys.stderr)
                         mat_object_to_write.name = lib_uuid
-                    
-                    mat_object_to_write.use_fake_user = True # Ensure it's saved
+                    mat_object_to_write.use_fake_user = True
                     final_set_for_bpy_write.add(mat_object_to_write)
                     mats_prepared_for_write +=1
                 except Exception as e_final_prep:
@@ -1023,54 +923,105 @@ def main_merge_library(args):
     
     print(f"[BG Merge - WORKER] Total materials prepared for writing to library: {mats_prepared_for_write}", file=sys.stderr)
 
-    # --- Texture Localization for all materials in final_set_for_bpy_write ---
-    target_library_directory = os.path.dirname(target_file_abs)
-    if not target_library_directory:
-        print(f"[BG Merge - WORKER] CRITICAL: Cannot determine target library directory from '{target_file_abs}'. Skipping texture localization.", file=sys.stderr)
-    else:
-        print(f"[BG Merge - WORKER] Starting texture localization for {len(final_set_for_bpy_write)} materials to target dir: '{target_library_directory}'...", file=sys.stderr)
-        all_images_to_process_in_final_set = set()
-        for mat_obj_final_write in final_set_for_bpy_write:
-            if mat_obj_final_write.use_nodes and mat_obj_final_write.node_tree:
-                for node in mat_obj_final_write.node_tree.nodes:
-                    if node.bl_idname == 'ShaderNodeTexImage' and node.image:
-                        all_images_to_process_in_final_set.add(node.image)
-        
-        print(f"[BG Merge - WORKER] Found {len(all_images_to_process_in_final_set)} unique image datablocks for localization.", file=sys.stderr)
-        localized_tex_count = 0
-        failed_tex_count = 0
-        for img_datablock in all_images_to_process_in_final_set:
-            if _ensure_texture_local_to_library(img_datablock, target_library_directory):
-                localized_tex_count +=1
-            else:
-                failed_tex_count +=1
-                print(f"[BG Merge - WORKER]  WARNING: Failed to localize texture '{getattr(img_datablock, 'name', 'UnnamedImage')}' for material(s).", file=sys.stderr)
-        print(f"[BG Merge - WORKER] Texture localization finished. Successful: {localized_tex_count}, Failed: {failed_tex_count}.", file=sys.stderr)
+    # --- NEW: Pack Images directly for materials in final_set_for_bpy_write ---
+    # This replaces the call to _ensure_texture_local_to_library
+    print(f"[BG Merge - WORKER] Starting image packing for {len(final_set_for_bpy_write)} materials...", file=sys.stderr)
+    packed_image_count = 0
+    failed_pack_count = 0
+    # Keep track of image datablocks already processed to avoid redundant packing attempts or messages
+    images_already_processed_for_packing = set()
+
+    for mat_obj_for_packing in final_set_for_bpy_write:
+        if not mat_obj_for_packing.use_nodes or not mat_obj_for_packing.node_tree:
+            continue
+        for node in mat_obj_for_packing.node_tree.nodes:
+            if node.bl_idname == 'ShaderNodeTexImage' and node.image:
+                img_datablock = node.image
+                
+                # Skip if this image datablock instance has already been processed
+                if img_datablock.name in images_already_processed_for_packing: # Using name as a proxy for the datablock instance
+                    continue
+
+                if img_datablock.packed_file is not None:
+                    print(f"  Image '{img_datablock.name}' is already packed. Skipping.", file=sys.stderr)
+                    images_already_processed_for_packing.add(img_datablock.name)
+                    continue
+
+                if img_datablock.source != 'FILE':
+                    print(f"  Image '{img_datablock.name}' source is '{img_datablock.source}' (not FILE). Skipping packing.", file=sys.stderr)
+                    images_already_processed_for_packing.add(img_datablock.name)
+                    continue
+                
+                if not img_datablock.filepath_raw: # Check filepath_raw specifically
+                    print(f"  Image '{img_datablock.name}' has no raw filepath. Cannot determine source for packing. Skipping.", file=sys.stderr)
+                    images_already_processed_for_packing.add(img_datablock.name)
+                    failed_pack_count +=1 # Count as a failure if it should have been packed but couldn't
+                    continue
+
+                # At this point, image.source == 'FILE', image.packed_file is None, and filepath_raw exists.
+                # Attempt to resolve the absolute path for disk check
+                abs_image_path = ""
+                try:
+                    # bpy.path.abspath() resolves relative to the current .blend file context.
+                    # When textures are loaded from the transfer file, their paths are relative to it.
+                    abs_image_path = bpy.path.abspath(img_datablock.filepath_raw)
+                except Exception as e_abs:
+                    print(f"  Error resolving absolute path for image '{img_datablock.name}' (raw: '{img_datablock.filepath_raw}'): {e_abs}. Skipping packing.", file=sys.stderr)
+                    failed_pack_count += 1
+                    images_already_processed_for_packing.add(img_datablock.name)
+                    continue
+
+                if not os.path.exists(abs_image_path):
+                    print(f"  Source file for image '{img_datablock.name}' not found at resolved path '{abs_image_path}' (from raw '{img_datablock.filepath_raw}'). Skipping packing.", file=sys.stderr)
+                    failed_pack_count += 1
+                    images_already_processed_for_packing.add(img_datablock.name)
+                    continue
+                
+                # Now attempt to pack
+                try:
+                    print(f"  Attempting to pack image: '{img_datablock.name}' from current filepath: '{img_datablock.filepath}' (raw: '{img_datablock.filepath_raw}', resolved abs: '{abs_image_path}')", file=sys.stderr)
+                    # Crucially, ensure the image.filepath is what image.pack() expects.
+                    # If image.filepath is not already abs_image_path, it might be safer to set it if pack fails.
+                    # However, Blender's internal loading via bpy.data.libraries.load should handle this.
+                    # If image.filepath is, for example, `//textures/foo.png` from the temp transfer file,
+                    # and that file exists at `abs_image_path`, pack() should work.
+                    img_datablock.pack()
+                    packed_image_count += 1
+                    print(f"    Successfully packed image '{img_datablock.name}'. New source: {img_datablock.source}, Filepath: '{img_datablock.filepath}'", file=sys.stderr)
+                except RuntimeError as e_pack:
+                    print(f"  Failed to pack image '{img_datablock.name}' (resolved from '{abs_image_path}'): {e_pack}", file=sys.stderr)
+                    failed_pack_count += 1
+                except Exception as e_pack_other:
+                    print(f"  Unexpected error while packing image '{img_datablock.name}': {e_pack_other}", file=sys.stderr)
+                    traceback.print_exc(file=sys.stderr)
+                    failed_pack_count += 1
+                
+                images_already_processed_for_packing.add(img_datablock.name) # Mark as processed regardless of outcome for this instance
     
+    print(f"[BG Merge - WORKER] Image packing finished. Successfully packed: {packed_image_count}, Failed/Skipped: {failed_pack_count}.", file=sys.stderr)
+    sys.stderr.flush()
+    # --- End NEW Image Packing Section ---
+
     # --- Write the final library file ---
     temp_lib_output_path = None
     try:
-        # Ensure target directory exists before mkstemp
         write_dir = os.path.dirname(target_file_abs)
-        if not write_dir: write_dir = "." # Fallback to current dir if target_file_abs is just a name
+        if not write_dir: write_dir = "." 
         os.makedirs(write_dir, exist_ok=True)
-
-        # Use a temporary file for writing to avoid corrupting library on error
+        
         fd, temp_lib_output_path = tempfile.mkstemp(suffix='.blend', prefix=f"{os.path.splitext(os.path.basename(target_file_abs))[0]}_MERGETEMP_", dir=write_dir)
-        os.close(fd) # Close the file descriptor as bpy.data.libraries.write needs path
+        os.close(fd) 
 
         if not final_set_for_bpy_write:
             print(f"[BG Merge - WORKER] No valid materials to write to library. Writing empty library to temp: {os.path.basename(temp_lib_output_path)}", file=sys.stderr)
             bpy.data.libraries.write(temp_lib_output_path, set(), fake_user=True, compress=True)
         else:
-            print(f"[BG Merge - WORKER] Writing final set of {len(final_set_for_bpy_write)} materials to temporary file: {os.path.basename(temp_lib_output_path)}", file=sys.stderr)
+            print(f"[BG Merge - WORKER] Writing final set of {len(final_set_for_bpy_write)} materials (with packed images) to temporary file: {os.path.basename(temp_lib_output_path)}", file=sys.stderr)
             bpy.data.libraries.write(temp_lib_output_path, final_set_for_bpy_write, fake_user=True, compress=True)
-
-        # Atomically replace the old library file with the new one
+        
         print(f"[BG Merge - WORKER] Moving temporary library to final target: {os.path.basename(target_file_abs)}", file=sys.stderr)
-        shutil.move(temp_lib_output_path, target_file_abs) # This should be atomic on the same filesystem
-        temp_lib_output_path = None # Indicate move was successful
-
+        shutil.move(temp_lib_output_path, target_file_abs) 
+        temp_lib_output_path = None 
         print(f"[BG Merge - WORKER] Library merge and replacement successful: {os.path.basename(target_file_abs)}", file=sys.stderr)
         print(f"[BG Merge - WORKER Summary] Added: {mats_added_count}, Updated: {mats_updated_count}, Skipped (No Hash): {mats_skipped_failed_hash_transfer_count}", file=sys.stderr)
         sys.stderr.flush()
@@ -1080,21 +1031,13 @@ def main_merge_library(args):
         traceback.print_exc(file=sys.stderr)
         return 1 # Error
     finally:
-        # Clean up temporary file if it still exists (e.g., if move failed)
         if temp_lib_output_path and os.path.exists(temp_lib_output_path):
             try:
                 os.remove(temp_lib_output_path)
                 print(f"[BG Merge - WORKER] Cleaned up stray temporary library file: {temp_lib_output_path}", file=sys.stderr)
             except Exception as e_clean_temp:
                 print(f"[BG Merge - WORKER] Error cleaning up stray temporary library file '{temp_lib_output_path}': {e_clean_temp}", file=sys.stderr)
-        
-        # Clean up all loaded material datablocks from this worker session to ensure clean state
-        # This is important because of --factory-startup and loading multiple files.
-        # We only want what's in final_set_for_bpy_write to persist if they were written.
-        # Actually, bpy.data.libraries.write saves a *new file* with only the specified datablocks.
-        # The current Blender instance's bpy.data is just for processing. No explicit cleanup of bpy.data.materials needed here
-        # as the worker exits. The _load_and_process_blend_file should handle its own temp loaded materials if necessary.
-        pass
+        # bpy.data.materials are implicitly cleaned up when the worker Blender instance exits.
 
 # --- Main Entry Point for the Worker Script ---
 def main_worker_entry():
