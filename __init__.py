@@ -59,6 +59,9 @@ LIBRARY_FILE = None
 DATABASE_FILE = None
 THUMBNAIL_FOLDER = None
 ICON_TEMPLATE_FILE = None
+_SUFFIX_REGEX_MAT_PARSE = re.compile(r"^(.*?)(\.(\d+))?$")
+_THUMBNAIL_PRELOAD_PATTERN = re.compile(r"^[a-f0-9]{32}\.png$", re.IGNORECASE)
+_ICON_TEMPLATE_VALIDATED = False
 
 THUMBNAIL_SIZE = 128
 VISIBLE_ITEMS = 30
@@ -87,8 +90,7 @@ WORKER_SCRIPT = os.path.join(os.path.dirname(__file__), "localise_library_worker
 BACKGROUND_WORKER_PY = None # Will point to your background_writer.py
 thumbnail_task_queue = Queue()
 thumbnail_worker_pool = [] # Stores Popen objects and task info
-MAX_CONCURRENT_THUMBNAIL_WORKERS = 5
-#MAX_CONCURRENT_THUMBNAIL_WORKERS = max(1, (os.cpu_count() or 4) // 2) # Default, more aggressive
+MAX_CONCURRENT_THUMBNAIL_WORKERS = max(1, (os.cpu_count() or 4) // 2) # Default, more aggressive
 THUMBNAIL_BATCH_SIZE_PER_WORKER = 5 # Number of thumbnails one worker process will try to generate
 thumbnail_pending_on_disk_check = {} # hash: {task_details} - Tracks hashes whose generation is actively awaited
 thumbnail_monitor_timer_active = False # Flag to control the monitor timer
@@ -564,7 +566,9 @@ def get_material_hash(mat, force=True):
         return None
 
 def preload_existing_thumbnails():
-    global custom_icons
+    global custom_icons, THUMBNAIL_FOLDER # Ensure THUMBNAIL_FOLDER is accessible
+    # _THUMBNAIL_PRELOAD_PATTERN is now a global, no need to define 'pattern' locally
+
     print("[Thumb Preload] Starting thumbnail preload process...")
 
     if custom_icons is None:
@@ -588,13 +592,14 @@ def preload_existing_thumbnails():
             print(f"[Thumb Preload] Error creating thumbnail directory {THUMBNAIL_FOLDER}: {e_mkdir}")
             return
 
-    pattern = re.compile(r"^[a-f0-9]{32}\.png$", re.IGNORECASE) # HASH.png pattern
+    # Local 'pattern' variable is removed as we use the global _THUMBNAIL_PRELOAD_PATTERN
     loaded_count = 0; skipped_count = 0; error_count = 0
 
     print(f"[Thumb Preload] Scanning directory: {THUMBNAIL_FOLDER}")
     try:
         for filename in os.listdir(THUMBNAIL_FOLDER):
-            if pattern.match(filename):
+            # Use the pre-compiled global pattern here
+            if _THUMBNAIL_PRELOAD_PATTERN.match(filename): # MODIFIED LINE
                 filepath = os.path.join(THUMBNAIL_FOLDER, filename)
                 icon_hash_key = filename[:-4].lower()
 
@@ -1439,7 +1444,7 @@ def _parse_material_suffix(name: str) -> tuple[str, int]:
              "mat_Plastic.000" -> ("mat_Plastic", 0)
     Returns (base_name, suffix_number)
     """
-    match = re.fullmatch(r"^(.*?)(\.(\d+))?$", name)
+    match = _SUFFIX_REGEX_MAT_PARSE.fullmatch(name)
     if not match: # Should ideally not happen for valid material names
         return name, -1 # Fallback, though -1 might conflict with .000 if not careful
 
@@ -3853,6 +3858,10 @@ def ensure_icon_template():
         created_data_blocks_for_template_file.append(light_data)
 
         preview_obj = bpy.data.objects.new(preview_obj_name, mesh_data)
+        # Rotate sphere by -25° on Y and -45° on Z
+        preview_obj.rotation_euler = (0, math.radians(-25), math.radians(-45))
+        # Apply only the Weighted Normal modifier
+        wn_mod = preview_obj.modifiers.new(name="WeightedNormal", type='WEIGHTED_NORMAL')
         created_data_blocks_for_template_file.append(preview_obj)
 
         cam_obj = bpy.data.objects.new(camera_obj_name, cam_data)
@@ -4115,19 +4124,24 @@ def find_legacy_thumbnail_path(hash_value): # Unchanged
 # Thumbnail Migration Handler (Unchanged)
 # --------------------------
 @persistent
-def migrate_thumbnail_files(dummy): # Unchanged
+def migrate_thumbnail_files(dummy): # Unchanged in core logic, just uses pre-compiled regex
+    global THUMBNAIL_FOLDER # Ensure THUMBNAIL_FOLDER is accessible
+    # _LEGACY_THUMBNAIL_PATTERN is now a global, no need to define 'legacy_pattern' locally
+
     if not os.path.exists(THUMBNAIL_FOLDER): return
-    migrated_count = 0; legacy_pattern = re.compile(r"^[0-9a-f-]{36}_[0-9a-f]{32}\.png$")
+    migrated_count = 0
+    # Local 'legacy_pattern' variable is removed
     try:
         for filename in os.listdir(THUMBNAIL_FOLDER):
             src_path = os.path.join(THUMBNAIL_FOLDER, filename)
-            if not legacy_pattern.match(filename): continue
+            # Use the pre-compiled global pattern here
+            if not _LEGACY_THUMBNAIL_PATTERN.match(filename): continue # MODIFIED LINE
             hash_value = filename.split("_")[1].split(".")[0]
-            dest_path = get_thumbnail_path(hash_value)
+            dest_path = get_thumbnail_path(hash_value) # Assumes get_thumbnail_path is defined
             if not os.path.exists(dest_path): os.rename(src_path, dest_path); migrated_count += 1
             else: os.remove(src_path) # Remove duplicate legacy
     except Exception as e: print(f"Thumbnail Migration Error: {str(e)}"); traceback.print_exc()
-    # print(f"Thumbnail Migration: {migrated_count} files migrated.") # Optional log on completion
+    # print(f"Thumbnail Migration: {migrated_count} files migrated.") # Optional log
 
 # --------------------------
 # Thumbnail Generation Core Logic (get_custom_icon, generate_thumbnail_async, update_material_thumbnails)
@@ -4135,47 +4149,63 @@ def migrate_thumbnail_files(dummy): # Unchanged
 def get_custom_icon(mat, collect_mode=False):
     global custom_icons, thumbnail_generation_scheduled, thumbnail_task_queue, thumbnail_pending_on_disk_check
     global g_tasks_for_current_run, g_current_run_task_hashes_being_processed, THUMBNAIL_SIZE
+    global _ICON_TEMPLATE_VALIDATED # MODIFIED: Added global declaration
 
     mat_name_debug = getattr(mat, 'name', 'None_Material_Name')
 
     if not mat:
+        # print(f"[GetIcon - {mat_name_debug}] Material object is None. Ret 0.", flush=True) # Optional Debug
         return 0
 
-    try:
-        if not _verify_icon_template():
+    # MODIFICATION START: Icon Template Validation Optimization
+    if not _ICON_TEMPLATE_VALIDATED:
+        try:
+            if not _verify_icon_template(): # _verify_icon_template is expected to handle its own prints
+                # print(f"[GetIcon - {mat_name_debug}] Initial _verify_icon_template failed. Ret 0.", flush=True) # Optional Debug
+                return 0 # Critical template error, cannot proceed
+            _ICON_TEMPLATE_VALIDATED = True # Set to True only on success
+            # print(f"[GetIcon - {mat_name_debug}] _ICON_TEMPLATE_VALIDATED set to True after successful verification.", flush=True) # Optional Debug
+        except Exception as e_tpl_chk:
+            print(f"[GetIcon - {mat_name_debug}] CRITICAL: Exception during _verify_icon_template call: {e_tpl_chk}. Ret 0.", file=sys.stderr, flush=True)
+            traceback.print_exc(file=sys.stderr)
             return 0
-    except Exception as e_tpl_chk:
-        # print(f"[GetIcon - {mat_name_debug}] Template-validation/rebuild error: {e_tpl_chk}. Ret 0.", flush=True)
-        return 0
+    # MODIFICATION END
 
     if custom_icons is None:
+        # print(f"[GetIcon - {mat_name_debug}] custom_icons is None. Attempting reinitialization.", flush=True) # Optional Debug
         try:
             custom_icons = bpy.utils.previews.new()
-            if custom_icons is None: return 0
+            if custom_icons is None:
+                print(f"[GetIcon - {mat_name_debug}] CRITICAL: Reinitialization of custom_icons failed. Ret 0.", file=sys.stderr, flush=True)
+                return 0
             if 'preload_existing_thumbnails' in globals() and callable(preload_existing_thumbnails):
+                # print(f"[GetIcon - {mat_name_debug}] Preloading thumbnails into newly created custom_icons.", flush=True) # Optional Debug
                 preload_existing_thumbnails()
-        except Exception:
+        except Exception as e_reinit_previews:
+            print(f"[GetIcon - {mat_name_debug}] CRITICAL: Exception reinitializing custom_icons: {e_reinit_previews}. Ret 0.", file=sys.stderr, flush=True)
+            traceback.print_exc(file=sys.stderr)
             return 0
 
-    current_material_hash = get_material_hash(mat)
+    current_material_hash = get_material_hash(mat) # Assumes get_material_hash is defined
     if not current_material_hash:
+        # print(f"[GetIcon - {mat_name_debug}] Could not get material hash. Ret 0.", flush=True) # Optional Debug
         return 0
 
     # 1. Check Blender's preview cache (custom_icons)
     if current_material_hash in custom_icons:
         cached_preview_item = custom_icons[current_material_hash]
-        path_for_cached_thumb = get_thumbnail_path(current_material_hash)
+        path_for_cached_thumb = get_thumbnail_path(current_material_hash) # Assumes get_thumbnail_path is defined
         
         is_cached_item_genuinely_valid = False
         if hasattr(cached_preview_item, 'icon_id') and cached_preview_item.icon_id > 0:
             actual_w, actual_h = cached_preview_item.icon_size
             
-            if actual_w <= 1 or actual_h <= 1: # Lenient: Only invalidate if basically zero-sized
+            if actual_w <= 1 or actual_h <= 1: # Lenient: Only invalidate if practically zero-sized
                 print(f"    [GetIcon - Cache VERY BAD SIZE] HASH {current_material_hash[:8]} (Mat: {mat_name_debug}): Cached ID {cached_preview_item.icon_id} but size {actual_w}x{actual_h} is practically zero. Invalidating.", flush=True)
                 if current_material_hash in custom_icons: # Ensure key exists before del
                     del custom_icons[current_material_hash]
             elif actual_w < THUMBNAIL_SIZE or actual_h < THUMBNAIL_SIZE: # Log if smaller than fully expected, but don't invalidate solely for this
-                # print(f"    [GetIcon - Cache SMALLER SIZE] HASH {current_material_hash[:8]} (Mat: {mat_name_debug}): Cached ID {cached_preview_item.icon_id}, size {actual_w}x{actual_h} (expected {THUMBNAIL_SIZE}x{THUMBNAIL_SIZE}). Checking file.", flush=True)
+                # print(f"    [GetIcon - Cache SMALLER SIZE] HASH {current_material_hash[:8]} (Mat: {mat_name_debug}): Cached ID {cached_preview_item.icon_id}, size {actual_w}x{actual_h} (expected {THUMBNAIL_SIZE}x{THUMBNAIL_SIZE}). Checking file.", flush=True) # Optional Debug
                 # If size is smaller but reasonable (e.g. 32x32), ensure backing file still exists
                 if not (os.path.isfile(path_for_cached_thumb) and os.path.getsize(path_for_cached_thumb) > 0):
                     print(f"    [GetIcon - Cache SMALLER SIZE NO FILE] HASH {current_material_hash[:8]} (Mat: {mat_name_debug}): Backing file invalid. Invalidating.", flush=True)
@@ -4190,6 +4220,7 @@ def get_custom_icon(mat, collect_mode=False):
                     is_cached_item_genuinely_valid = True
         
         if is_cached_item_genuinely_valid:
+            # print(f"[GetIcon - {mat_name_debug}] Returning valid cached icon_id: {cached_preview_item.icon_id} for HASH {current_material_hash[:8]}.", flush=True) # Optional Debug
             return cached_preview_item.icon_id
 
     thumbnail_file_path = get_thumbnail_path(current_material_hash)
@@ -4200,13 +4231,17 @@ def get_custom_icon(mat, collect_mode=False):
         try:
             if os.path.getsize(thumbnail_file_path) > 0:
                 file_ok_on_disk = True
-        except OSError:
+        except OSError: # Catches FileNotFoundError as well on some OS
             file_ok_on_disk = False
 
     if file_ok_on_disk:
+        # print(f"[GetIcon - {mat_name_debug}] File exists on disk for HASH {current_material_hash[:8]}. Attempting to load into custom_icons.", flush=True) # Optional Debug
         try:
+            # It's possible the key was deleted above due to invalid size, or it was never there.
+            # Safe to try deleting before loading if it exists, to ensure a fresh load from disk.
             if current_material_hash in custom_icons:
-                 del custom_icons[current_material_hash]
+                # print(f"    [GetIcon - DiskLoad] Removing existing entry for HASH {current_material_hash[:8]} from custom_icons before disk load.", flush=True) # Optional Debug
+                del custom_icons[current_material_hash]
             
             preview_item_from_disk_load = custom_icons.load(current_material_hash, thumbnail_file_path, 'IMAGE')
             is_genuinely_valid_from_disk = False
@@ -4219,65 +4254,92 @@ def get_custom_icon(mat, collect_mode=False):
                     if current_material_hash in custom_icons:
                         del custom_icons[current_material_hash]
                 elif actual_w < THUMBNAIL_SIZE or actual_h < THUMBNAIL_SIZE: # Log if smaller but don't auto-invalidate if reasonable
-                    print(f"    [GetIcon - DiskLoad SMALLER SIZE] HASH {current_material_hash[:8]} (Mat: {mat_name_debug}): Loaded ID {preview_item_from_disk_load.icon_id} from file, size {actual_w}x{actual_h} (expected {THUMBNAIL_SIZE}x{THUMBNAIL_SIZE}). Accepting it.", flush=True)
+                    # print(f"    [GetIcon - DiskLoad SMALLER SIZE] HASH {current_material_hash[:8]} (Mat: {mat_name_debug}): Loaded ID {preview_item_from_disk_load.icon_id} from file, size {actual_w}x{actual_h} (expected {THUMBNAIL_SIZE}x{THUMBNAIL_SIZE}). Accepting it.", flush=True) # Optional Debug
                     is_genuinely_valid_from_disk = True # Accept smaller, reasonable sizes
                 else: # Size is as expected
                     is_genuinely_valid_from_disk = True
             
             if is_genuinely_valid_from_disk:
+                # print(f"[GetIcon - {mat_name_debug}] Successfully loaded from disk. Returning icon_id: {preview_item_from_disk_load.icon_id} for HASH {current_material_hash[:8]}.", flush=True) # Optional Debug
                 return preview_item_from_disk_load.icon_id
             # else: Load failed or was deemed invalid by size check. Fall through to schedule.
+            # print(f"    [GetIcon - DiskLoad] Load from disk for HASH {current_material_hash[:8]} was not genuinely valid. Will schedule generation.", flush=True) # Optional Debug
 
         except RuntimeError as e_runtime_load_geticon:
-             # print(f"    [GetIcon - DiskLoad RUNTIME ERROR] HASH {current_material_hash[:8]} (Mat: {mat_name_debug}) for '{thumbnail_file_path}': {e_runtime_load_geticon}. Will schedule generation.", flush=True)
-             pass
+            print(f"    [GetIcon - DiskLoad RUNTIME ERROR] HASH {current_material_hash[:8]} (Mat: {mat_name_debug}) for '{thumbnail_file_path}': {e_runtime_load_geticon}. Will schedule generation.", file=sys.stderr, flush=True)
+            # Fall through to schedule generation
         except Exception as e_load_from_disk:
-            # print(f"    [GetIcon - DiskLoad EXCEPTION] HASH {current_material_hash[:8]} (Mat: {mat_name_debug}): Error loading from disk file '{thumbnail_file_path}': {e_load_from_disk}. Will schedule generation.", flush=True)
-            pass
+            print(f"    [GetIcon - DiskLoad EXCEPTION] HASH {current_material_hash[:8]} (Mat: {mat_name_debug}): Error loading from disk file '{thumbnail_file_path}': {e_load_from_disk}. Will schedule generation.", file=sys.stderr, flush=True)
+            traceback.print_exc(file=sys.stderr)
+            # Fall through to schedule generation
 
     # 3. If not found/loaded validly, check if already scheduled or being processed
     if current_material_hash in g_current_run_task_hashes_being_processed or \
        current_material_hash in thumbnail_pending_on_disk_check:
+        # print(f"[GetIcon - {mat_name_debug}] HASH {current_material_hash[:8]} is already being processed or pending disk check. Ret 0.", flush=True) # Optional Debug
         return 0 
     
+    # Check against thumbnail_generation_scheduled:
+    # If collect_mode is False (meaning we are in UI draw): if it's already scheduled, return 0 to avoid re-queueing.
+    # If collect_mode is True (meaning update_material_thumbnails is gathering tasks): we still want to collect it
+    # so update_material_thumbnails can decide if it should be added to g_tasks_for_current_run.
     if thumbnail_generation_scheduled.get(current_material_hash, False) and not collect_mode:
+        # print(f"[GetIcon - {mat_name_debug}] HASH {current_material_hash[:8]} already in thumbnail_generation_scheduled and not in collect_mode. Ret 0.", flush=True) # Optional Debug
         return 0
 
     # 4. Prepare task if not found/loaded validly
+    # print(f"[GetIcon - {mat_name_debug}] HASH {current_material_hash[:8]} - Preparing task details for generation.", flush=True) # Optional Debug
     blend_file_path_for_worker = None
     if mat.library and mat.library.filepath:
         blend_file_path_for_worker = bpy.path.abspath(mat.library.filepath)
-    elif not mat.library and bpy.data.filepath:
+    elif not mat.library and bpy.data.filepath: # Material is local to the current (saved) file
         blend_file_path_for_worker = bpy.path.abspath(bpy.data.filepath)
-    else:
-        return 0
+    else: # Material is local, but current .blend file is unsaved, or other edge case
+        # print(f"[GetIcon - {mat_name_debug}] Cannot determine blend_file_path_for_worker. Local mat in unsaved file? Ret 0.", flush=True) # Optional Debug
+        return 0 # Cannot generate if source .blend is unknown
 
     if not blend_file_path_for_worker or not os.path.exists(blend_file_path_for_worker):
+        # print(f"[GetIcon - {mat_name_debug}] blend_file_path_for_worker '{blend_file_path_for_worker}' is invalid or not found. Ret 0.", flush=True) # Optional Debug
         return 0
 
-    mat_uuid_for_task = mat.get("uuid")
-    if not mat_uuid_for_task or len(mat_uuid_for_task) != 36:
+    # Ensure material has a UUID (important for the worker to find it)
+    mat_uuid_for_task = get_material_uuid(mat) # This will also create if missing for non-library
+    if not mat_uuid_for_task or len(mat_uuid_for_task) != 36: # Basic validation
+        print(f"[GetIcon - {mat_name_debug}] CRITICAL: Could not get/ensure valid UUID for material. Ret 0.", file=sys.stderr, flush=True)
         return 0
 
+    # Ensure local materials (not from a library) have fake user if they have no users,
+    # so they are saved with the temp .blend file passed to the worker.
     if not mat.library:
         try:
-            if mat.users == 0 and not mat.use_fake_user : mat.use_fake_user = True
-        except Exception: pass
+            if mat.users == 0 and not mat.use_fake_user :
+                mat.use_fake_user = True
+                # print(f"    [GetIcon - {mat_name_debug}] Set use_fake_user=True for local material with 0 users.", flush=True) # Optional Debug
+        except Exception as e_fake_user:
+            print(f"    [GetIcon - {mat_name_debug}] Warning: Could not set use_fake_user for local material: {e_fake_user}", file=sys.stderr, flush=True)
+
 
     task_details = {
         'blend_file': blend_file_path_for_worker,
-        'mat_uuid': mat_uuid_for_task,
+        'mat_uuid': mat_uuid_for_task, # Changed from 'mat_name' to 'mat_uuid' for worker
         'thumb_path': thumbnail_file_path,
         'hash_value': current_material_hash,
-        'mat_name_debug': mat.name,
-        'retries': 0
+        'mat_name_debug': mat.name, # Keep original name for debugging if needed
+        'retries': 0 # Initial retry count
     }
 
     if collect_mode:
-        return task_details
+        # print(f"[GetIcon - {mat_name_debug}] In collect_mode, returning task_details for HASH {current_material_hash[:8]}.", flush=True) # Optional Debug
+        return task_details # Return the task dictionary
     else:
-        update_material_thumbnails(specific_tasks_to_process=[task_details])
-        return 0
+        # This is a direct call from UI (e.g., draw_item), schedule the task.
+        # update_material_thumbnails will handle adding to g_tasks_for_current_run and dispatching.
+        # print(f"[GetIcon - {mat_name_debug}] Not in collect_mode. Calling update_material_thumbnails for HASH {current_material_hash[:8]}.", flush=True) # Optional Debug
+        if 'update_material_thumbnails' in globals() and callable(update_material_thumbnails):
+            update_material_thumbnails(specific_tasks_to_process=[task_details])
+        else:
+            print(f"[GetIcon - {mat_name_debug}] CRITICAL: update_material_thumbnails function not found!", file=sys.stderr, flush=True)
+        return 0 # Return 0 as thumbnail is not ready yet / being generated
 
 def _verify_icon_template() -> bool:
     """
@@ -5278,17 +5340,25 @@ class MATERIALLIST_PT_panel(bpy.types.Panel): # Ensure bpy.types.Panel is inheri
 
         if 0 <= idx < len(scene.material_list_items):
             item = scene.material_list_items[idx]
-            # mat_for_preview = get_material_by_uuid(item.material_uuid) 
-            # if mat_for_preview:
-            #     preview_box = mat_list_box.box()
-            #     # Assuming ensure_safe_preview is defined
-            #     # if ensure_safe_preview(mat_for_preview):
-            #     #     preview_box.template_preview(mat_for_preview, show_buttons=False)
-            #     # else:
-            #     #     preview_box.label(text="Preview not available", icon='ERROR')
+            
+            mat_for_preview = get_material_by_uuid(item.material_uuid) 
+            
+            info_box_parent = mat_list_box # Default parent for info_box
 
-            #     info_box = preview_box.box() # Changed from preview_box.box() to mat_list_box.box() if preview is removed
-            info_box = mat_list_box.box() # Assuming info is always shown even if preview logic is complex
+            if mat_for_preview:
+                preview_box = mat_list_box.box() # Box for preview and its info
+                if ensure_safe_preview(mat_for_preview):
+                    preview_box.template_preview(mat_for_preview, show_buttons=False)
+                else:
+                    preview_box.label(text="Preview not available", icon='ERROR')
+                info_box_parent = preview_box # Info will be inside the preview_box
+            else:
+                # If material not found for preview, indicate it before generic info
+                missing_mat_info_box = mat_list_box.box()
+                missing_mat_info_box.label(text=f"Material (Data for '{item.material_name}') not found.", icon='ERROR')
+                # info_box_parent remains mat_list_box for the rest of the info
+
+            info_box = info_box_parent.box() # Create the info box under the determined parent
             info_box.label(text=f"Name: {item.material_name}")
             info_box.label(text=f"Source: {'Local' if not item.is_library else 'Library'}")
             info_box.label(text=f"UUID: {item.material_uuid[:8]}...")
