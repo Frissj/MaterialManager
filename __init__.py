@@ -872,13 +872,20 @@ def get_material_uuid(mat): # Unchanged (core UUID logic)
     except Exception as e: print(f"[UUID] Error setting UUID for {getattr(mat, 'name', 'Unknown')}: {e}")
     return new_id
 
-def get_unique_display_name(base_name): # Unchanged
-    existing = [mat_get_display_name(m) for m in bpy.data.materials] # Uses display names
-    if base_name not in existing: return base_name
+def get_unique_display_name(base_name):
+    global material_names # Ensure access to the global dictionary of finalized display names
+    
+    # Check for uniqueness only against display names already assigned by the addon
+    existing_display_names = set(material_names.values())
+
+    if base_name not in existing_display_names:
+        return base_name
+    
     count = 1
     while True:
         new_name = f"{base_name}.{count:03d}"
-        if new_name not in existing: return new_name
+        if new_name not in existing_display_names:
+            return new_name
         count += 1
 
 def load_material_group_cache(): # Unchanged
@@ -914,126 +921,203 @@ def save_material_group_cache(version, groups): # Unchanged
 def initialize_material_properties():
     """
     Ensures UUIDs exist for ALL materials.
-    Local non-"mat_" materials' datablocks are NAMED by their UUID (if display name doesn't start with "mat_").
-    Creates initial DB name entries if missing for non-"mat_" materials.
+    Local non-"mat_" materials' datablocks are NAMED by their UUID.
+    Creates initial DB name entries. If a material's original datablock name (or its base)
+    is already a UUID, its display name defaults to "Material" (uniquified).
+    Otherwise, the display name is based on the base of its original datablock name.
     """
     global _display_name_cache, material_names
-    print("[DEBUG DB InitProps] Running initialize_material_properties (mat_ exclusion by display name)")
-    needs_name_db_save_init = False
-    mats_to_rename_datablocks = []
+    print("[DEBUG DB InitProps] Running initialize_material_properties (UUID-name to 'Material' logic active)")
+    
+    local_needs_name_db_save_init = False 
     assigned_new_uuid_count = 0
     checked_materials_count = 0
-    renamed_datablock_count = 0
+    renamed_datablock_count_this_run = 0
     new_db_names_added_count = 0
 
-    if not material_names:
+    if not material_names: 
         print("[InitProps DB] material_names empty, attempting to load from DB...")
         load_material_names()
 
     print("[InitProps DB] Processing materials for UUIDs and initial DB names...")
-    all_mats_in_data = list(bpy.data.materials) # Iterate over a copy for safety
+    all_mats_in_data = list(bpy.data.materials)
     total_mats_to_process = len(all_mats_in_data)
     print(f"[InitProps DB] Found {total_mats_to_process} materials to check in bpy.data.materials.")
 
     for mat_idx, mat in enumerate(all_mats_in_data):
         checked_materials_count += 1
         if not mat:
-            # print(f"[InitProps DB] Skipping invalid material object at index {mat_idx}.") # Optional
             continue
 
-        original_datablock_name = mat.name # Store before potential rename
-        current_uuid_prop_on_mat = mat.get("uuid")
-        uuid_was_missing_or_invalid = not current_uuid_prop_on_mat or len(current_uuid_prop_on_mat) != 36
+        original_datablock_name = mat.name  
+        uuid_prop_before_validation = mat.get("uuid", "")
 
-        # Use validate_material_uuid to ensure a valid UUID is on the custom property.
-        # This function will assign one if missing/invalid.
-        # It returns the (potentially new) valid UUID.
-        final_uuid_for_mat = validate_material_uuid(mat, is_copy=False) # is_copy=False ensures it uses existing valid UUIDs
+        final_uuid_for_mat = validate_material_uuid(mat, is_copy=False)  
 
-        if uuid_was_missing_or_invalid and final_uuid_for_mat:
+        if not final_uuid_for_mat:
+            print(f"[InitProps DB] CRITICAL: Could not get/assign valid UUID for '{original_datablock_name}'. Skipping.")
+            continue
+
+        if not is_valid_uuid_format(uuid_prop_before_validation) or uuid_prop_before_validation != final_uuid_for_mat:
             assigned_new_uuid_count += 1
-            # Optional detailed log:
-            # print(f"[InitProps DB] Assigned/validated UUID for '{original_datablock_name}': '{current_uuid_prop_on_mat}' -> '{final_uuid_for_mat}'")
-
-        if not final_uuid_for_mat: # Should not happen if validate_material_uuid is robust
-            print(f"[InitProps DB] CRITICAL: Could not get/assign valid UUID for '{original_datablock_name}'. Skipping further processing for it.")
-            continue
+        
+        name_match_for_original = _SUFFIX_REGEX_MAT_PARSE.fullmatch(original_datablock_name)
+        base_of_original_name = original_datablock_name
+        if name_match_for_original and name_match_for_original.group(1):
+            base_of_original_name = name_match_for_original.group(1)
             
-        # Progress logging for UUID assignment
-        if assigned_new_uuid_count > 0 and assigned_new_uuid_count % 20 == 0:
-            print(f"[InitProps DB] Progress: Assigned {assigned_new_uuid_count} new UUIDs (checked {checked_materials_count}/{total_mats_to_process})...")
+        # uuid_was_adopted_from_name is kept for its original potential uses (e.g. logging or other specific logic)
+        # but is not the primary driver for display_name_basis if base_of_original_name itself is a UUID.
+        uuid_was_adopted_from_name = (
+            (not is_valid_uuid_format(uuid_prop_before_validation)) and  
+            is_valid_uuid_format(base_of_original_name) and      
+            final_uuid_for_mat == base_of_original_name          
+        )
+        
+        if final_uuid_for_mat not in material_names:
+            display_name_basis = ""
+            # MODIFIED LOGIC for display_name_basis:
+            # If the material's original datablock name (or its base) is already a UUID,
+            # its display name basis becomes "Material".
+            # Otherwise, the display name basis becomes the base of its original datablock name.
+            if is_valid_uuid_format(base_of_original_name):
+                display_name_basis = "Material"
+            else:
+                display_name_basis = base_of_original_name # Use the base part (e.g. "Rock" from "Rock.001")
+            
+            unique_display_name_for_db = get_unique_display_name(display_name_basis) # Will use the new get_unique_display_name
+            
+            material_names[final_uuid_for_mat] = unique_display_name_for_db
+            new_db_names_added_count += 1
+            local_needs_name_db_save_init = True
 
-        # Determine display name for "mat_" skip logic and for DB entry
-        # This relies on material_names potentially being loaded/updated.
-        # mat_get_display_name also calls get_material_uuid, which is fine as it's idempotent after validate_material_uuid.
-        display_name_for_logic = mat_get_display_name(mat)
+        if not mat.library:
+            effective_display_name_for_mat_check = material_names.get(final_uuid_for_mat, "")
+            
+            if not effective_display_name_for_mat_check.startswith("mat_"):
+                if mat.name != final_uuid_for_mat: 
+                    try:
+                        existing_mat_with_target_name = bpy.data.materials.get(final_uuid_for_mat)
+                        if not existing_mat_with_target_name or existing_mat_with_target_name == mat:
+                            mat.name = final_uuid_for_mat
+                            renamed_datablock_count_this_run +=1
+                    except Exception as e_rename_initprops:
+                        print(f"[InitProps DB] Error renaming local datablock '{original_datablock_name}' to '{final_uuid_for_mat}': {e_rename_initprops}")
+            
+            try:
+                if not mat.use_fake_user:
+                    mat.use_fake_user = True
+            except Exception as e_fake_user_init_props:
+                print(f"[InitProps DB] Warning: Could not set use_fake_user for local mat '{getattr(mat, 'name', 'N/A')}': {e_fake_user_init_props}")
 
-        # Logic for non-"mat_" materials (display name and datablock name)
-        if not display_name_for_logic.startswith("mat_"):
-            # Ensure DB entry for display name
-            if final_uuid_for_mat not in material_names:
-                # Use original_datablock_name for the initial display name if it's new to the DB
-                # This ensures that if a user named it "MyShinyRed", that becomes its first display name.
-                material_names[final_uuid_for_mat] = original_datablock_name
-                new_db_names_added_count += 1
-                needs_name_db_save_init = True
-                # print(f"[InitProps DB] Queued initial DB display name for non-'mat_' '{original_datablock_name}' (UUID: {final_uuid_for_mat}).")
-
-            # Ensure local non-"mat_" datablocks are named by their UUID
-            if not mat.library: # If it's a local material
-                try:
-                    if not mat.use_fake_user:
-                        mat.use_fake_user = True
-                        # This assignment will mark the material as updated in the depsgraph here.
-                        # This is fine, as 'hash_dirty' will be set to False later in delayed_load_post
-                        # *after* all such initializations are done.
-                except Exception as e_fake_user_init_props:
-                    print(f"[InitProps DB] Warning: Could not set use_fake_user for local material '{getattr(mat, 'name', 'N/A')}': {e_fake_user_init_props}")
+        if assigned_new_uuid_count > 0 and assigned_new_uuid_count % 20 == 0 and total_mats_to_process > 0:
+                print(f"[InitProps DB] Progress: Assigned/Validated {assigned_new_uuid_count} UUIDs (checked {checked_materials_count}/{total_mats_to_process})...")
 
     if assigned_new_uuid_count > 0:
         print(f"[InitProps DB] Finished UUID assignment pass. Assigned/Validated {assigned_new_uuid_count} UUIDs for {checked_materials_count} materials.")
+    if renamed_datablock_count_this_run > 0:
+        print(f"[InitProps DB] Renamed {renamed_datablock_count_this_run} local non-'mat_' datablocks to their UUIDs in this run.")
 
-    if mats_to_rename_datablocks:
-        print(f"[InitProps DB] Renaming {len(mats_to_rename_datablocks)} local non-'mat_' datablocks to their UUIDs...")
-        for mat_to_rename, target_uuid_name, old_name_for_log_local in mats_to_rename_datablocks:
-            try:
-                # Double check before renaming as bpy.data.materials might have changed if other ops ran
-                if mat_to_rename.name == target_uuid_name: continue
-
-                actual_mat_to_rename = bpy.data.materials.get(old_name_for_log_local) # Re-fetch by old name
-                if not actual_mat_to_rename or actual_mat_to_rename.name == target_uuid_name: # Might have been renamed by another process or already correct
-                    continue
-
-                existing_mat_check = bpy.data.materials.get(target_uuid_name)
-                if not existing_mat_check or existing_mat_check == actual_mat_to_rename :
-                    actual_mat_to_rename.name = target_uuid_name
-                    renamed_datablock_count += 1
-                    # print(f"[InitProps DB] Renamed local datablock '{old_name_for_log_local}' -> '{target_uuid_name}'.")
-                # else: # Optional log for conflict
-                    # print(f"[InitProps DB] Final check: Skipped rename for '{old_name_for_log_local}' to UUID '{target_uuid_name}': Name conflict.")
-            except ReferenceError:
-                print(f"[InitProps DB] ReferenceError trying to rename material that was originally '{old_name_for_log_local}'. It may have been deleted.")
-            except Exception as e_rename_final:
-                print(f"[InitProps DB] Datablock rename failed for material originally named '{old_name_for_log_local}': {e_rename_final}")
-        if renamed_datablock_count > 0:
-            print(f"[InitProps DB] Successfully renamed {renamed_datablock_count} non-'mat_' local datablocks.")
-
-    if needs_name_db_save_init:
-        print(f"[InitProps DB] Saving {new_db_names_added_count} newly added initial display names to database...")
+    if local_needs_name_db_save_init:
+        print(f"[InitProps DB] Saving {new_db_names_added_count} newly added/updated display names to database...")
         save_material_names()
-        _display_name_cache.clear() # Clear cache as names might have changed
+        _display_name_cache.clear()
 
     print("[DEBUG DB InitProps] initialize_material_properties finished.")
 
-def validate_material_uuid(mat, is_copy=False): # Unchanged (core UUID logic)
-    if mat is None: return None
-    original_uuid = mat.get("uuid", "")
-    if not original_uuid or len(original_uuid) != 36 or is_copy:
-        new_uuid = str(uuid.uuid4())
-        try: mat["uuid"] = new_uuid
-        except Exception as e: print(f"Warning: Could not set UUID on {getattr(mat, 'name', 'N/A')}: {e}")
-        return new_uuid
-    return original_uuid
+def is_valid_uuid_format(uuid_string):
+    """
+    Checks if the given string is a well-formatted UUID.
+    A simple structural check is performed, then uuid.UUID() for full validation.
+    """
+    if not isinstance(uuid_string, str) or len(uuid_string) != 36:
+        return False
+    # Basic check for xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx format with 4 hyphens
+    parts = uuid_string.split('-')
+    if len(parts) != 5:
+        return False
+    if not (len(parts[0]) == 8 and len(parts[1]) == 4 and len(parts[2]) == 4 and \
+            len(parts[3]) == 4 and len(parts[4]) == 12):
+        return False
+    # Try to convert to UUID object for full validation of hex characters etc.
+    try:
+        uuid.UUID(uuid_string) # This will raise ValueError if format is wrong (e.g. invalid chars)
+        return True
+    except ValueError:
+        return False
+
+def is_valid_uuid_format(uuid_string):
+    """
+    Checks if the given string is a well-formatted UUID.
+    A simple structural check is performed, then uuid.UUID() for full validation.
+    """
+    if not isinstance(uuid_string, str) or len(uuid_string) != 36:
+        return False
+    parts = uuid_string.split('-')
+    if len(parts) != 5:
+        return False
+    if not (len(parts[0]) == 8 and len(parts[1]) == 4 and len(parts[2]) == 4 and \
+            len(parts[3]) == 4 and len(parts[4]) == 12):
+        return False
+    try:
+        uuid.UUID(uuid_string)
+        return True
+    except ValueError:
+        return False
+
+# --- MODIFIED FUNCTION ---
+def validate_material_uuid(mat, is_copy=False): # In __init__.py
+    """
+    Ensures a material has a valid UUID stored in its custom property "uuid".
+    Priority:
+    1. If is_copy, always generate a new UUID.
+    2. Use existing "uuid" custom property if valid.
+    3. If "uuid" custom prop is missing/invalid, check mat.name (and its base).
+       If the base of mat.name is a valid UUID string, use it.
+    4. Otherwise, generate a new UUID.
+    Returns the determined UUID string.
+    """
+    if mat is None:
+        return None
+
+    if is_copy:
+        new_uuid_for_copy = str(uuid.uuid4())
+        try:
+            mat["uuid"] = new_uuid_for_copy
+        except Exception as e:
+            print(f"[UUID Validate] Warning: Could not set new UUID on copied material {getattr(mat, 'name', 'N/A')}: {e}")
+        return new_uuid_for_copy
+
+    # 1. Check existing "uuid" custom property
+    uuid_prop_val = mat.get("uuid", "")
+    if is_valid_uuid_format(uuid_prop_val):
+        return uuid_prop_val
+
+    # 2. If custom property is missing or invalid, check if the base of mat.name is a valid UUID
+    current_mat_name = getattr(mat, 'name', None)
+    if current_mat_name:
+        name_match = _SUFFIX_REGEX_MAT_PARSE.fullmatch(current_mat_name)
+        base_name_from_datablock = current_mat_name # Default to full name if no suffix
+        if name_match and name_match.group(1): # Ensure group(1) exists (base name part)
+            base_name_from_datablock = name_match.group(1)
+
+        if is_valid_uuid_format(base_name_from_datablock):
+            # print(f"[UUID Validate] Mat '{current_mat_name}' base '{base_name_from_datablock}' is UUID. Using it and setting custom prop.")
+            try:
+                mat["uuid"] = base_name_from_datablock # Set the custom property
+                return base_name_from_datablock
+            except Exception as e:
+                print(f"[UUID Validate] Warning: Could not set 'uuid' prop from mat's base name '{base_name_from_datablock}': {e}. Generating new UUID.")
+                # Fall through to new UUID generation if setting the property fails
+
+    # 3. If no valid UUID found via prop or name, generate a new one.
+    # print(f"[UUID Validate] Mat '{getattr(mat, 'name', 'N/A')}' - No valid UUID from prop or name. Generating new UUID.")
+    new_fallback_uuid = str(uuid.uuid4())
+    try:
+        mat["uuid"] = new_fallback_uuid
+    except Exception as e:
+        print(f"[UUID Validate] Warning: Could not set newly generated fallback UUID on {getattr(mat, 'name', 'N/A')}: {e}")
+    return new_fallback_uuid
 
 # --------------------------
 # Background Library Updates (Unchanged, _perform_library_update already skips "mat_" by display name)
@@ -3880,7 +3964,7 @@ def ensure_icon_template():
 
     temp_setup_scene_name = f"IconTemplate_TEMP_SETUP_{str(uuid.uuid4())[:8]}"
     temp_setup_scene = None
-    scene_to_save_in_template = None
+    scene_to_save_in_template = None # Will be defined by the inserted snippet
     created_data_blocks_for_template_file = []  # Store references to all created data
 
     try:
@@ -3942,7 +4026,7 @@ def ensure_icon_template():
                 print(f"[IconTemplate Ensure]   Pre-cleanup: Successfully removed scene '{scene_to_remove_name_check}'.")
             except Exception as e_remove_scene_robust:
                 print(f"[IconTemplate Ensure]   Error during pre-cleanup of scene '{scene_to_remove_name_check}': {e_remove_scene_robust}. Template creation may result in a suffixed scene name.")
-                break
+                break # Avoid infinite loop if removal fails
 
         # --- END CRITICAL PRE-CLEANUP ---
 
@@ -3951,6 +4035,8 @@ def ensure_icon_template():
             print("[IconTemplate Ensure] CRITICAL: Failed to create temporary setup scene for context.")
             return False
 
+        # --- START OF USER'S PROVIDED SNIPPET ---
+        # Create data blocks (mesh, camera, light) as before
         mesh_data = bpy.data.meshes.new(preview_mesh_data_name)
         bm = bmesh.new()
         bmesh.ops.create_uvsphere(bm, u_segments=32, v_segments=16, radius=0.8)
@@ -3972,55 +4058,68 @@ def ensure_icon_template():
         created_data_blocks_for_template_file.append(cam_data)
 
         light_data = bpy.data.lights.new(light_data_name, type='POINT')
-        # Don't set energy yet
         created_data_blocks_for_template_file.append(light_data)
 
+        # --- MODIFICATION: Create the scene_to_save_in_template earlier ---
+        print(f"[IconTemplate Ensure] Creating scene for template file with target name: '{template_scene_name_in_file}'")
+        scene_to_save_in_template = bpy.data.scenes.new(template_scene_name_in_file)
+        if not scene_to_save_in_template: # Your original check was later, this is a good place for it
+            print(f"[IconTemplate Ensure] CRITICAL: Failed to create target template scene with name '{template_scene_name_in_file}'.")
+            raise RuntimeError(f"Failed to create target template scene '{template_scene_name_in_file}'.")
+
+        print(f"[IconTemplate Ensure] Scene created with actual name: '{scene_to_save_in_template.name}'. Intended: '{template_scene_name_in_file}'.")
+        if scene_to_save_in_template.name != template_scene_name_in_file: # Your original check
+            print(f"[IconTemplate Ensure] CRITICAL WARNING: Created scene name '{scene_to_save_in_template.name}' "
+                  f"does not match target '{template_scene_name_in_file}'. This will likely cause worker failure. "
+                  "Check pre-cleanup logs for scene removal issues.")
+            raise RuntimeError(f"Template scene created with incorrect name: {scene_to_save_in_template.name} vs target {template_scene_name_in_file}")
+        # --- End scene creation block, scene_to_save_in_template now exists ---
+        # Add scene and its collection to the list of items to be written (as in your original code)
+        created_data_blocks_for_template_file.append(scene_to_save_in_template)
+        created_data_blocks_for_template_file.append(scene_to_save_in_template.collection)
+
+
         preview_obj = bpy.data.objects.new(preview_obj_name, mesh_data)
-        # Rotate sphere by -25° on Y and -45° on Z
+        # *** MODIFICATION: Link to scene's collection BEFORE modifying transform ***
+        scene_to_save_in_template.collection.objects.link(preview_obj)
+        # Now modify properties
         preview_obj.rotation_euler = (0, math.radians(-25), math.radians(-45))
-        # Apply only the Weighted Normal modifier
         wn_mod = preview_obj.modifiers.new(name="WeightedNormal", type='WEIGHTED_NORMAL')
         created_data_blocks_for_template_file.append(preview_obj)
 
         cam_obj = bpy.data.objects.new(camera_obj_name, cam_data)
+        # *** MODIFICATION: Link to scene's collection BEFORE modifying transform ***
+        scene_to_save_in_template.collection.objects.link(cam_obj)
+        # Now modify properties
         cam_obj.location = (1.7, -1.7, 1.4)
         cam_obj.rotation_euler = (math.radians(60), 0, math.radians(45))
         created_data_blocks_for_template_file.append(cam_obj)
 
         light_obj = bpy.data.objects.new(light_obj_name, light_data)
+        # *** MODIFICATION: Link to scene's collection BEFORE modifying transform ***
+        scene_to_save_in_template.collection.objects.link(light_obj)
+        # Now modify properties
         light_obj.location = (0.15, -2.0, 1.3)
         created_data_blocks_for_template_file.append(light_obj)
 
-        print(f"[IconTemplate Ensure] Creating scene for template file with target name: '{template_scene_name_in_file}'")
-        scene_to_save_in_template = bpy.data.scenes.new(template_scene_name_in_file)
-        if not scene_to_save_in_template:
-            print(f"[IconTemplate Ensure] CRITICAL: Failed to create target template scene with name '{template_scene_name_in_file}'.")
-            raise RuntimeError(f"Failed to create target template scene '{template_scene_name_in_file}'.")
-
-        print(f"[IconTemplate Ensure] Scene created with actual name: '{scene_to_save_in_template.name}'. Intended: '{template_scene_name_in_file}'.")
-        if scene_to_save_in_template.name != template_scene_name_in_file:
-            print(f"[IconTemplate Ensure] CRITICAL WARNING: Created scene name '{scene_to_save_in_template.name}' "
-                  f"does not match target '{template_scene_name_in_file}'. This will likely cause worker failure. "
-                  "Check pre-cleanup logs for scene removal issues.")
-            raise RuntimeError(f"Template scene created with incorrect name: {scene_to_save_in_template.name} vs target {template_scene_name_in_file}")
-
-        scene_to_save_in_template.collection.objects.link(preview_obj)
-        scene_to_save_in_template.collection.objects.link(cam_obj)
-        scene_to_save_in_template.collection.objects.link(light_obj)
+        # Set active camera for the scene (this was after linking in your original, which is fine)
         scene_to_save_in_template.camera = cam_obj
 
+        # Set light energy (this was after linking in your original try-catch, which is correct)
         try:
             light_data.energy = 240
             print(f"[IconTemplate Ensure] Set light_data.energy = {light_data.energy} after linking object.")
-        except AttributeError as e_energy:
+        except AttributeError as e_energy: # Your specific exception handling
             print(f"[IconTemplate Ensure] CRITICAL ERROR setting light energy even after linking: {e_energy}")
             traceback.print_exc()
             raise
-        except Exception as e_generic_energy: # Catch any other exception during energy setting
+        except Exception as e_generic_energy:
             print(f"[IconTemplate Ensure] CRITICAL GENERIC ERROR setting light energy: {e_generic_energy}")
             traceback.print_exc()
             raise
+        # --- END OF USER'S PROVIDED SNIPPET ---
 
+        # ... (The rest of your function: render settings, writing to file, verification, cleanup) proceeds from here
         try:
             current_engine_options = bpy.context.scene.render.bl_rna.properties['engine'].enum_items.keys()
             if 'BLENDER_EEVEE_NEXT' in current_engine_options:
@@ -4045,9 +4144,9 @@ def ensure_icon_template():
             elif hasattr(eevee_settings, 'samples'): # For older Eevee
                 eevee_settings.samples = 16
 
-        # CRITICAL: Add the scene and its collection to the list of items to be written
-        created_data_blocks_for_template_file.append(scene_to_save_in_template)
-        created_data_blocks_for_template_file.append(scene_to_save_in_template.collection)
+        # Note: The lines below were originally here, but are now handled within the user's snippet.
+        # created_data_blocks_for_template_file.append(scene_to_save_in_template)
+        # created_data_blocks_for_template_file.append(scene_to_save_in_template.collection)
 
         temp_dir_for_blend_save = tempfile.mkdtemp(prefix="icon_template_blend_")
         temp_blend_path = os.path.join(temp_dir_for_blend_save, os.path.basename(ICON_TEMPLATE_FILE))
@@ -4121,9 +4220,9 @@ def ensure_icon_template():
                     elif isinstance(block, bpy.types.Light) and block_name_for_cleanup in bpy.data.lights:
                         bpy.data.lights.remove(bpy.data.lights[block_name_for_cleanup])
                     elif isinstance(block, bpy.types.Scene) and block_name_for_cleanup in bpy.data.scenes:
-                         # Be careful removing scenes if they are active or last one
+                        # Be careful removing scenes if they are active or last one
                         if len(bpy.data.scenes) > 1 and bpy.context.window and bpy.context.window.scene != block:
-                             bpy.data.scenes.remove(bpy.data.scenes[block_name_for_cleanup])
+                                bpy.data.scenes.remove(bpy.data.scenes[block_name_for_cleanup])
                         elif len(bpy.data.scenes) == 1 and block_name_for_cleanup in bpy.data.scenes : # It's the only scene, can't remove
                             print(f"[IconTemplate Ensure] Cannot remove scene '{block_name_for_cleanup}', it's the only one.")
                         else: # It might be active in a window
@@ -5491,7 +5590,7 @@ class MATERIALLIST_PT_panel(bpy.types.Panel): # Ensure bpy.types.Panel is inheri
         # MODIFICATION END
 
         # --- Material List Display & Info ---
-        mat_list_box = layout.box()
+        mat_list_box = layout.box() # Assuming this is how you structure it
         row = mat_list_box.row(align=True)
         row.label(text="Materials:", icon='MATERIAL')
         row.prop(scene, "material_list_sort_alpha", text="", toggle=True, icon='SORTALPHA')
@@ -5503,29 +5602,33 @@ class MATERIALLIST_PT_panel(bpy.types.Panel): # Ensure bpy.types.Panel is inheri
         sub_row = mat_list_box.row(align=True)
         sub_row.prop(scene, "material_search", text="", icon='VIEWZOOM')
 
+        idx = scene.material_list_active_index # Corrected from active_propname
         if 0 <= idx < len(scene.material_list_items):
             item = scene.material_list_items[idx]
-            mat_for_preview = get_material_by_uuid(item.material_uuid)
-            info_box_parent = mat_list_box
+            mat_for_preview = get_material_by_uuid(item.material_uuid) # Use helper
+            info_box_parent = mat_list_box # Default parent for info if no preview
 
             if mat_for_preview:
                 preview_box = mat_list_box.box()
-                if ensure_safe_preview(mat_for_preview):
-                    preview_box.template_preview(mat_for_preview, show_buttons=False)
+                if ensure_safe_preview(mat_for_preview): # ensure_safe_preview from your existing code
+                    # MODIFICATION HERE: show_buttons=True (or remove to use default True)
+                    preview_box.template_preview(mat_for_preview, show_buttons=True) 
                 else:
                     preview_box.label(text="Preview not available", icon='ERROR')
-                info_box_parent = preview_box
+                info_box_parent = preview_box # Info below preview if preview exists
             else:
+                # Handle case where material for preview isn't found (optional, good for robustness)
                 missing_mat_info_box = mat_list_box.box()
                 missing_mat_info_box.label(text=f"Material (Data for '{item.material_name}') not found.", icon='ERROR')
 
-            info_box = info_box_parent.box()
-            info_box.label(text=f"Name: {item.material_name}")
+
+            info_box = info_box_parent.box() # Add info box under preview or directly under list
+            info_box.label(text=f"Name: {item.material_name}") 
             info_box.label(text=f"Source: {'Local' if not item.is_library else 'Library'}")
             info_box.label(text=f"UUID: {item.material_uuid[:8]}...")
-
-            name_to_check = item.original_name
-            if not name_to_check.startswith("mat_") and name_to_check != "Material":
+          
+            name_to_check = item.original_name 
+            if name_to_check and not name_to_check.startswith("mat_") and name_to_check != "Material": # Added check for name_to_check
                 count = sum(1 for li in scene.material_list_items if li.original_name == name_to_check)
                 if count > 1:
                     warning_box = info_box.box(); warning_box.alert = True
@@ -5898,7 +6001,7 @@ def unregister():
     global custom_icons
     global thumbnail_monitor_timer_active, thumbnail_worker_pool, thumbnail_task_queue
     global thumbnail_pending_on_disk_check, thumbnail_generation_scheduled
-    global db_connections 
+    global db_connections
     global material_names, material_hashes, global_hash_cache, material_list_cache, _display_name_cache
     # New batch globals
     global g_thumbnail_process_ongoing, g_material_creation_timestamp_at_process_start
@@ -5909,71 +6012,65 @@ def unregister():
 
     if thumbnail_monitor_timer_active:
         print("[Unregister] Attempting to stop thumbnail monitor timer...")
-        if bpy.app.timers.is_registered(process_thumbnail_tasks): 
+        if bpy.app.timers.is_registered(process_thumbnail_tasks):
             try:
                 bpy.app.timers.unregister(process_thumbnail_tasks)
                 print("[Unregister] Thumbnail monitor timer successfully unregistered.")
-            except Exception as e_tmr_unreg: 
-                 print(f"[Unregister] Error unregistering thumbnail monitor timer: {e_tmr_unreg}")
+            except Exception as e_tmr_unreg:
+                print(f"[Unregister] Error unregistering thumbnail monitor timer: {e_tmr_unreg}")
         else:
             print("[Unregister] Thumbnail monitor timer was not registered.")
         thumbnail_monitor_timer_active = False
 
     print(f"[Unregister] Found {len(thumbnail_worker_pool)} thumbnail worker processes to terminate...")
-    for worker_idx, worker_info in enumerate(list(thumbnail_worker_pool)): 
+    for worker_idx, worker_info in enumerate(list(thumbnail_worker_pool)):
         process = worker_info.get('process')
         batch_info = worker_info.get('batched_tasks_in_worker', [])
         batch_id = "N/A"
         if batch_info and len(batch_info) > 0 and batch_info[0].get('hash_value'):
             batch_id = batch_info[0]['hash_value'][:8]
-        
+
         print(f"[Unregister] Processing worker {worker_idx + 1}/{len(thumbnail_worker_pool)} (Batch ID: {batch_id})")
-        
+
         if not process:
             print(f"  Worker {worker_idx + 1}: No process object found, skipping.")
             continue
-            
+
         if not hasattr(process, 'poll'):
             print(f"  Worker {worker_idx + 1}: Process object has no poll method, skipping.")
             continue
-            
+
         # Check if process is still running
         poll_result = process.poll()
         if poll_result is not None:
             print(f"  Worker {worker_idx + 1}: Process already terminated with exit code {poll_result}.")
             continue
-            
-        # Process is still running, attempt to terminate
+
+        # Process is still running, attempt to kill directly
         try:
             pid = getattr(process, 'pid', 'Unknown')
-            print(f"  Worker {worker_idx + 1}: Attempting to terminate running process (PID: {pid})...")
-            
-            process.terminate()
-            print(f"  Worker {worker_idx + 1}: Terminate signal sent, waiting up to 2 seconds...")
-            
+            print(f"  Worker {worker_idx + 1}: Attempting to kill running process (PID: {pid})...")
+
+            process.kill() # Using kill() directly
+            print(f"  Worker {worker_idx + 1}: Kill signal sent, waiting up to 0.15 seconds...")
+
             try:
-                process.wait(timeout=2.0)
+                process.wait(timeout=0.15) # MODIFIED Wait time
                 final_exit_code = process.poll()
-                print(f"  Worker {worker_idx + 1}: Process terminated gracefully with exit code {final_exit_code}.")
+                if final_exit_code is not None:
+                    print(f"  Worker {worker_idx + 1}: Process confirmed killed with exit code {final_exit_code}.")
+                else:
+                    # This case would be unusual after a kill and wait
+                    print(f"  Worker {worker_idx + 1}: WARNING - Process state unclear after kill signal and wait. PID: {pid}")
             except subprocess.TimeoutExpired:
-                print(f"  Worker {worker_idx + 1}: Process did not terminate within 2 seconds, attempting to kill...")
-                try:
-                    process.kill()
-                    print(f"  Worker {worker_idx + 1}: Kill signal sent, waiting up to 1 second...")
-                    process.wait(timeout=1.0)
-                    final_exit_code = process.poll()
-                    print(f"  Worker {worker_idx + 1}: Process killed with exit code {final_exit_code}.")
-                except subprocess.TimeoutExpired:
-                    print(f"  Worker {worker_idx + 1}: CRITICAL - Process did not respond to kill signal within 1 second!")
-                except Exception as e_kill:
-                    print(f"  Worker {worker_idx + 1}: Error during kill: {e_kill}")
-            except Exception as e_wait:
-                print(f"  Worker {worker_idx + 1}: Error during wait after terminate: {e_wait}")
-                
-        except AttributeError as e_attr: 
-            print(f"  Worker {worker_idx + 1}: Process object missing expected attributes: {e_attr}")
-        except Exception as e_term: 
-            print(f"  Worker {worker_idx + 1}: Unexpected error during termination: {e_term}")
+                print(f"  Worker {worker_idx + 1}: WARNING - Process (PID: {pid}) did not confirm exit within 0.15 seconds after kill signal.")
+            except Exception as e_wait_kill:
+                print(f"  Worker {worker_idx + 1}: Error during wait after kill (PID: {pid}): {e_wait_kill}")
+
+        except AttributeError as e_attr:
+            print(f"  Worker {worker_idx + 1}: Process object missing expected attributes for kill: {e_attr}")
+        except Exception as e_kill_general: # Changed variable name for clarity
+            print(f"  Worker {worker_idx + 1}: Unexpected error during kill attempt: {e_kill_general}")
 
     thumbnail_worker_pool.clear()
     print(f"[Unregister] Worker pool cleared. Processing task queue...")
@@ -5981,45 +6078,45 @@ def unregister():
     queue_size = thumbnail_task_queue.qsize()
     print(f"[Unregister] Draining {queue_size} items from thumbnail task queue...")
     drained_count = 0
-    while not thumbnail_task_queue.empty(): 
+    while not thumbnail_task_queue.empty():
         try:
             thumbnail_task_queue.get_nowait()
             drained_count += 1
         except Empty:
             break
     print(f"[Unregister] Drained {drained_count} items from task queue.")
-    
+
     thumbnail_pending_on_disk_check.clear()
     print(f"[Unregister] Cleared thumbnail_pending_on_disk_check dictionary.")
 
-    for handler_list, func in handler_pairs: 
-        if func and callable(func): 
+    for handler_list, func in handler_pairs:
+        if func and callable(func):
             removed_count = 0
-            while func in handler_list: 
+            while func in handler_list:
                 try:
                     handler_list.remove(func)
                     removed_count += 1
-                except ValueError: 
-                    break 
-                except Exception as e_handler_unreg: 
+                except ValueError:
+                    break
+                except Exception as e_handler_unreg:
                     print(f"[Unregister] Error removing handler {func.__name__}: {e_handler_unreg}")
-                    break 
+                    break
             if removed_count > 0:
                 print(f"[Unregister] Removed handler {func.__name__} {removed_count} time(s).")
 
-    for prop_name, _ in scene_props: 
+    for prop_name, _ in scene_props:
         if hasattr(bpy.types.Scene, prop_name):
             try:
                 delattr(bpy.types.Scene, prop_name)
                 print(f"[Unregister] Removed scene property: {prop_name}")
-            except Exception as e_prop_unreg: 
-                 print(f"[Unregister] Error deleting scene property '{prop_name}': {e_prop_unreg}")
+            except Exception as e_prop_unreg:
+                print(f"[Unregister] Error deleting scene property '{prop_name}': {e_prop_unreg}")
 
     if hasattr(bpy.types.WindowManager, 'matlist_save_handler_processed'):
         try:
             delattr(bpy.types.WindowManager, 'matlist_save_handler_processed')
             print(f"[Unregister] Removed WindowManager.matlist_save_handler_processed")
-        except Exception as e_wm_prop_unreg: 
+        except Exception as e_wm_prop_unreg:
             print(f"[Unregister] Error deleting WindowManager.matlist_save_handler_processed: {e_wm_prop_unreg}")
     if hasattr(bpy.types.WindowManager, 'matlist_pending_lib_update_is_forced'):
         try:
@@ -6028,24 +6125,24 @@ def unregister():
         except Exception as e_wm_prop_unreg_force:
             print(f"[Unregister] Error deleting WindowManager.matlist_pending_lib_update_is_forced: {e_wm_prop_unreg_force}")
 
-    for cls in reversed(classes): 
+    for cls in reversed(classes):
         try:
             bpy.utils.unregister_class(cls)
             print(f"[Unregister] Unregistered class: {cls.__name__}")
-        except RuntimeError: 
+        except RuntimeError:
             print(f"[Unregister] Class {cls.__name__} was not registered, skipping.")
-        except Exception as e_cls_unreg: 
+        except Exception as e_cls_unreg:
             print(f"[Unregister] Error unregistering class {cls.__name__}: {e_cls_unreg}")
 
     if custom_icons is not None:
         try:
             bpy.utils.previews.remove(custom_icons)
             print(f"[Unregister] Removed custom_icons preview collection.")
-        except Exception as e_preview_rem: 
+        except Exception as e_preview_rem:
             print(f"[Unregister] Error removing custom_icons preview collection: {e_preview_rem}")
         custom_icons = None
 
-    if 'db_connections' in globals() and isinstance(db_connections, Queue): 
+    if 'db_connections' in globals() and isinstance(db_connections, Queue):
         closed_count = 0
         print(f"[Unregister] Closing database connections from pool...")
         while not db_connections.empty():
@@ -6053,12 +6150,12 @@ def unregister():
                 conn = db_connections.get_nowait()
                 conn.close()
                 closed_count +=1
-            except Empty: 
-                break 
-            except Exception as e_db_close: 
+            except Empty:
+                break
+            except Exception as e_db_close:
                 print(f"[Unregister] Error closing a DB connection from pool: {e_db_close}")
-                break 
-        if closed_count > 0: 
+                break
+        if closed_count > 0:
             print(f"[Unregister] Closed {closed_count} DB connections from pool.")
 
     material_names.clear()
@@ -6066,7 +6163,7 @@ def unregister():
     global_hash_cache.clear()
     material_list_cache.clear()
     _display_name_cache.clear()
-    thumbnail_generation_scheduled.clear() 
+    thumbnail_generation_scheduled.clear()
     # Clear new batch globals
     g_tasks_for_current_run.clear()
     g_current_run_task_hashes_being_processed.clear()
