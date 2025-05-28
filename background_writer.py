@@ -153,35 +153,25 @@ def validate_material_uuid(mat, is_copy=False): # From background_writer.py
         return str(uuid.uuid4())
     return original_uuid
 
-def get_material_hash(mat, current_blend_filepath_for_worker_context=None):
+def get_material_hash(mat, current_blend_filepath_for_worker_context=None): # current_blend_filepath_for_worker_context is not used by _hash_image
     """
     Calculates a content-based hash for a material.
     This version is for background_writer.py and does NOT use main addon caches.
-    `current_blend_filepath_for_worker_context` is the path to the .blend file
-    currently being processed by the worker (e.g., the transfer file), crucial for
-    resolving '//' style image paths within that file's context if bpy.data.filepath
-    is not reliable in the worker for this purpose.
     """
-    if not mat: 
+    if not mat:
         return None
-    
+
     mat_name_for_debug = getattr(mat, 'name_full', getattr(mat, 'name', 'UnknownMaterial_BG_Worker'))
-    # mat_uuid = mat.get("uuid") # Not used for caching in this worker version
-
-    # NO CACHING LOGIC using main addon's material_hashes or global_hash_cache here.
-    # This function in the worker always calculates or relies on its own context.
-
-    # print(f"[GetHash BG_WORKER - CALCULATING] Mat: {mat_name_for_debug}, UUID: {mat_uuid}")
 
     hash_inputs = []
-    pbr_image_hashes = set() 
+    pbr_image_hashes = set()
 
     try:
         principled_node = None
         material_output_node = None
 
         if mat.use_nodes and mat.node_tree:
-            principled_node = find_principled_bsdf(mat) 
+            principled_node = find_principled_bsdf(mat)
             for node_out_check in mat.node_tree.nodes:
                 if node_out_check.bl_idname == 'ShaderNodeOutputMaterial' and node_out_check.is_active_output:
                     material_output_node = node_out_check
@@ -191,7 +181,7 @@ def get_material_hash(mat, current_blend_filepath_for_worker_context=None):
                     if node_out_check.bl_idname == 'ShaderNodeOutputMaterial':
                         material_output_node = node_out_check
                         break
-        else: 
+        else:
             hash_inputs.append("NON_NODE_MATERIAL_BG_WORKER") # Suffix for clarity
             hash_inputs.append(f"DiffuseColor:{_stable_repr(mat.diffuse_color)}")
             hash_inputs.append(f"Metallic:{_stable_repr(mat.metallic)}")
@@ -206,7 +196,7 @@ def get_material_hash(mat, current_blend_filepath_for_worker_context=None):
                 ("Subsurface Weight", "value_texture"), ("Subsurface Color", "color_texture"),
                 ("Subsurface Radius", "vector_value_only"), ("Subsurface Scale", "value_only"),
                 ("Subsurface IOR", "value_only"), ("Subsurface Anisotropy", "value_only"),
-                ("Clearcoat Weight", "value_texture"), ("Clearcoat Tint", "color_texture"), 
+                ("Clearcoat Weight", "value_texture"), ("Clearcoat Tint", "color_texture"),
                 ("Clearcoat Roughness", "value_texture"),
                 ("Clearcoat Normal", "normal_texture_special"),
                 ("Specular IOR Level", "value_texture"), ("Specular Tint", "color_texture"),
@@ -240,7 +230,7 @@ def get_material_hash(mat, current_blend_filepath_for_worker_context=None):
                             if nm_color_input and nm_color_input.is_linked and nm_color_input.links[0].from_node.bl_idname == 'ShaderNodeTexImage':
                                 tex_node = nm_color_input.links[0].from_node
                                 if tex_node.image:
-                                    img_hash = _hash_image(tex_node.image, current_blend_filepath_for_worker_context)
+                                    img_hash = _hash_image(tex_node.image) # MODIFIED: Removed second argument
                                     if img_hash: pbr_image_hashes.add(img_hash)
                                     tex_hash = img_hash if img_hash else f"TEX_NORMALMAP_IMG_NO_HASH_BGW_{getattr(tex_node.image, 'name', 'Unnamed')}"
                             hash_inputs.append(f"{input_key_str}=NORMALMAP(Strength:{_stable_repr(nm_strength)},Tex:{tex_hash})")
@@ -254,19 +244,19 @@ def get_material_hash(mat, current_blend_filepath_for_worker_context=None):
                             if bump_height_input and bump_height_input.is_linked and bump_height_input.links[0].from_node.bl_idname == 'ShaderNodeTexImage':
                                 tex_node = bump_height_input.links[0].from_node
                                 if tex_node.image:
-                                    img_hash = _hash_image(tex_node.image, current_blend_filepath_for_worker_context)
+                                    img_hash = _hash_image(tex_node.image) # MODIFIED: Removed second argument
                                     if img_hash: pbr_image_hashes.add(img_hash)
                                     tex_hash = img_hash if img_hash else f"TEX_BUMP_IMG_NO_HASH_BGW_{getattr(tex_node.image, 'name', 'Unnamed')}"
                             hash_inputs.append(f"{input_key_str}=BUMPMAP(Strength:{_stable_repr(bump_strength)},Distance:{_stable_repr(bump_distance)},Tex:{tex_hash})")
                         elif source_node.bl_idname == 'ShaderNodeTexImage' and source_node.image:
-                            img_hash = _hash_image(source_node.image, current_blend_filepath_for_worker_context)
+                            img_hash = _hash_image(source_node.image) # MODIFIED: Removed second argument
                             if img_hash: pbr_image_hashes.add(img_hash)
                             tex_hash = img_hash if img_hash else f"TEX_NORMAL_IMG_NO_HASH_BGW_{getattr(source_node.image, 'name', 'Unnamed')}"
                             hash_inputs.append(f"{input_key_str}=TEX:{tex_hash}")
                         else:
                             hash_inputs.append(f"{input_key_str}=LINKED_NODE:{source_node.bl_idname}_SOCKET:{source_socket_name}")
                     elif source_node.bl_idname == 'ShaderNodeTexImage' and source_node.image:
-                        img_hash = _hash_image(source_node.image, current_blend_filepath_for_worker_context)
+                        img_hash = _hash_image(source_node.image) # MODIFIED: Removed second argument
                         if img_hash: pbr_image_hashes.add(img_hash)
                         tex_hash = img_hash if img_hash else f"TEX_{input_name.replace(' ','')}_IMG_NO_HASH_BGW_{getattr(source_node.image, 'name', 'Unnamed')}"
                         hash_inputs.append(f"{input_key_str}=TEX:{tex_hash}")
@@ -289,38 +279,37 @@ def get_material_hash(mat, current_blend_filepath_for_worker_context=None):
                     if disp_height_input and disp_height_input.is_linked and disp_height_input.links[0].from_node.bl_idname == 'ShaderNodeTexImage':
                         tex_node = disp_height_input.links[0].from_node
                         if tex_node.image:
-                            img_hash = _hash_image(tex_node.image, current_blend_filepath_for_worker_context)
+                            img_hash = _hash_image(tex_node.image) # MODIFIED: Removed second argument
                             if img_hash: pbr_image_hashes.add(img_hash)
                             tex_hash = img_hash if img_hash else f"TEX_DISP_IMG_NO_HASH_BGW_{getattr(tex_node.image, 'name', 'Unnamed')}"
                     hash_inputs.append(f"MAT_OUTPUT_DISPLACEMENT=DISP_NODE(Mid:{_stable_repr(disp_midlevel)},Scale:{_stable_repr(disp_scale)},Tex:{tex_hash})")
-                elif source_node.bl_idname == 'ShaderNodeTexImage' and source_node.image: 
-                    img_hash = _hash_image(source_node.image, current_blend_filepath_for_worker_context)
+                elif source_node.bl_idname == 'ShaderNodeTexImage' and source_node.image:
+                    img_hash = _hash_image(source_node.image) # MODIFIED: Removed second argument
                     if img_hash: pbr_image_hashes.add(img_hash)
                     tex_hash = img_hash if img_hash else f"TEX_DISP_DIRECT_IMG_NO_HASH_BGW_{getattr(source_node.image, 'name', 'Unnamed')}"
                     hash_inputs.append(f"MAT_OUTPUT_DISPLACEMENT=TEX:{tex_hash}")
-                else: 
+                else:
                     hash_inputs.append(f"MAT_OUTPUT_DISPLACEMENT=LINKED_NODE:{source_node.bl_idname}_SOCKET:{source_socket_name}")
 
         if mat.use_nodes and mat.node_tree:
             for node in mat.node_tree.nodes:
                 if node.bl_idname == 'ShaderNodeTexImage' and node.image:
-                    img_hash_general = _hash_image(node.image, current_blend_filepath_for_worker_context) 
+                    img_hash_general = _hash_image(node.image) # MODIFIED: Removed second argument
                     if img_hash_general:
                         pbr_image_hashes.add(img_hash_general)
 
         if pbr_image_hashes:
-            sorted_pbr_image_hashes = sorted(list(pbr_image_hashes)) 
+            sorted_pbr_image_hashes = sorted(list(pbr_image_hashes))
             hash_inputs.append(f"ALL_UNIQUE_IMAGE_HASHES_COMBINED:{'|'.join(sorted_pbr_image_hashes)}")
-        
+
         final_hash_string = f"VERSION:{HASH_VERSION_FOR_WORKER}|||" + "|||".join(sorted(hash_inputs))
         digest = hashlib.md5(final_hash_string.encode('utf-8')).hexdigest()
-        
-        # No attempt to update main addon's global_hash_cache or material_hashes from the worker
+
         return digest
 
     except Exception as e:
         print(f"[BG_WORKER get_material_hash] Error hashing mat '{mat_name_for_debug}': {type(e).__name__} - {e}", file=sys.stderr)
-        traceback.print_exc(file=sys.stderr) 
+        traceback.print_exc(file=sys.stderr)
         return None
 
 # --- Database Timestamp Function (Used by Merge Library) ---
