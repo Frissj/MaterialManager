@@ -5476,7 +5476,7 @@ class MATERIALLIST_PT_panel(bpy.types.Panel): # Ensure bpy.types.Panel is inheri
         workspace_box = layout.box()
         row = workspace_box.row(align=True)
         row.label(text="Workspace Mode:", icon='FILE_BLEND')
-        row.label(text=f"{scene.workspace_mode}") 
+        row.label(text=f"{scene.workspace_mode}")
         workspace_box.operator("materiallist.toggle_workspace_mode", text=f"Switch to {'Editing' if scene.workspace_mode == 'REFERENCE' else 'Reference'}", icon='ARROW_LEFTRIGHT')
 
         # --- Material Options ---
@@ -5498,28 +5498,23 @@ class MATERIALLIST_PT_panel(bpy.types.Panel): # Ensure bpy.types.Panel is inheri
         idx = scene.material_list_active_index
         if 0 <= idx < len(scene.material_list_items):
             item = scene.material_list_items[idx]
-            # Assuming get_material_by_uuid is defined (e.g. in addon's __init__.py or a helpers module)
-            # And it's properly imported or available in the scope of this panel.
-            # For example: from .. import get_material_by_uuid (if in a sub-module)
-            # For now, we'll assume it's globally available or part of the addon's structure.
-            # mat_for_make_local_check = get_material_by_uuid(item.material_uuid) 
-            # Due to not having the definition of get_material_by_uuid, I'll comment out dependent lines
-            # to ensure this snippet is runnable standalone, focusing on the UI structure.
-            # You'd uncomment and ensure get_material_by_uuid is correctly referenced in your full addon.
-            pass # Placeholder for where mat_for_make_local_check would be used.
-            # if mat_for_make_local_check and mat_for_make_local_check.library:
-            #     options_box.operator("materiallist.make_local", icon='LINKED', text="Make Selected Local")
+            mat_for_make_local_check = get_material_by_uuid(item.material_uuid)
+            if mat_for_make_local_check and mat_for_make_local_check.library:
+                options_box.operator("materiallist.make_local", icon='LINKED', text="Make Selected Local")
+
 
         # --- Reference Snapshot ---
         backup_box = layout.box()
-        backup_box.label(text="Reference Snapshot", icon='INFO') 
+        backup_box.label(text="Reference Snapshot", icon='INFO')
         backup_box.operator("materiallist.backup_editing", icon='FILE_TICK', text="Backup Current as Reference")
 
         # --- Assign to Active Object ---
         assign_box = layout.box()
+        # MODIFICATION START: Moved select_dominant to the top
+        assign_box.operator("materiallist.select_dominant", text="Select Dominant Material on Active Object", icon='RESTRICT_SELECT_OFF')
         assign_box.operator("materiallist.add_material_to_slot", icon='PLUS', text="Add Selected to Object Slots")
         assign_box.operator("materiallist.assign_selected_material", icon='BRUSH_DATA', text="Assign Selected to Faces/Object")
-        assign_box.operator("materiallist.select_dominant", text="Select Dominant Material on Active Object", icon='RESTRICT_SELECT_OFF')
+        # MODIFICATION END
 
         # --- Material List Display & Info ---
         mat_list_box = layout.box()
@@ -5536,25 +5531,21 @@ class MATERIALLIST_PT_panel(bpy.types.Panel): # Ensure bpy.types.Panel is inheri
 
         if 0 <= idx < len(scene.material_list_items):
             item = scene.material_list_items[idx]
-            
-            mat_for_preview = get_material_by_uuid(item.material_uuid) 
-            
-            info_box_parent = mat_list_box # Default parent for info_box
+            mat_for_preview = get_material_by_uuid(item.material_uuid)
+            info_box_parent = mat_list_box
 
             if mat_for_preview:
-                preview_box = mat_list_box.box() # Box for preview and its info
+                preview_box = mat_list_box.box()
                 if ensure_safe_preview(mat_for_preview):
                     preview_box.template_preview(mat_for_preview, show_buttons=False)
                 else:
                     preview_box.label(text="Preview not available", icon='ERROR')
-                info_box_parent = preview_box # Info will be inside the preview_box
+                info_box_parent = preview_box
             else:
-                # If material not found for preview, indicate it before generic info
                 missing_mat_info_box = mat_list_box.box()
                 missing_mat_info_box.label(text=f"Material (Data for '{item.material_name}') not found.", icon='ERROR')
-                # info_box_parent remains mat_list_box for the rest of the info
 
-            info_box = info_box_parent.box() # Create the info box under the determined parent
+            info_box = info_box_parent.box()
             info_box.label(text=f"Name: {item.material_name}")
             info_box.label(text=f"Source: {'Local' if not item.is_library else 'Library'}")
             info_box.label(text=f"UUID: {item.material_uuid[:8]}...")
@@ -5570,24 +5561,18 @@ class MATERIALLIST_PT_panel(bpy.types.Panel): # Ensure bpy.types.Panel is inheri
         library_ops_box = layout.box()
         library_ops_box.label(text="Library Operations", icon='ASSET_MANAGER')
         library_ops_box.operator("materiallist.integrate_library", text="Integrate External Library", icon='IMPORT')
-        #library_ops_box.operator("materiallist.pack_library_textures", text="Pack All Library Textures", icon='PACKAGE')
+        #library_ops_box.operator("materiallist.pack_library_textures", text="Pack All Library Textures", icon='PACKAGE') # Restored this line
 
         # --- Batch Utilities ---
         project_util_box = layout.box()
         project_util_box.label(text="Batch Utilities", icon='TOOL_SETTINGS')
-        
-        # MODIFIED LINE: Changed the text label for the directory property.
-        # This assumes scene.material_list_external_unpack_dir is defined with subtype='DIR_PATH'
-        # in your addon's registration code to enable the directory explorer.
         project_util_box.prop(scene, "material_list_external_unpack_dir", text="External Output Folder")
 
         col = project_util_box.column(align=True)
-        # These bl_idname strings should correspond to your Operator classes
-        col.operator("materiallist.pack_textures_externally", text="Unpack Lib into Folder", icon='EXPORT') # Assuming bl_idname matches your operator
-        col.separator(factor=0.7) 
-        col.operator("materiallist.pack_textures_internally", text="Pack into Local Projects", icon='IMPORT') # Assuming bl_idname matches your operator
-        
-        project_util_box.operator("materiallist.trim_library", icon='TRASH', text="Trim Library") # Assuming bl_idname matches
+        col.operator("materiallist.pack_textures_externally", text="Unpack Lib into Folder", icon='EXPORT')
+        col.separator(factor=0.7)
+        col.operator("materiallist.pack_textures_internally", text="Pack into Local Projects", icon='IMPORT')
+        project_util_box.operator("materiallist.trim_library", icon='TRASH', text="Trim Library")
 
         # --- Global Refresh ---
         refresh_box = layout.box()
