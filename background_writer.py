@@ -16,7 +16,7 @@ import math
 
 # --- Globals for Thumbnail Rendering Part (initialized by functions) ---
 ICON_TEMPLATE_FILE_WORKER = None
-THUMBNAIL_SIZE_WORKER = 128 # Default, overridden by arg
+THUMBNAIL_SIZE_WORKER = 256 # Default, overridden by arg
 persistent_icon_template_scene_worker = None # Cache for loaded template scene within this worker instance
 
 # --- Hashing Functions (Ensure these match your main addon's implementation) ---
