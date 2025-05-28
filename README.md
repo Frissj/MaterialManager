@@ -24,7 +24,7 @@ Key Features:
 
     Duplicate & Make Local: Quickly create editable local copies of any material. Convert linked library materials into local versions within your current project, automatically remapping all users.
     Flexible Assignment: Easily assign materials to objects or selected faces, add materials to object slots without immediate assignment, or quickly unassign all "mat_" prefixed utility materials.
-    Batch Utilities: "Rename to Albedo" (renames based on Base Color texture), "Select Dominant Material" on your active object, and "Localise All Users" (batch converts library materials to local in all linked project files).
+    Batch Utilities: "Rename to Albedo" (renames based on Base Color texture), "Select Dominant Material" on your active object, 
     Intuitive UI: Search, sort (alphabetically/recency), filter (local/used, hide "mat_"), and get detailed previews and information for your selected material.
 
 💪 Robust, Stable & Developer-Friendly
