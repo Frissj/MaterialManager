@@ -5317,9 +5317,9 @@ class MATERIALLIST_PT_panel(bpy.types.Panel): # Ensure bpy.types.Panel is inheri
 
         col = project_util_box.column(align=True)
         # These bl_idname strings should correspond to your Operator classes
-        col.operator("materiallist.pack_textures_externally", text="Projects: Localise & Unpack Externally", icon='EXPORT') # Assuming bl_idname matches your operator
-        col.separator(factor=0.5) 
-        col.operator("materiallist.pack_textures_internally", text="Projects: Localise & Pack Internally", icon='IMPORT') # Assuming bl_idname matches your operator
+        col.operator("materiallist.pack_textures_externally", text="Unpack Lib into Folder", icon='EXPORT') # Assuming bl_idname matches your operator
+        col.separator(factor=0.7) 
+        col.operator("materiallist.pack_textures_internally", text="Pack into Local Projects", icon='IMPORT') # Assuming bl_idname matches your operator
         
         project_util_box.operator("materiallist.trim_library", icon='TRASH', text="Trim Library") # Assuming bl_idname matches
 
