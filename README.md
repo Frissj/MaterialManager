@@ -24,7 +24,7 @@ Key Features:
 
     Duplicate & Make Local: Quickly create editable local copies of any material. Convert linked library materials into local versions within your current project, automatically remapping all users.
     Flexible Assignment: Easily assign materials to objects or selected faces, add materials to object slots without immediate assignment, or quickly unassign all "mat_" prefixed utility materials.
-    Batch Utilities: "Rename to Albedo" (renames based on Base Color texture), "Select Dominant Material" on your active object, 
+    Batch Utilities: "Rename to Albedo" (renames based on Base Color texture), "Select Dominant Material" on your active object, "Unpack Lib into Folder" will take all library materials and unpack to a folder of your choice, then repath. Designed if you do not want to use the addon anymore, "Pack into Local Projects" is designed if you want to share files or do not trust Blender to keep track of links. 
     Intuitive UI: Search, sort (alphabetically/recency), filter (local/used, hide "mat_"), and get detailed previews and information for your selected material.
 
 💪 Robust, Stable & Developer-Friendly
