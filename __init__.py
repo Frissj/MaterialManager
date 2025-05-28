@@ -1154,10 +1154,7 @@ def _perform_library_update(force: bool = False):
 
     print(f"[DEBUG LibUpdate MainAddon] Effective force for this run: {effective_force}")
 
-    # Load current material hashes from DB (material_hashes global is populated)
-    # These hashes are now purely content-based.
     load_material_hashes()
-    # existing_hashes_in_db_for_uuid = material_hashes # More descriptive name, it's {uuid: content_hash}
 
     existing_names_in_lib_file = set() # Stores UUIDs (datablock names) present in material_library.blend
 
@@ -1165,81 +1162,50 @@ def _perform_library_update(force: bool = False):
         try:
             with bpy.data.libraries.load(LIBRARY_FILE, link=False, assets_only=True) as (data_from_lib_names, _):
                 if hasattr(data_from_lib_names, 'materials'):
-                    # These names in the library file ARE the UUIDs of the library materials
                     existing_names_in_lib_file = {name for name in data_from_lib_names.materials if isinstance(name, str)}
-            # print(f"[DEBUG LibUpdate MainAddon] Names (UUIDs) found in existing library file '{os.path.basename(LIBRARY_FILE)}': {existing_names_in_lib_file if existing_names_in_lib_file else 'None'}")
         except Exception as e:
             print(f"[DEBUG LibUpdate MainAddon] Error loading names from library file '{LIBRARY_FILE}': {e}")
-            # Decide if you want to proceed or return False if library is inaccessible
     else:
         print(f"[DEBUG LibUpdate MainAddon] Library file '{LIBRARY_FILE}' does not exist. `existing_names_in_lib_file` will be empty.")
 
-    to_transfer = [] # List of material objects from current scene to transfer
-    # This set prevents adding multiple local materials that have the *same content hash*
-    # to the *same single transfer file operation*. The worker will handle further logic.
+    to_transfer = []
     processed_content_hashes_for_this_transfer_op = set()
+
+    # MODIFICATION 1: Initialize list for deferred fake user setting
+    mats_needing_fake_user_setting = []
 
     print(f"[DEBUG LibUpdate MainAddon] Iterating {len(bpy.data.materials)} materials in current .blend file for potential transfer.")
     for mat_idx, mat in enumerate(bpy.data.materials):
         mat_name_debug = getattr(mat, 'name', f'InvalidMaterialObject_idx_{mat_idx}')
         try:
             if getattr(mat, 'library', None):
-                # print(f"  Skipping '{mat_name_debug}': Is a library material itself (linked from elsewhere).")
                 continue
 
-            # Ensure material has a "uuid" custom property and its datablock name is that UUID
-            # This should have been handled by save_handler or initialize_material_properties for local, non-"mat_" materials.
-            # For "mat_" materials, they might still have their descriptive names, but should have a "uuid" prop.
-            # The key is that the 'uid' used here should be the persistent identifier for this datablock.
-            uid = mat.get("uuid") # Get the persistent UUID from custom property
+            uid = mat.get("uuid")
             if not uid:
-                uid = validate_material_uuid(mat) # Ensure "uuid" prop exists, get or create it
+                uid = validate_material_uuid(mat)
                 try:
-                    mat["uuid"] = uid # Make sure it's set on the object if validate_material_uuid just returned it
+                    mat["uuid"] = uid
                 except Exception as e_setuuid_loop:
                     print(f"  Warning: Could not set 'uuid' property on {mat_name_debug} during lib update check: {e_setuuid_loop}")
 
-
-            # If datablock name is not its UUID (common for "mat_" or newly created before save_handler rename)
-            # it's fine, as worker will use "uuid" prop if name isn't UUID.
-            # For transfer, materials are typically renamed to their UUID if they are local non-"mat_".
-            # The crucial part is that 'uid' variable holds the intended persistent ID for this material datablock.
-
             if not uid:
-                # print(f"  Skipping '{mat_name_debug}': Could not get/assign valid persistent UUID for processing.")
                 continue
 
-            # Skip "mat_" prefixed materials (by display name) from being added to library,
-            # unless you specifically want them in the library.
-            # This uses mat_get_display_name which relies on 'material_names' global.
-            display_name = mat_get_display_name(mat) # Ensure material_names is loaded
+            display_name = mat_get_display_name(mat)
             if display_name.startswith("mat_"):
-                # print(f"  Skipping '{mat_name_debug}' (display name '{display_name}'): Starts with 'mat_'.")
                 continue
 
-            # Get current content hash (now purely content-based)
-            # Force recalculation for local materials being considered for transfer
             current_content_hash = get_material_hash(mat, force=True)
 
             if not current_content_hash:
-                # print(f"  Skipping '{mat_name_debug}' (UUID: {uid}): Failed to calculate its content_hash.")
                 continue
 
-            # Avoid adding multiple *different local materials* that happen to have the
-            # *same content hash* to this single transfer operation.
-            # The worker will decide if this content (under its new UUID) needs to be added to the library.
             if current_content_hash in processed_content_hashes_for_this_transfer_op and not effective_force:
-                # print(f"  Skipping '{mat_name_debug}' (UUID: {uid}, ContentHash: {current_content_hash[:8]}): This content hash already added to transfer list this run from another local material.")
                 continue
 
-            # Check conditions for transferring this material (identified by 'uid')
-            # 1. Is this 'uid' already a datablock name in material_library.blend?
             uid_is_in_library_file = uid in existing_names_in_lib_file
-
-            # 2. What is the hash stored in our DB for this 'uid'?
-            db_hash_for_this_uid = material_hashes.get(uid) # material_hashes is {uuid: content_hash}
-
-            # Conditions to decide if this material (by its 'uid') needs to be transferred for add/update
+            db_hash_for_this_uid = material_hashes.get(uid)
             should_transfer = False
             reason_for_transfer = []
 
@@ -1248,73 +1214,76 @@ def _perform_library_update(force: bool = False):
                 reason_for_transfer.append("ForcedUpdate")
             else:
                 if not uid_is_in_library_file:
-                    should_transfer = True # It's a new UUID to the library
+                    should_transfer = True
                     reason_for_transfer.append("NewUUIDToLibrary")
-                elif db_hash_for_this_uid is None: # UUID known in lib file, but not in our DB hash cache (should be rare if lib is consistent)
+                elif db_hash_for_this_uid is None:
                     should_transfer = True
                     reason_for_transfer.append("UUIDInLibFileButNotInDBHashCache")
                 elif current_content_hash != db_hash_for_this_uid:
-                    should_transfer = True # Content of this known UUID has changed
+                    should_transfer = True
                     reason_for_transfer.append("ContentChangedForExistingUUID")
-                # No explicit 'else: skip' here, should_transfer remains false if no condition met
-
-            # print(f"  Checking {mat_name_debug} (UUID: {uid}, ContentHash: {current_content_hash[:8]}, DBHashForUUID: {db_hash_for_this_uid[:8] if db_hash_for_this_uid else 'None'}):")
-            # print(f"    IsUIDInLibFile ({uid}): {uid_is_in_library_file}")
-            # print(f"    ShouldTransfer: {should_transfer} (Reasons: {', '.join(reason_for_transfer) if reason_for_transfer else 'None'})")
 
             if should_transfer:
-                # Before adding to transfer, ensure its datablock name IS its UUID.
-                # This is crucial for the worker, which expects materials in the transfer file
-                # (and later in the library file) to be named by their UUID.
                 if mat.name != uid:
                     try:
-                        # print(f"    Renaming datablock '{mat.name}' to its UUID '{uid}' for transfer.")
-                        # Check if a material with the target UUID name already exists AND IS DIFFERENT
                         existing_mat_with_target_name = bpy.data.materials.get(uid)
                         if existing_mat_with_target_name and existing_mat_with_target_name != mat:
-                            print(f"    WARNING: Cannot rename '{mat.name}' to UUID '{uid}' for transfer. Target name exists and is a different datablock. Skipping this material.")
-                            continue # Skip this problematic material
+                            print(f"      WARNING: Cannot rename '{mat.name}' to UUID '{uid}' for transfer. Target name exists and is a different datablock. Skipping this material.")
+                            continue
                         mat.name = uid
                     except Exception as rename_err:
-                        print(f"    WARNING: Failed to rename datablock '{mat.name}' to UUID '{uid}' for transfer: {rename_err}. Skipping this material.")
-                        continue # Skip if rename fails
+                        print(f"      WARNING: Failed to rename datablock '{mat.name}' to UUID '{uid}' for transfer: {rename_err}. Skipping this material.")
+                        continue
+                
+                # MODIFICATION 2: Remove direct setting of use_fake_user from here
+                # if hasattr(mat, 'use_fake_user'):
+                #     mat.use_fake_user = True # <--- ORIGINAL ERROR LINE (REMOVED)
 
-                if hasattr(mat, 'use_fake_user'):
-                    mat.use_fake_user = True
+                # MODIFICATION 3: Add to list for deferred setting
+                if mat and not mat.library: # Ensure it's local and should be processed
+                    mats_needing_fake_user_setting.append(mat)
 
-                # Stamp origin information
                 try:
                     current_filepath_for_origin = bpy.data.filepath if bpy.data.filepath else "UnsavedOrUnknown"
-                    # 'uid' is the persistent UUID of the source material datablock
-                    # 'display_name' is the source material's display name
                     mat["ml_origin_blend_file"] = current_filepath_for_origin
-                    mat["ml_origin_mat_name"] = display_name # Store the original display name from source
-                    mat["ml_origin_mat_uuid"] = uid # Store the UUID of the source material datablock
-
-                    # print(f"    Stamping origin on '{mat.name}': File='{os.path.basename(current_filepath_for_origin)}', SourceOrigName='{display_name}', SourceUUID='{uid}'")
+                    mat["ml_origin_mat_name"] = display_name
+                    mat["ml_origin_mat_uuid"] = uid
                 except Exception as e_set_origin_prop:
-                    print(f"    Warning: Could not set origin custom properties on '{mat.name}': {e_set_origin_prop}")
+                    print(f"      Warning: Could not set origin custom properties on '{mat.name}': {e_set_origin_prop}")
 
-                print(f"    >>> ADDING '{mat.name}' (orig display name: '{display_name}', ContentHash: {current_content_hash[:8]}) TO TRANSFER LIST. Reason: {reason_for_transfer}")
+                print(f"      >>> ADDING '{mat.name}' (orig display name: '{display_name}', ContentHash: {current_content_hash[:8]}) TO TRANSFER LIST. Reason: {reason_for_transfer}")
                 to_transfer.append(mat)
                 processed_content_hashes_for_this_transfer_op.add(current_content_hash)
-                # Update material_hashes in memory (and later save to DB) for this UUID with its current content hash
-                material_hashes[uid] = current_content_hash # This ensures cond_hash_changed works correctly next time
+                material_hashes[uid] = current_content_hash
 
         except ReferenceError:
-            # print(f"  Skipping material at index {mat_idx}: ReferenceError (material likely deleted during iteration).")
             continue
         except Exception as loop_error:
             print(f"[DEBUG LibUpdate MainAddon] Error processing material {mat_name_debug} in loop: {loop_error}")
             traceback.print_exc()
+    
+    # --- MODIFICATION 4: Insert the deferred setting of use_fake_user ---
+    if mats_needing_fake_user_setting:
+        print(f"[DEBUG LibUpdate MainAddon] Setting use_fake_user for {len(mats_needing_fake_user_setting)} materials.")
+        for mat_to_set in mats_needing_fake_user_setting:
+            try:
+                # Ensure it's a valid, local material from bpy.data before attempting to set fake user
+                if mat_to_set and mat_to_set.name in bpy.data.materials and \
+                   not mat_to_set.library and hasattr(mat_to_set, 'use_fake_user'):
+                    if not mat_to_set.use_fake_user: # Only set if not already True
+                        mat_to_set.use_fake_user = True
+            except AttributeError as e_attr: # Catch the specific error
+                print(f"  Error setting use_fake_user for {getattr(mat_to_set, 'name', 'N/A')} (AttributeError): {e_attr}", file=sys.stderr)
+                # traceback.print_exc(file=sys.stderr) # Keep commented unless detailed trace is needed
+            except Exception as e_general:
+                print(f"  Error setting use_fake_user for {getattr(mat_to_set, 'name', 'N/A')}: {e_general}", file=sys.stderr)
+                # traceback.print_exc(file=sys.stderr) # Keep commented unless detailed trace is needed
+    # --- End of MODIFICATION 4 ---
 
     if not to_transfer:
         print("[DEBUG LibUpdate MainAddon] Nothing to transfer to library.")
-        # Save material_hashes if any were updated in memory even if nothing transferred (e.g. hash changed but no transfer needed)
-        # This would be if a material was skipped due to processed_content_hashes_for_this_transfer_op
-        # but its individual material_hashes[uid] was updated.
-        save_material_hashes() # Ensure any in-memory changes to material_hashes are persisted
-        return True # Indicate completion (nothing to do)
+        save_material_hashes()
+        return True
 
     print(f"[DEBUG LibUpdate MainAddon] Preparing to transfer {len(to_transfer)} materials.")
     try:
@@ -1331,18 +1300,15 @@ def _perform_library_update(force: bool = False):
         tmp_dir_for_transfer = tempfile.mkdtemp(prefix="matlib_transfer_")
         transfer_blend_file_path = os.path.join(tmp_dir_for_transfer, f"transfer_data_{uuid.uuid4().hex[:8]}.blend")
 
-        # Ensure all materials in 'to_transfer' are valid Material type objects
         valid_mats_for_bpy_write = {m for m in to_transfer if isinstance(m, bpy.types.Material)}
 
         if not valid_mats_for_bpy_write:
             print("[DEBUG LibUpdate MainAddon] No valid material objects in the transfer list after filtering. Nothing to write.")
             if tmp_dir_for_transfer and os.path.exists(tmp_dir_for_transfer):
                 shutil.rmtree(tmp_dir_for_transfer, ignore_errors=True)
-            save_material_hashes() # Persist any hash updates
-            return True # Nothing written, but process completed.
+            save_material_hashes()
+            return True
 
-        # The materials in valid_mats_for_bpy_write are the ones that will be written.
-        # Their names should be their UUIDs by now.
         actual_mats_written_to_transfer_file = valid_mats_for_bpy_write
 
         print(f"[DEBUG LibUpdate MainAddon] Writing {len(actual_mats_written_to_transfer_file)} materials to transfer file: {transfer_blend_file_path}")
@@ -1354,13 +1320,12 @@ def _perform_library_update(force: bool = False):
         traceback.print_exc()
         if tmp_dir_for_transfer and os.path.exists(tmp_dir_for_transfer):
             shutil.rmtree(tmp_dir_for_transfer, ignore_errors=True)
-        save_material_hashes() # Persist any hash updates
-        return False # Indicate failure
+        save_material_hashes()
+        return False
 
-    # --- Staging textures for the transfer file ---
     if actual_mats_written_to_transfer_file and tmp_dir_for_transfer:
         print(f"[DEBUG LibUpdate MainAddon] Staging textures for transfer file '{os.path.basename(transfer_blend_file_path)}' into temp dir: {tmp_dir_for_transfer}")
-        unique_images_to_stage = {} # {original_abs_path_in_main_session: target_abs_path_in_temp_dir_for_worker}
+        unique_images_to_stage = {}
 
         for mat_in_transfer_file in actual_mats_written_to_transfer_file:
             if mat_in_transfer_file.use_nodes and mat_in_transfer_file.node_tree:
@@ -1368,16 +1333,13 @@ def _perform_library_update(force: bool = False):
                     if node.bl_idname == 'ShaderNodeTexImage' and node.image:
                         img_datablock = node.image
                         if img_datablock.packed_file:
-                            # print(f"  Image '{img_datablock.name}' is packed. Will be handled by library write.")
                             continue
                         if not img_datablock.filepath_raw:
-                            # print(f"  Image '{img_datablock.name}' has no filepath_raw. Skipping staging.")
                             continue
 
                         original_stored_path_in_datablock = img_datablock.filepath_raw
                         source_abs_path_in_main_blender_session = ""
                         try:
-                            # This resolves relative to the *current main .blend file* being saved
                             source_abs_path_in_main_blender_session = bpy.path.abspath(original_stored_path_in_datablock)
                         except Exception as e_abs_main_session:
                             print(f"  WARNING: Could not resolve abspath for '{original_stored_path_in_datablock}' (image '{img_datablock.name}') in main session: {e_abs_main_session}. Skipping staging for this texture.")
@@ -1387,24 +1349,14 @@ def _perform_library_update(force: bool = False):
                             print(f"  WARNING: Source texture file for staging not found at '{source_abs_path_in_main_blender_session}' (from raw '{original_stored_path_in_datablock}', image '{img_datablock.name}'). Cannot stage.")
                             continue
                         
-                        # The worker will expect textures relative to the transfer_blend_file_path if they are '//'
-                        # So, if the original_stored_path_in_datablock was `//textures/mytex.png`,
-                        # we need to copy `source_abs_path_in_main_blender_session` to
-                        # `tmp_dir_for_transfer/textures/mytex.png`.
                         target_abs_path_in_temp_staging_dir = ""
                         if original_stored_path_in_datablock.startswith('//'):
                             relative_part_from_blend_root = original_stored_path_in_datablock[2:]
-                            # Normalize for os.path.join, important if paths came from different OS
                             normalized_relative_part = relative_part_from_blend_root.replace('\\', os.sep).replace('/', os.sep)
                             target_abs_path_in_temp_staging_dir = os.path.join(tmp_dir_for_transfer, normalized_relative_part)
                             
-                            if source_abs_path_in_main_blender_session not in unique_images_to_stage: # Avoid redundant copy instructions
+                            if source_abs_path_in_main_blender_session not in unique_images_to_stage:
                                 unique_images_to_stage[source_abs_path_in_main_blender_session] = target_abs_path_in_temp_staging_dir
-                        # else: Absolute paths in image datablocks are left as is; worker will try to find them.
-                        # If they were relative but not `//` (e.g. `textures/mytex.png`), bpy.path.abspath resolved them.
-                        # The worker, when loading transfer_blend_file_path, will see these as absolute.
-                        # This behavior might need refinement if non-// relative paths are common and need to be staged.
-                        # For now, only `//` paths are explicitly staged into the temp dir structure.
 
         if unique_images_to_stage:
             print(f"[DEBUG LibUpdate MainAddon] Copying {len(unique_images_to_stage)} unique relatively-pathed ('//') image files to temp staging area for worker...")
@@ -1412,16 +1364,13 @@ def _perform_library_update(force: bool = False):
             for src_path, temp_dest_path in unique_images_to_stage.items():
                 try:
                     os.makedirs(os.path.dirname(temp_dest_path), exist_ok=True)
-                    shutil.copy2(src_path, temp_dest_path) # copy2 preserves metadata like timestamps
+                    shutil.copy2(src_path, temp_dest_path)
                     staged_count +=1
                 except Exception as e_stage_copy:
                     print(f"    ERROR STAGING: Failed to copy '{src_path}' to '{temp_dest_path}': {e_stage_copy}")
                     failed_copy_count +=1
             print(f"[DEBUG LibUpdate MainAddon] Staging of {staged_count} relatively-pathed images complete. Failed copies: {failed_copy_count}.")
-    # --- End Staging Textures ---
 
-    # Save material_hashes (which contains {uuid: content_hash}) to DB.
-    # This includes hashes for materials that were just added to to_transfer.
     save_material_hashes()
     print(f"[DEBUG LibUpdate MainAddon] Updated and saved material_hashes to DB for materials processed in this update.")
 
@@ -1429,35 +1378,29 @@ def _perform_library_update(force: bool = False):
         print(f"[DEBUG LibUpdate MainAddon] CRITICAL Error: Background worker script missing or path invalid: {BACKGROUND_WORKER_PY}")
         if tmp_dir_for_transfer and os.path.exists(tmp_dir_for_transfer):
             shutil.rmtree(tmp_dir_for_transfer, ignore_errors=True)
-        return False # Cannot launch worker
+        return False
 
-    # --- Launch Background Worker Thread ---
     def _bg_merge_thread_target(transfer_file, target_library, database_path_for_worker, temp_dir_to_cleanup_after_worker):
         try:
             db_file_abs_for_worker = os.path.abspath(database_path_for_worker) if database_path_for_worker else None
             if not db_file_abs_for_worker or not os.path.exists(db_file_abs_for_worker):
                 print(f"[BG Merge Thread] WARNING: Database file not found at '{db_file_abs_for_worker}' for worker's use. Origin/timestamps might not be updated by worker.", file=sys.stderr)
-                # Worker can still proceed with merge if DB is only for secondary info.
 
             cmd = [
                 bpy.app.binary_path,
-                "--background", # Run Blender in background
-                "--factory-startup", # Start with a clean state, no user prefs or startup file
-                # The transfer_file itself is NOT loaded via command line here.
-                # The worker script will load it using bpy.data.libraries.load()
-                # This is important if transfer_file contains materials that might conflict with factory startup scene.
+                "--background", 
+                "--factory-startup", 
                 "--python", BACKGROUND_WORKER_PY,
-                "--", # Separator for script arguments
+                "--", 
                 "--operation", "merge_library",
-                "--transfer", transfer_file, # Path to the .blend file with materials to merge
-                "--target", target_library, # Path to the main material_library.blend
+                "--transfer", transfer_file, 
+                "--target", target_library,
             ]
-            if db_file_abs_for_worker: # Only pass DB path if it's valid
-                 cmd.extend(["--db", db_file_abs_for_worker])
+            if db_file_abs_for_worker:
+                cmd.extend(["--db", db_file_abs_for_worker])
 
             print(f"[BG Merge Thread] Executing worker command: {' '.join(cmd)}", flush=True)
-            # Increased timeout as library operations can be slow
-            res = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=600) # 10 minutes
+            res = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=600)
 
             if res.stdout:
                 print(f"[BG Merge Thread - Worker Stdout For {os.path.basename(transfer_file)}]:\n{res.stdout}", flush=True)
@@ -1478,28 +1421,24 @@ def _perform_library_update(force: bool = False):
         finally:
             if temp_dir_to_cleanup_after_worker and os.path.exists(temp_dir_to_cleanup_after_worker):
                 try:
-                    shutil.rmtree(temp_dir_to_cleanup_after_worker, ignore_errors=False) # Try to raise error if cleanup fails
+                    shutil.rmtree(temp_dir_to_cleanup_after_worker, ignore_errors=False)
                     print(f"[BG Merge Thread] Cleaned up temp directory: {temp_dir_to_cleanup_after_worker}", flush=True)
                 except Exception as e_clean_final:
                     print(f"[BG Merge Thread] Warning: Error cleaning up temp directory '{temp_dir_to_cleanup_after_worker}': {e_clean_final}", flush=True)
-                    # This might indicate files are locked, which could be an issue.
-    # --- End Background Worker Thread ---
 
     library_file_abs_path = os.path.abspath(LIBRARY_FILE)
-    db_file_abs_path_for_main = os.path.abspath(DATABASE_FILE) # For the worker
+    db_file_abs_path_for_main = os.path.abspath(DATABASE_FILE)
 
-    # Launch the background merge operation in a separate thread
-    # The worker process itself is a separate Blender instance.
     bg_thread = Thread(target=_bg_merge_thread_target, args=(
         transfer_blend_file_path,
         library_file_abs_path,
-        db_file_abs_path_for_main, # Pass the DB path to the worker
-        tmp_dir_for_transfer # Pass the whole temp dir for cleanup
+        db_file_abs_path_for_main,
+        tmp_dir_for_transfer
     ), daemon=True)
     bg_thread.start()
 
     print(f"[DEBUG LibUpdate MainAddon] Background merge thread launched for {len(actual_mats_written_to_transfer_file)} materials. Transfer file: {os.path.basename(transfer_blend_file_path)}, Target Library: {os.path.basename(library_file_abs_path)}")
-    return True # Update process initiated
+    return True
 
 # --------------------------------------------------------------
 # Localisation-Worker helper (Unchanged)
