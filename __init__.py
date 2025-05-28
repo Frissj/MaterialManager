@@ -28,20 +28,43 @@ from datetime import datetime
 # --------------------------
 def get_material_manager_addon_data_dir():
     """
-    Returns a user-writable directory path for the addon's persistent data.
-    It tries to create a subdirectory within Blender's user configuration path.
+    Returns a directory path for the addon's persistent data.
+    It attempts to create a subdirectory within C:\ProgramData.
+    WARNING: Writing to C:\ProgramData typically requires administrator privileges.
+             This addon may not function correctly without them if this path is used.
     """
-    try:
-        config_path = bpy.utils.user_resource('CONFIG')
-        addon_data_path = os.path.join(config_path, "MaterialManagerAddon_Data")
-    except AttributeError:
-        print("Warning: bpy.utils.user_resource('CONFIG') not available. Falling back to user's home directory.", flush=True)
-        home_path = os.path.expanduser("~")
-        addon_data_path = os.path.join(home_path, ".MaterialManagerAddon_Data")
+    # --- MODIFICATION START ---
+    # User-requested base path
+    base_data_path = r"C:\ProgramData" 
+    # --- MODIFICATION END ---
+
+    addon_data_path = os.path.join(base_data_path, "MaterialManagerAddon_Data")
 
     try:
         os.makedirs(addon_data_path, exist_ok=True)
         print(f"[Path Setup] Addon data directory set to: {addon_data_path}", flush=True)
+        
+        # Add a check to see if the directory is actually writable
+        # This is a simple test by trying to create a temporary file
+        # A more robust check might be needed depending on specific OS interactions.
+        test_file_path = os.path.join(addon_data_path, f"write_test_{uuid.uuid4().hex}.tmp")
+        try:
+            with open(test_file_path, 'w') as f_test:
+                f_test.write("test")
+            os.remove(test_file_path)
+            print(f"[Path Setup] Write access to {addon_data_path} confirmed.", flush=True)
+        except Exception as write_test_error:
+            print(f"WARNING: Could not confirm write access to {addon_data_path}. Test failed: {write_test_error}", flush=True)
+            print("The addon might not be able to save persistent data to this location without appropriate permissions.", flush=True)
+
+
+    except PermissionError as pe:
+        print(f"CRITICAL PERMISSION ERROR: Could not create or write to addon data directory: {addon_data_path}", flush=True)
+        print(f"Error details: {pe}", flush=True)
+        print("Please ensure Blender has write permissions to this location, or run Blender as an administrator (not generally recommended).", flush=True)
+        temp_dir_fallback = tempfile.mkdtemp(prefix="MaterialManagerAddon_TEMP_")
+        print(f"FALLBACK: Using temporary directory for data (DATA WILL NOT PERSIST): {temp_dir_fallback}", flush=True)
+        return temp_dir_fallback
     except Exception as e:
         print(f"CRITICAL ERROR: Could not create or access addon data directory: {addon_data_path}", flush=True)
         print(f"Error details: {e}", flush=True)
