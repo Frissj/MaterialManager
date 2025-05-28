@@ -131,6 +131,7 @@ g_dispatch_lock = Lock()
 g_library_update_pending = False
 g_current_run_task_hashes_being_processed = set() # Tracks hashes in current run batches to avoid re-queueing by get_custom_icon
 # --- End New Globals ---
+_preview_type_cache = {}
 
 # --------------------------
 # MATERIAL LIST ITEM CLASS
@@ -5339,15 +5340,26 @@ def force_redraw(limit_timer: bool = False):
         # one swap is plenty; comment out to disable completely
         bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
 
-def ensure_safe_preview(mat): # Kept from old addon for panel usage
-    if not mat: return False
+def ensure_safe_preview(mat):
+    if not mat:
+        return False
     try:
-        if not hasattr(mat, 'preview'): return False
-        if not mat.preview:
-            try: mat.preview_ensure(); return True
-            except: return False
+        # get previous preview type from our external cache
+        last = _preview_type_cache.get(mat.name, None)
+        # read current type
+        cur = getattr(mat, "preview_render_type", None)
+        if cur is None:
+            # force first render
+            mat.preview_ensure()
+            cur = mat.preview_render_type
+        # only re-render if the type changed
+        if last != cur:
+            mat.preview_ensure()
+            _preview_type_cache[mat.name] = cur
         return True
-    except: return False
+    except Exception as e:
+        print(f"[Preview] ERROR on {mat.name}: {e}")
+        return False
 
 # --------------------------
 # UIList and Panel Classes (from old addon, will use updated helpers)
@@ -5550,13 +5562,14 @@ class MATERIALLIST_PT_panel(bpy.types.Panel): # Ensure bpy.types.Panel is inheri
             if mat_for_preview:
                 preview_box = mat_list_box.box()
                 if ensure_safe_preview(mat_for_preview): # ensure_safe_preview from your existing code
-                    # MODIFICATION HERE: show_buttons=True (or remove to use default True)
+                    # This line is key: show_buttons=True (or omitting it, as True is default)
+                    # Blender's template_preview will grey out shape buttons if mat_for_preview.library is set.
                     preview_box.template_preview(mat_for_preview, show_buttons=True) 
                 else:
                     preview_box.label(text="Preview not available", icon='ERROR')
                 info_box_parent = preview_box # Info below preview if preview exists
             else:
-                # Handle case where material for preview isn't found (optional, good for robustness)
+                # Handle case where material for preview isn't found
                 missing_mat_info_box = mat_list_box.box()
                 missing_mat_info_box.label(text=f"Material (Data for '{item.material_name}') not found.", icon='ERROR')
 
@@ -5577,7 +5590,7 @@ class MATERIALLIST_PT_panel(bpy.types.Panel): # Ensure bpy.types.Panel is inheri
         library_ops_box = layout.box()
         library_ops_box.label(text="Library Operations", icon='ASSET_MANAGER')
         library_ops_box.operator("materiallist.integrate_library", text="Integrate External Library", icon='IMPORT')
-        #library_ops_box.operator("materiallist.pack_library_textures", text="Pack All Library Textures", icon='PACKAGE') # Restored this line
+        library_ops_box.operator("materiallist.pack_library_textures", text="Pack All Library Data", icon='PACKAGE') # Restored this line
 
         # --- Batch Utilities ---
         project_util_box = layout.box()
