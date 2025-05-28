@@ -87,6 +87,7 @@ _THUMBNAIL_PRELOAD_PATTERN = re.compile(r"^[a-f0-9]{32}\.png$", re.IGNORECASE)
 _ICON_TEMPLATE_VALIDATED = False
 _LEGACY_THUMBNAIL_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+_([a-f0-9]{32})\.png$", re.IGNORECASE) # ADD THIS LINE
 g_thumbnails_loaded_in_current_UMT_run = False # Add this new global
+g_matlist_transient_tasks_for_post_save = []
 
 THUMBNAIL_SIZE = 128
 VISIBLE_ITEMS = 30
@@ -1758,37 +1759,32 @@ def initialize_db_connection_pool(): # MODIFIED
 def save_handler(dummy):
     """
     Pre-save handler with optimizations and timing.
+    MODIFIED: To use a global list for passing thumbnail tasks to save_post_handler.
     """
-    global materials_modified, material_names, material_hashes
+    global materials_modified, material_names, material_hashes # Existing globals
+    global g_matlist_transient_tasks_for_post_save # Use the addon's global list
 
     if getattr(bpy.context.window_manager, 'matlist_save_handler_processed', False):
-        # print("[SAVE DB] Save handler already processed for this specific save operation. Skipping.") # Less verbose
         return
     bpy.context.window_manager.matlist_save_handler_processed = True
+    
+    g_matlist_transient_tasks_for_post_save.clear() # Clear the global list for the current save event
 
     start_time_total = time.time()
     print(f"\n[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] ----- Starting pre-save process ({len(bpy.data.materials)} materials total) -----")
 
     needs_metadata_update = False
     needs_name_db_save = False
-    timestamp_updated_for_recency = False # Tracks if any timestamp was updated in this run
+    timestamp_updated_for_recency = False
+    actual_material_modifications_this_run = False 
 
-    # Load material_names if the global dict is empty (e.g., after addon re-register or if cache was cleared)
-    # This might happen if save_handler is called very early or in unusual contexts.
-    # Typically, load_post_handler and deferred_safe_init should populate material_names.
-    if not material_names and bpy.data.filepath: # Only attempt load if filepath exists (i.e., not a new unsaved file)
+    if not material_names and bpy.data.filepath:
         print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] material_names dictionary empty, attempting load from DB...")
         load_names_timer_start = time.time()
         load_material_names()
         print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] load_material_names() took {time.time() - load_names_timer_start:.4f}s.")
 
-
-    # --- PHASE 1: UUIDs, Display Names, Datablock Renames ---
     phase1_start_time = time.time()
-    # print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] Phase 1: Processing UUIDs, display names, datablock renames...")
-    
-    # Create a list copy for safe iteration if any operations might change bpy.data.materials
-    # For current operations, direct iteration should be safe, but copy is robust.
     mats_to_process_phase1 = list(bpy.data.materials)
     uuid_assigned_in_phase1_count = 0
     datablock_renamed_in_phase1_count = 0
@@ -1796,216 +1792,194 @@ def save_handler(dummy):
 
     for mat in mats_to_process_phase1:
         if not mat: continue
-
-        original_datablock_name = mat.name # Store before potential rename
+        original_datablock_name = mat.name
         old_uuid_prop = mat.get("uuid", "")
-        
-        # validate_material_uuid ensures mat["uuid"] is set and valid.
-        # It returns the UUID (either existing valid one or newly generated one).
-        current_uuid_prop = validate_material_uuid(mat, is_copy=False) 
-
-        if old_uuid_prop != current_uuid_prop: # True if UUID was missing, invalid, or changed by validation logic
+        current_uuid_prop = validate_material_uuid(mat, is_copy=False)
+        if old_uuid_prop != current_uuid_prop:
             needs_metadata_update = True
+            actual_material_modifications_this_run = True
             uuid_assigned_in_phase1_count +=1
-            # print(f"[SAVE DB] UUID prop assigned/changed for '{original_datablock_name}': '{old_uuid_prop}' -> '{current_uuid_prop}'")
-
-        # Get display name (relies on material_names being populated, get_material_uuid called within)
-        current_display_name_for_processing = mat_get_display_name(mat) 
-
-        # Logic for non-"mat_" materials (display name DB entry and datablock name)
+        current_display_name_for_processing = mat_get_display_name(mat)
         if not current_display_name_for_processing.startswith("mat_"):
-            if current_uuid_prop: # Should always be true if validate_material_uuid is robust
-                # Ensure DB entry for display name
+            if current_uuid_prop:
                 if current_uuid_prop not in material_names:
-                    material_names[current_uuid_prop] = original_datablock_name # Use original datablock name as initial display name
+                    material_names[current_uuid_prop] = original_datablock_name
                     db_name_entry_added_in_phase1_count +=1
                     needs_name_db_save = True
-                    needs_metadata_update = True # Flag that names DB needs save
-                
-                # Ensure local non-"mat_" datablocks are named by their UUID
+                    needs_metadata_update = True
+                    actual_material_modifications_this_run = True
                 if not mat.library and mat.name != current_uuid_prop:
                     try:
-                        # Check if target UUID name is already taken by a *different* material
                         existing_mat_with_target_name = bpy.data.materials.get(current_uuid_prop)
                         if not existing_mat_with_target_name or existing_mat_with_target_name == mat:
-                            mat.name = current_uuid_prop # Perform datablock rename
+                            mat.name = current_uuid_prop
                             datablock_renamed_in_phase1_count +=1
-                            needs_metadata_update = True # Flag that Blender data changed
-                        # else: # Optional: log conflict
-                            # print(f"[SAVE DB] Phase 1: Cannot rename '{original_datablock_name}' to UUID '{current_uuid_prop}', name used by different block.")
+                            needs_metadata_update = True
+                            actual_material_modifications_this_run = True
                     except Exception as rename_err:
                         print(f"[SAVE DB] Phase 1 ERROR: Failed to rename non-'mat_' datablock '{original_datablock_name}' to UUID: {rename_err}.")
-            # else: # Should not be reached if current_uuid_prop is always valid
-                # print(f"[SAVE DB] Phase 1 CRITICAL: Could not get/assign valid UUID for non-'mat_' material '{original_datablock_name}'.")
-
-        # Ensure local materials have fake user set (important for library operations)
         if not mat.library:
             try:
                 if not mat.use_fake_user: mat.use_fake_user = True
-            except Exception: pass # Ignore errors setting fake user (rare)
+            except Exception: pass
             
     print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] Phase 1 (UUIDs/Names) took {time.time() - phase1_start_time:.4f}s. Assigned: {uuid_assigned_in_phase1_count} UUIDs, Renamed: {datablock_renamed_in_phase1_count} DBs, Added: {db_name_entry_added_in_phase1_count} NameEntries.")
 
-    # --- Load Hashes from DB ---
     load_hashes_start_time = time.time()
-    load_material_hashes() # Populates global material_hashes dict
+    load_material_hashes()
     print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] load_material_hashes() took {time.time() - load_hashes_start_time:.4f}s. ({len(material_hashes)} hashes loaded).")
 
-    # --- PHASE 2: Hash Checking, Timestamp Updates, Old Thumbnail Deletion ---
     phase2_start_time = time.time()
-    # print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] Phase 2: Checking material hashes, timestamps...")
-    
-    hashes_to_save_to_db = {} # {uuid: new_hash} for DB update
-    hashes_actually_changed_in_db = False # Tracks if an *existing* hash value in DB was different
+    hashes_to_save_to_db = {}
+    hashes_actually_changed_in_db = False
     deleted_old_thumb_count = 0
     recalculated_hash_count = 0
-
-    mats_to_process_phase2 = list(bpy.data.materials) # Iterate over a copy
+    mats_to_process_phase2 = list(bpy.data.materials)
 
     for mat in mats_to_process_phase2:
         if not mat: continue
-
-        mat_name_debug = getattr(mat, 'name_full', getattr(mat, 'name', 'N/A_Material'))
-        actual_uuid_for_hash_storage = mat.get("uuid") 
-
+        # mat_name_debug = getattr(mat, 'name_full', getattr(mat, 'name', 'N/A_Material')) # Keep for debugging if needed
+        actual_uuid_for_hash_storage = mat.get("uuid")
         if not actual_uuid_for_hash_storage:
-            # This implies validate_material_uuid in Phase 1 failed or material was added between phases without UUID
-            # print(f"[SAVE DB] Phase 2 Warning: Material '{mat_name_debug}' missing 'uuid' property. Skipping hash processing.")
             continue
-
         db_stored_hash_for_this_uuid = material_hashes.get(actual_uuid_for_hash_storage)
-        current_hash_to_compare_with_db = db_stored_hash_for_this_uuid # Default to existing if no recalc
-
+        current_hash_to_compare_with_db = db_stored_hash_for_this_uuid
         needs_recalc = False
-        if not mat.library: # Only local materials use the "hash_dirty" optimization fully
-            is_dirty_from_prop = mat.get("hash_dirty", True) # Default to True if prop missing (newly added mats)
+        if not mat.library:
+            is_dirty_from_prop = mat.get("hash_dirty", True)
             if is_dirty_from_prop or db_stored_hash_for_this_uuid is None:
                 needs_recalc = True
-        # For library materials, we don't manage "hash_dirty". We'd only recalc if db_stored_hash is None (new to our DB).
-        elif db_stored_hash_for_this_uuid is None : # Library material new to our DB hashes
-             needs_recalc = True
-
+        elif db_stored_hash_for_this_uuid is None :
+            needs_recalc = True
 
         if needs_recalc:
             recalculated_hash_count +=1
-            recalculated_hash = get_material_hash(mat, force=True) # force=True for reliability when recalc is needed
+            recalculated_hash = get_material_hash(mat, force=True)
             if not recalculated_hash:
-                # print(f"[SAVE DB] Phase 2 Warning: Failed to calculate hash for '{mat_name_debug}' (UUID: {actual_uuid_for_hash_storage}). Skipping update.")
-                if "hash_dirty" in mat and not mat.library: mat["hash_dirty"] = False # Still reset dirty flag
+                if "hash_dirty" in mat and not mat.library: mat["hash_dirty"] = False
                 continue
             current_hash_to_compare_with_db = recalculated_hash
         
-        # Now, compare the determined current hash (either from recalc or from DB if not dirty) with the DB stored one
         if db_stored_hash_for_this_uuid != current_hash_to_compare_with_db:
+            actual_material_modifications_this_run = True
             hashes_to_save_to_db[actual_uuid_for_hash_storage] = current_hash_to_compare_with_db
-            # print(f"[SAVE DB] Phase 2: Hash for '{mat_name_debug}' (UUID: {actual_uuid_for_hash_storage}) is new or changed. Old: '{db_stored_hash_for_this_uuid}', New: '{current_hash_to_compare_with_db}'. Updating timestamp.")
-            
             update_material_timestamp(actual_uuid_for_hash_storage)
             timestamp_updated_for_recency = True
-
-            if db_stored_hash_for_this_uuid is not None: # If it's not None, it means an *existing* hash value changed
+            if db_stored_hash_for_this_uuid is not None:
                 hashes_actually_changed_in_db = True
-                if not mat.library: # Delete old thumbnail only for local materials whose hash changed
-                    old_thumbnail_path = get_thumbnail_path(db_stored_hash_for_this_uuid) # Assumes get_thumbnail_path defined
+                if not mat.library:
+                    old_thumbnail_path = get_thumbnail_path(db_stored_hash_for_this_uuid)
                     if os.path.isfile(old_thumbnail_path):
                         try:
                             os.remove(old_thumbnail_path)
                             deleted_old_thumb_count += 1
                         except Exception as e_del_thumb:
                             print(f"[SAVE DB] Phase 2 Error deleting old thumbnail {old_thumbnail_path}: {e_del_thumb}")
-        
-        if "hash_dirty" in mat and not mat.library: # Reset dirty flag for local materials after processing
+            
+            # *** MODIFIED: Collect task detail into the global list ***
+            blend_file_path_for_worker_task = None
+            if mat.library and mat.library.filepath:
+                blend_file_path_for_worker_task = bpy.path.abspath(mat.library.filepath)
+            elif not mat.library and bpy.data.filepath:
+                blend_file_path_for_worker_task = bpy.path.abspath(bpy.data.filepath)
+
+            if blend_file_path_for_worker_task and os.path.exists(blend_file_path_for_worker_task) and actual_uuid_for_hash_storage:
+                thumb_path_for_task = get_thumbnail_path(current_hash_to_compare_with_db) if current_hash_to_compare_with_db else None
+                if thumb_path_for_task:
+                    task_detail_for_post = {
+                        'blend_file': blend_file_path_for_worker_task,
+                        'mat_uuid': actual_uuid_for_hash_storage,
+                        'thumb_path': thumb_path_for_task,
+                        'hash_value': current_hash_to_compare_with_db,
+                        'mat_name_debug': mat.name, 
+                        'retries': 0
+                    }
+                    g_matlist_transient_tasks_for_post_save.append(task_detail_for_post)
+            # *** END MODIFICATION ***
+
+        if "hash_dirty" in mat and not mat.library:
             try: mat["hash_dirty"] = False
-            except Exception: pass # Ignore if prop cannot be set (should not happen)
+            except Exception: pass
 
     print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] Phase 2 (Hashes/Timestamps) took {time.time() - phase2_start_time:.4f}s. Recalculated: {recalculated_hash_count} hashes. Deleted: {deleted_old_thumb_count} old thumbs.")
 
-    # --- Save Names and Hashes to DB ---
     db_write_start_time = time.time()
     saved_names_this_run = False
     saved_hashes_this_run = False
 
     if needs_name_db_save:
-        # print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] Saving updated material display names to database...")
         save_material_names()
         saved_names_this_run = True
-
+        actual_material_modifications_this_run = True 
     if hashes_to_save_to_db:
-        material_hashes.update(hashes_to_save_to_db) # Update the global dict
-        # print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] Saving {len(hashes_to_save_to_db)} updated/new material hashes to database...")
+        material_hashes.update(hashes_to_save_to_db)
         save_material_hashes()
         saved_hashes_this_run = True
-    
+        actual_material_modifications_this_run = True
+        
     if saved_names_this_run or saved_hashes_this_run:
         print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] Database write operations took {time.time() - db_write_start_time:.4f}s. (Names saved: {saved_names_this_run}, Hashes saved: {saved_hashes_this_run})")
 
+    if actual_material_modifications_this_run:
+        materials_modified = True # Set the global flag if actual changes occurred
 
-    # --- PHASE 3: Determine if Library Update Needed ---
     phase3_start_time = time.time()
-    # print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] Phase 3: Determining if library update needed...")
     library_update_queued_type = "None"
-    if hashes_actually_changed_in_db or needs_metadata_update: # Critical changes
+    if hashes_actually_changed_in_db or needs_metadata_update:
         update_material_library(force_update=True)
         library_update_queued_type = "Forced"
-    elif hashes_to_save_to_db or needs_name_db_save or timestamp_updated_for_recency: # New data added or recency affected
+    elif hashes_to_save_to_db or needs_name_db_save or timestamp_updated_for_recency: 
         update_material_library(force_update=False)
         library_update_queued_type = "Non-Forced"
-    # print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] Phase 3 (Lib Update Queue) took {time.time() - phase3_start_time:.4f}s. Queued: {library_update_queued_type}")
-
+        
+    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] Phase 3 (Lib Update Queue) took {time.time() - phase3_start_time:.4f}s. Queued: {library_update_queued_type}")
     print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] ----- Pre-save handler total time: {time.time() - start_time_total:.4f}s. -----")
-    materials_modified = False # Reset the global depsgraph flag
 
 @persistent
 def save_post_handler(dummy=None):
     """
-    Post-save callback, trimmed for speed.
-
-    A UI refresh / thumbnail pass is only run when
-      • the depsgraph said materials changed  (materials_modified flag), or
-      • the last thumbnail cycle actually loaded new icons
-        (g_thumbnails_loaded_in_current_UMT_run flag).
-
-    That removes the ~0.25 s spent redrawing the 3-D viewport when nothing
-    visual changed.
+    Post-save callback.
+    MODIFIED: To use a global list for specific thumbnail tasks from save_handler.
     """
-    global materials_modified, g_thumbnails_loaded_in_current_UMT_run
+    global materials_modified, g_thumbnails_loaded_in_current_UMT_run # Existing globals
+    global g_matlist_transient_tasks_for_post_save # Use the addon's global list
 
     t0 = time.time()
     scene = bpy.context.scene or get_first_scene()
 
-    # ------------------------------------------------------------------
-    # 1. Decide whether the UI really needs rebuilding
-    # ------------------------------------------------------------------
-    need_ui_refresh = materials_modified or g_thumbnails_loaded_in_current_UMT_run
+    ui_list_needs_refresh_and_redraw = materials_modified or g_thumbnails_loaded_in_current_UMT_run
 
-    if need_ui_refresh and scene:
-        # -- rebuild list (fast) -------------------------
+    if ui_list_needs_refresh_and_redraw and scene:
         if callable(populate_material_list):
             populate_material_list(scene)
-
-        # -- run thumbnail pipeline (may no-op) ----------
-        if callable(update_material_thumbnails):
-            update_material_thumbnails()
-
-        # -- light redraw: tag UI only -------------------
         if callable(force_redraw):
-            force_redraw()                      # << no blocking swaps
-    # else: nothing changed → skip the whole 0.25 s block
+            force_redraw()
 
-    # ------------------------------------------------------------------
-    # 2. Always update material-usage table (already very quick)
-    # ------------------------------------------------------------------
+    trigger_thumbnail_update_due_to_save = materials_modified 
+
+    if trigger_thumbnail_update_due_to_save:
+        # MODIFIED: Retrieve tasks from the global list.
+        # Pass a copy of the list to update_material_thumbnails, as it might be cleared later.
+        specific_tasks = list(g_matlist_transient_tasks_for_post_save) 
+
+        if callable(update_material_thumbnails):
+            if specific_tasks: # Check if the list from save_handler is not empty
+                # print(f"[POST-SAVE] Using {len(specific_tasks)} specific tasks from save_handler for thumbnails.")
+                update_material_thumbnails(specific_tasks_to_process=specific_tasks)
+            else:
+                # print("[POST-SAVE] materials_modified is True but no specific tasks from save_handler. Full thumbnail update scan.")
+                update_material_thumbnails() # Fallback to full scan
+    
+    g_matlist_transient_tasks_for_post_save.clear() # Clear the global list after use for this save cycle
+
     try:
-        _log_blend_material_usage()             # helper copied intact
+        _log_blend_material_usage()
     except Exception as e:
         print(f"[POST-SAVE] usage-log error: {e}")
         traceback.print_exc()
 
-    # ------------------------------------------------------------------
-    # 3. Reset one-shot flags & WM helper property
-    # ------------------------------------------------------------------
-    materials_modified = False
-    g_thumbnails_loaded_in_current_UMT_run = False
+    materials_modified = False 
+    
     if hasattr(bpy.context.window_manager, 'matlist_save_handler_processed'):
         bpy.context.window_manager.matlist_save_handler_processed = False
 
