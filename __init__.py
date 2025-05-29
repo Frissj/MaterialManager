@@ -2692,36 +2692,49 @@ class MATERIALLIST_OT_unassign_mat(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        # Store the current active object to restore later
         view_layer = context.view_layer
-        initial_active = getattr(view_layer.objects, 'active', None)
+        initial_active = view_layer.objects.active
+        initial_mode = context.mode
+
+        # Ensure we're in Object Mode once
+        if bpy.ops.object.mode_set.poll():
+            bpy.ops.object.mode_set(mode='OBJECT')
 
         processed_objects = 0
         total_removed = 0
 
-        # Iterate all mesh objects in the scene
-        for obj in (o for o in context.scene.objects if o.type == 'MESH'):
+        # Loop through all mesh objects
+        for obj in context.scene.objects:
+            if obj.type != 'MESH':
+                continue
+
             mats = obj.data.materials
-            # Identify indices of materials to remove (those prefixed 'mat_')
-            to_remove = [i for i, m in enumerate(mats)
-                         if m and m.name.startswith('mat_')]
-            if not to_remove:
+            # Build a filtered list of slots to keep
+            kept = [m for m in mats if not (m and m.name.startswith('mat_'))]
+            removed = len(mats) - len(kept)
+            if removed <= 0:
                 continue
 
             processed_objects += 1
-            total_removed += len(to_remove)
+            total_removed += removed
 
-            # Remove materials in reverse order to avoid reindexing issues
-            for idx in reversed(to_remove):
-                mats.pop(index=idx)
+            # Bulk‐remove & reassign
+            mats.clear()
+            for mat in kept:
+                mats.append(mat)
 
-        # Restore the original active object if still valid
+        # Restore original active object
         if initial_active and initial_active.name in bpy.data.objects:
-            view_layer.objects.active = bpy.data.objects[initial_active.name]
+            view_layer.objects.active = initial_active
 
-        # Report summary
-        self.report({'INFO'},
-                    f"Processed {processed_objects} mesh objects, removed {total_removed} 'mat_' slots")
+        # Restore original mode
+        if bpy.ops.object.mode_set.poll():
+            bpy.ops.object.mode_set(mode=initial_mode)
+
+        self.report(
+            {'INFO'},
+            f"Processed {processed_objects} mesh objects, removed {total_removed} 'mat_' slots"
+        )
         return {'FINISHED'}
 
 class MATERIALLIST_OT_backup_reference(Operator):
@@ -5343,6 +5356,12 @@ def create_reference_snapshot(context: bpy.types.Context) -> bool:
 
             joined_obj = context.active_object
             joined_obj.name = f"REF_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+            # 5a) Remove any empty (None) material slots
+            mats = joined_obj.data.materials
+            for i in range(len(mats) - 1, -1, -1):
+                if mats[i] is None:
+                    mats.pop(index=i)
 
         except Exception as e_join:
             context.report({'ERROR'}, f"Join failed: {e_join}")
