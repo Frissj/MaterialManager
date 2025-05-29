@@ -32,3 +32,7 @@ Key Features:
     SQLite Database Backend: All critical metadata—names, content hashes, timestamps, material origins, backups, and more—is stored reliably in a dedicated SQLite database.
     Background Processing: Heavy tasks like library updates, thumbnail generation, and file localisation are offloaded to background processes, keeping Blender responsive.
     Detailed Logging & Error Handling: Designed for stability with comprehensive feedback and graceful error management.
+
+![image](https://github.com/user-attachments/assets/57252011-c25f-463a-9383-ed1b9b624ef5)
+![image](https://github.com/user-attachments/assets/8a9f686f-2d73-4fe6-b02f-8c2f05c41f11)
+
