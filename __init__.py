@@ -3833,26 +3833,117 @@ class MATERIALLIST_OT_trim_library(bpy.types.Operator):
 class MATERIALLIST_OT_select_dominant(Operator):
     bl_idname = "materiallist.select_dominant"
     bl_label = "Select Dominant Material"
-    bl_description = ("On the active object, find the material used by the largest number of faces and select it in the list.")
+    bl_description = (
+        "On the active object: if in Edit Mode with faces selected, finds the material "
+        "used by the largest number of selected faces. Otherwise, finds the material "
+        "used by the largest number of total faces. Selects it in the list."
+    )
+
     @classmethod
-    def poll(cls, context): ob = context.active_object; return ob and ob.type == 'MESH'
+    def poll(cls, context):
+        ob = context.active_object
+        return ob and ob.type == 'MESH'
+
     def execute(self, context):
-        ob = context.active_object; me = ob.data
-        if not me.materials: self.report({'WARNING'}, "Object has no materials."); return {'CANCELLED'}
-        counts = {}; bm = bmesh.new(); bm.from_mesh(me)
-        for f in bm.faces: counts[f.material_index] = counts.get(f.material_index, 0) + 1
-        bm.free()
-        if not counts: self.report({'WARNING'}, "No face material assignments."); return {'CANCELLED'}
-        dominant_idx = max(counts, key=counts.get)
-        dominant_mat = me.materials[dominant_idx]
-        if not dominant_mat: self.report({'WARNING'}, "Dominant slot has no material."); return {'CANCELLED'}
+        ob = context.active_object
+        me = ob.data
         scene = context.scene
-        # Use get_material_uuid to find the correct item in the list, as dominant_mat.name might be display name if not UUID named
+
+        if not me.materials:
+            self.report({'WARNING'}, "Object has no materials.")
+            return {'CANCELLED'}
+
+        counts = {}
+        faces_to_consider = []
+        is_edit_mode_with_selection = False
+
+        if ob.mode == 'EDIT':
+            bm = bmesh.from_edit_mesh(me)
+            bm.faces.ensure_lookup_table() # Ensure indices are up to date
+            selected_faces = [f for f in bm.faces if f.select]
+            if selected_faces:
+                is_edit_mode_with_selection = True
+                faces_to_consider = selected_faces
+                # print(f"[Select Dominant] Edit Mode: Found {len(selected_faces)} selected faces.")
+            else:
+                # No faces selected in Edit Mode, consider all faces
+                faces_to_consider = list(bm.faces) # Make a copy
+                # print(f"[Select Dominant] Edit Mode: No faces selected, considering all {len(faces_to_consider)} faces.")
+            # We don't free bm here if selected_faces were used, as they are references.
+            # If we made a copy for all faces, bm can be freed earlier if we are done with it.
+            # However, for simplicity, let's free it after counts are gathered.
+        else: # Object Mode
+            # print(f"[Select Dominant] Object Mode: Will consider all faces.")
+            # Create a temporary BMesh to access face data
+            bm = bmesh.new()
+            bm.from_mesh(me)
+            bm.faces.ensure_lookup_table()
+            faces_to_consider = list(bm.faces) # Make a copy
+            # bm.free() # Free immediately if created just for this block
+
+        if not faces_to_consider:
+            if is_edit_mode_with_selection:
+                self.report({'WARNING'}, "No faces are selected.")
+            else:
+                self.report({'WARNING'}, "Object has no faces to analyze.")
+            if ob.mode == 'OBJECT' and 'bm' in locals() and bm.is_wrapped: # Check if bm exists and is valid from Object mode
+                 bm.free()
+            elif ob.mode == 'EDIT' and 'bm' in locals(): # For edit mode, bmesh.from_edit_mesh does not need explicit free
+                pass
+            return {'CANCELLED'}
+
+        for f in faces_to_consider:
+            counts[f.material_index] = counts.get(f.material_index, 0) + 1
+
+        # Free BMesh if it was created (Object Mode) or if from_edit_mesh was used (Edit Mode)
+        if 'bm' in locals():
+            if bm.is_wrapped: # True if created by bmesh.new()
+                bm.free()
+            # else: bmesh.from_edit_mesh() doesn't need explicit free, changes are written back or discarded by Blender
+
+        if not counts:
+            if is_edit_mode_with_selection:
+                self.report({'WARNING'}, "Selected faces have no material assignments, or materials are invalid.")
+            else:
+                self.report({'WARNING'}, "No material assignments found on object faces.")
+            return {'CANCELLED'}
+
+        try:
+            dominant_idx = max(counts, key=counts.get)
+        except ValueError: # Should not happen if counts is not empty
+            self.report({'WARNING'}, "Could not determine dominant material index.")
+            return {'CANCELLED'}
+
+        if not (0 <= dominant_idx < len(me.materials)):
+            self.report({'WARNING'}, f"Dominant material index {dominant_idx} is out of bounds for material slots.")
+            return {'CANCELLED'}
+
+        dominant_mat = me.materials[dominant_idx]
+        if not dominant_mat:
+            self.report({'WARNING'}, f"Dominant material slot {dominant_idx} has no material assigned.")
+            return {'CANCELLED'}
+
         dominant_uuid = get_material_uuid(dominant_mat)
+        if not dominant_uuid:
+            self.report({'WARNING'}, f"Could not get UUID for dominant material '{dominant_mat.name}'.")
+            return {'CANCELLED'}
+
+        found_in_list = False
         for i, itm in enumerate(scene.material_list_items):
-            if itm.material_uuid == dominant_uuid: # Compare UUIDs
-                scene.material_list_active_index = i; break
-        self.report({'INFO'}, f"Selected '{mat_get_display_name(dominant_mat)}'")
+            if itm.material_uuid == dominant_uuid:
+                scene.material_list_active_index = i
+                found_in_list = True
+                break
+        
+        if found_in_list:
+            mode_info = "selected faces" if is_edit_mode_with_selection else "object"
+            self.report({'INFO'}, f"Selected '{mat_get_display_name(dominant_mat)}' (dominant on {mode_info})")
+        else:
+            self.report({'WARNING'}, f"Dominant material '{mat_get_display_name(dominant_mat)}' not found in the UI list.")
+            # Optionally, refresh the list here if this happens
+            # populate_material_list(scene) 
+            # force_redraw()
+
         return {'FINISHED'}
 
 # --------------------------
