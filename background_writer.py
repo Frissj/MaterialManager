@@ -49,59 +49,97 @@ def _stable_repr(value):
     else:
         return repr(value)
 
-def _hash_image(img):
-    """
-    Returns md5 digest.
-    For packed images: hashes the first 128KB of img.packed_file.data.
-    For external files: hashes the first 128KB of the file content.
-    Handles library materials by resolving '//' paths relative to the library file.
-    Falls back to metadata-based hash if content cannot be accessed.
-    """
+# _hash_image (Version from background_writer.py, modified for image_hash_cache)
+def _hash_image(img, image_hash_cache=None): # Added image_hash_cache parameter
     if not img: 
         return "NO_IMAGE_DATABLOCK"
 
-    # 1. Handle PACKED images first by hashing their actual data
+    # --- Cache Key Generation ---
+    # Try to create a reasonably unique key for the image datablock for caching purposes.
+    # id(img.original) would be ideal if always reliable for content source.
+    # For now, using a combination of available attributes.
+    cache_key = None
+    if hasattr(img, 'name_full') and img.name_full: # Includes library path
+        cache_key = img.name_full 
+    elif hasattr(img, 'name') and img.name:
+        cache_key = img.name # Fallback if name_full is not good
+    
+    # If it's a packed file, its content is self-contained. The name should be unique enough within bpy.data.images.
+    # If it's external, the filepath_raw (resolved) is critical.
+    if img.packed_file:
+        if cache_key:
+            cache_key += "|PACKED"
+        else: # Should not happen if img.name exists
+            cache_key = f"PACKED_IMG_ID_{id(img)}" 
+    elif hasattr(img, 'filepath_raw') and img.filepath_raw:
+        # For external files, the raw path (which might be relative) is part of its identity.
+        # The actual content hash will depend on the resolved absolute path.
+        # For caching, we can use the raw path plus library info if any.
+        if cache_key:
+            cache_key += f"|EXT_RAW:{img.filepath_raw}"
+        else:
+            cache_key = f"EXT_RAW:{img.filepath_raw}_ID_{id(img)}"
+
+    if image_hash_cache is not None and cache_key is not None and cache_key in image_hash_cache:
+        # print(f"[_hash_image CACHE HIT] For key: {cache_key} -> {image_hash_cache[cache_key][:8]}") # DEBUG
+        return image_hash_cache[cache_key]
+    # --- End Cache Key Generation & Check ---
+
+    calculated_digest = None # This will store the final hash for this image
+
+    # 1. Handle PACKED images first
     if hasattr(img, 'packed_file') and img.packed_file and hasattr(img.packed_file, 'data') and img.packed_file.data:
         try:
-            # Hash the first 128KB of packed data for consistency and performance
-            # img.packed_file.data is a bpy_prop_array of bytes
-            data_to_hash = bytes(img.packed_file.data[:131072]) # Ensure it's plain bytes
-            return hashlib.md5(data_to_hash).hexdigest()
+            data_to_hash = bytes(img.packed_file.data[:131072])
+            calculated_digest = hashlib.md5(data_to_hash).hexdigest()
         except Exception as e_pack_hash:
             print(f"[_hash_image Warning] Could not hash packed_file.data for image '{getattr(img, 'name', 'N/A')}': {e_pack_hash}", file=sys.stderr)
             # Fall through to metadata-based fallback if direct data hashing fails
 
-    # 2. Handle EXTERNAL images (original logic for non-packed or if packed failed above)
-    raw_path = img.filepath_raw if hasattr(img, 'filepath_raw') and img.filepath_raw else ""
-    resolved_abs_path = ""
-    try:
-        if hasattr(img, 'library') and img.library and hasattr(img.library, 'filepath') and img.library.filepath and raw_path.startswith('//'):
-            library_blend_abs_path = bpy.path.abspath(img.library.filepath)
-            library_dir = os.path.dirname(library_blend_abs_path)
-            path_relative_to_lib_root = raw_path[2:]
-            path_relative_to_lib_root = path_relative_to_lib_root.replace('\\', os.sep).replace('/', os.sep)
-            resolved_abs_path = os.path.join(library_dir, path_relative_to_lib_root)
-        elif raw_path: # For non-library images or non-// paths in library images (e.g. absolute paths)
-            resolved_abs_path = bpy.path.abspath(raw_path) # Resolves relative to current .blend if path is relative
+    # 2. Handle EXTERNAL images (if not packed or packed hashing failed)
+    if calculated_digest is None: # Only if not already hashed from packed data
+        raw_path = img.filepath_raw if hasattr(img, 'filepath_raw') and img.filepath_raw else ""
+        resolved_abs_path = ""
+        try:
+            if hasattr(img, 'library') and img.library and hasattr(img.library, 'filepath') and img.library.filepath and raw_path.startswith('//'):
+                library_blend_abs_path = bpy.path.abspath(img.library.filepath)
+                library_dir = os.path.dirname(library_blend_abs_path)
+                path_relative_to_lib_root = raw_path[2:]
+                path_relative_to_lib_root = path_relative_to_lib_root.replace('\\', os.sep).replace('/', os.sep)
+                resolved_abs_path = os.path.join(library_dir, path_relative_to_lib_root)
+            elif raw_path:
+                resolved_abs_path = bpy.path.abspath(raw_path)
+            
+            if resolved_abs_path and os.path.exists(resolved_abs_path) and os.path.isfile(resolved_abs_path):
+                try:
+                    with open(resolved_abs_path, "rb") as f: 
+                        data_from_file = f.read(131072)
+                    calculated_digest = hashlib.md5(data_from_file).hexdigest()
+                except Exception as read_err:
+                    print(f"[_hash_image Warning] Could not read external file '{resolved_abs_path}' (from raw '{raw_path}', image '{getattr(img, 'name', 'N/A')}'): {read_err}", file=sys.stderr)
+                    # Fall through to fallback
+            # else: (file not found by resolved_abs_path, fall through to fallback)
+        except Exception as path_err: 
+            print(f"[_hash_image Warning] Error during path resolution/check for external file '{raw_path}' (image '{getattr(img, 'name', 'N/A')}'): {path_err}", file=sys.stderr)
+            # Fall through to fallback
         
-        if resolved_abs_path and os.path.exists(resolved_abs_path) and os.path.isfile(resolved_abs_path):
-            try:
-                with open(resolved_abs_path, "rb") as f: 
-                    data_from_file = f.read(131072) # Read first 128k
-                return hashlib.md5(data_from_file).hexdigest()
-            except Exception as read_err:
-                print(f"[_hash_image Warning] Could not read external file '{resolved_abs_path}' (from raw '{raw_path}', image '{getattr(img, 'name', 'N/A')}'): {read_err}", file=sys.stderr)
-    except Exception as path_err: 
-        print(f"[_hash_image Warning] Error during path resolution/check for external file '{raw_path}' (image '{getattr(img, 'name', 'N/A')}'): {path_err}", file=sys.stderr)
-    
     # 3. Fallback if neither packed data nor external file content could be successfully hashed
-    img_name_for_fallback = getattr(img, 'name_full', getattr(img, 'name', 'UnknownImage'))
-    is_packed_for_fallback = hasattr(img, 'packed_file') and (img.packed_file is not None)
-    source_for_fallback = getattr(img, 'source', 'UNKNOWN_SOURCE')
-    
-    fallback_data = f"FALLBACK_HASH_FOR_IMG|NAME:{img_name_for_fallback}|RAW_PATH:{raw_path}|IS_PACKED_STATE:{is_packed_for_fallback}|SOURCE:{source_for_fallback}"
-    # print(f"[_hash_image Fallback] Using fallback for image '{img_name_for_fallback}'. Data: {fallback_data}", file=sys.stderr) # Optional: for debugging
-    return hashlib.md5(fallback_data.encode('utf-8')).hexdigest()
+    if calculated_digest is None:
+        img_name_for_fallback = getattr(img, 'name_full', getattr(img, 'name', 'UnknownImage'))
+        is_packed_for_fallback = hasattr(img, 'packed_file') and (img.packed_file is not None)
+        source_for_fallback = getattr(img, 'source', 'UNKNOWN_SOURCE')
+        raw_path_for_fallback = img.filepath_raw if hasattr(img, 'filepath_raw') and img.filepath_raw else "" # Add raw path to fallback
+        
+        fallback_data = f"FALLBACK_HASH_FOR_IMG|NAME:{img_name_for_fallback}|RAW_PATH:{raw_path_for_fallback}|IS_PACKED_STATE:{is_packed_for_fallback}|SOURCE:{source_for_fallback}"
+        calculated_digest = hashlib.md5(fallback_data.encode('utf-8')).hexdigest()
+
+    # --- Cache Storing ---
+    if image_hash_cache is not None and cache_key is not None and calculated_digest is not None:
+        image_hash_cache[cache_key] = calculated_digest
+        # print(f"[_hash_image CACHE SET] For key: {cache_key} -> {calculated_digest[:8]}") # DEBUG
+    # --- End Cache Storing ---
+
+    return calculated_digest if calculated_digest is not None else "IMAGE_HASHING_ERROR_FALLBACK"
 
 def find_principled_bsdf(mat): # Keep your version
     if not mat or not mat.use_nodes or not mat.node_tree:
@@ -153,25 +191,31 @@ def validate_material_uuid(mat, is_copy=False): # From background_writer.py
         return str(uuid.uuid4())
     return original_uuid
 
-def get_material_hash(mat, current_blend_filepath_for_worker_context=None): # current_blend_filepath_for_worker_context is not used by _hash_image
-    """
-    Calculates a content-based hash for a material.
-    This version is for background_writer.py and does NOT use main addon caches.
-    """
-    if not mat:
-        return None
+# get_material_hash (Structure from __init__.py, using updated helpers)
+def get_material_hash(mat, force=True, image_hash_cache=None): # Added image_hash_cache parameter
+    HASH_VERSION = "v_RTX_REMIX_PBR_COMPREHENSIVE_2_CONTENT_ONLY" 
 
-    mat_name_for_debug = getattr(mat, 'name_full', getattr(mat, 'name', 'UnknownMaterial_BG_Worker'))
+    if not mat: 
+        return None
+    
+    mat_name_for_debug = getattr(mat, 'name_full', getattr(mat, 'name', 'UnknownMaterial'))
+    mat_uuid = mat.get("uuid")
+
+    if not force and mat_uuid:
+        if mat_uuid in material_hashes:
+            return material_hashes[mat_uuid]
+        if mat_uuid in global_hash_cache:
+            return global_hash_cache[mat_uuid]
 
     hash_inputs = []
-    pbr_image_hashes = set()
+    pbr_image_hashes = set() 
 
     try:
         principled_node = None
         material_output_node = None
 
         if mat.use_nodes and mat.node_tree:
-            principled_node = find_principled_bsdf(mat)
+            principled_node = find_principled_bsdf(mat) 
             for node_out_check in mat.node_tree.nodes:
                 if node_out_check.bl_idname == 'ShaderNodeOutputMaterial' and node_out_check.is_active_output:
                     material_output_node = node_out_check
@@ -181,8 +225,8 @@ def get_material_hash(mat, current_blend_filepath_for_worker_context=None): # cu
                     if node_out_check.bl_idname == 'ShaderNodeOutputMaterial':
                         material_output_node = node_out_check
                         break
-        else:
-            hash_inputs.append("NON_NODE_MATERIAL_BG_WORKER") # Suffix for clarity
+        else: # Non-node material
+            hash_inputs.append("NON_NODE_MATERIAL")
             hash_inputs.append(f"DiffuseColor:{_stable_repr(mat.diffuse_color)}")
             hash_inputs.append(f"Metallic:{_stable_repr(mat.metallic)}")
             hash_inputs.append(f"Roughness:{_stable_repr(mat.roughness)}")
@@ -196,7 +240,7 @@ def get_material_hash(mat, current_blend_filepath_for_worker_context=None): # cu
                 ("Subsurface Weight", "value_texture"), ("Subsurface Color", "color_texture"),
                 ("Subsurface Radius", "vector_value_only"), ("Subsurface Scale", "value_only"),
                 ("Subsurface IOR", "value_only"), ("Subsurface Anisotropy", "value_only"),
-                ("Clearcoat Weight", "value_texture"), ("Clearcoat Tint", "color_texture"),
+                ("Clearcoat Weight", "value_texture"), ("Clearcoat Tint", "color_texture"), 
                 ("Clearcoat Roughness", "value_texture"),
                 ("Clearcoat Normal", "normal_texture_special"),
                 ("Specular IOR Level", "value_texture"), ("Specular Tint", "color_texture"),
@@ -226,13 +270,13 @@ def get_material_hash(mat, current_blend_filepath_for_worker_context=None): # cu
                             nm_strength_input = source_node.inputs.get("Strength")
                             nm_strength = nm_strength_input.default_value if nm_strength_input and hasattr(nm_strength_input, 'default_value') else 1.0
                             nm_color_input = source_node.inputs.get("Color")
-                            tex_hash = "NO_TEX_IN_NORMALMAP_BG_WORKER"
+                            tex_hash = "NO_TEX_IN_NORMALMAP"
                             if nm_color_input and nm_color_input.is_linked and nm_color_input.links[0].from_node.bl_idname == 'ShaderNodeTexImage':
                                 tex_node = nm_color_input.links[0].from_node
                                 if tex_node.image:
-                                    img_hash = _hash_image(tex_node.image) # MODIFIED: Removed second argument
+                                    img_hash = _hash_image(tex_node.image, image_hash_cache=image_hash_cache) # Pass cache
                                     if img_hash: pbr_image_hashes.add(img_hash)
-                                    tex_hash = img_hash if img_hash else f"TEX_NORMALMAP_IMG_NO_HASH_BGW_{getattr(tex_node.image, 'name', 'Unnamed')}"
+                                    tex_hash = img_hash if img_hash else f"TEX_NORMALMAP_IMG_NO_HASH_{getattr(tex_node.image, 'name', 'Unnamed')}"
                             hash_inputs.append(f"{input_key_str}=NORMALMAP(Strength:{_stable_repr(nm_strength)},Tex:{tex_hash})")
                         elif source_node.bl_idname == 'ShaderNodeBump':
                             bump_strength_input = source_node.inputs.get("Strength")
@@ -240,25 +284,25 @@ def get_material_hash(mat, current_blend_filepath_for_worker_context=None): # cu
                             bump_strength = bump_strength_input.default_value if bump_strength_input and hasattr(bump_strength_input, 'default_value') else 1.0
                             bump_distance = bump_distance_input.default_value if bump_distance_input and hasattr(bump_distance_input, 'default_value') else 0.1
                             bump_height_input = source_node.inputs.get("Height")
-                            tex_hash = "NO_TEX_IN_BUMPMAP_BG_WORKER"
+                            tex_hash = "NO_TEX_IN_BUMPMAP"
                             if bump_height_input and bump_height_input.is_linked and bump_height_input.links[0].from_node.bl_idname == 'ShaderNodeTexImage':
                                 tex_node = bump_height_input.links[0].from_node
                                 if tex_node.image:
-                                    img_hash = _hash_image(tex_node.image) # MODIFIED: Removed second argument
+                                    img_hash = _hash_image(tex_node.image, image_hash_cache=image_hash_cache) # Pass cache
                                     if img_hash: pbr_image_hashes.add(img_hash)
-                                    tex_hash = img_hash if img_hash else f"TEX_BUMP_IMG_NO_HASH_BGW_{getattr(tex_node.image, 'name', 'Unnamed')}"
+                                    tex_hash = img_hash if img_hash else f"TEX_BUMP_IMG_NO_HASH_{getattr(tex_node.image, 'name', 'Unnamed')}"
                             hash_inputs.append(f"{input_key_str}=BUMPMAP(Strength:{_stable_repr(bump_strength)},Distance:{_stable_repr(bump_distance)},Tex:{tex_hash})")
                         elif source_node.bl_idname == 'ShaderNodeTexImage' and source_node.image:
-                            img_hash = _hash_image(source_node.image) # MODIFIED: Removed second argument
+                            img_hash = _hash_image(source_node.image, image_hash_cache=image_hash_cache) # Pass cache
                             if img_hash: pbr_image_hashes.add(img_hash)
-                            tex_hash = img_hash if img_hash else f"TEX_NORMAL_IMG_NO_HASH_BGW_{getattr(source_node.image, 'name', 'Unnamed')}"
+                            tex_hash = img_hash if img_hash else f"TEX_NORMAL_IMG_NO_HASH_{getattr(source_node.image, 'name', 'Unnamed')}"
                             hash_inputs.append(f"{input_key_str}=TEX:{tex_hash}")
                         else:
                             hash_inputs.append(f"{input_key_str}=LINKED_NODE:{source_node.bl_idname}_SOCKET:{source_socket_name}")
                     elif source_node.bl_idname == 'ShaderNodeTexImage' and source_node.image:
-                        img_hash = _hash_image(source_node.image) # MODIFIED: Removed second argument
+                        img_hash = _hash_image(source_node.image, image_hash_cache=image_hash_cache) # Pass cache
                         if img_hash: pbr_image_hashes.add(img_hash)
-                        tex_hash = img_hash if img_hash else f"TEX_{input_name.replace(' ','')}_IMG_NO_HASH_BGW_{getattr(source_node.image, 'name', 'Unnamed')}"
+                        tex_hash = img_hash if img_hash else f"TEX_{input_name.replace(' ','')}_IMG_NO_HASH_{getattr(source_node.image, 'name', 'Unnamed')}"
                         hash_inputs.append(f"{input_key_str}=TEX:{tex_hash}")
                     else:
                         hash_inputs.append(f"{input_key_str}=LINKED_NODE:{source_node.bl_idname}_SOCKET:{source_socket_name}")
@@ -275,40 +319,44 @@ def get_material_hash(mat, current_blend_filepath_for_worker_context=None): # cu
                     disp_scale_input = source_node.inputs.get("Scale")
                     disp_midlevel = disp_midlevel_input.default_value if disp_midlevel_input and hasattr(disp_midlevel_input, 'default_value') else 0.5
                     disp_scale = disp_scale_input.default_value if disp_scale_input and hasattr(disp_scale_input, 'default_value') else 1.0
-                    tex_hash = "NO_TEX_IN_DISPLACEMENT_NODE_BG_WORKER"
+                    tex_hash = "NO_TEX_IN_DISPLACEMENT_NODE"
                     if disp_height_input and disp_height_input.is_linked and disp_height_input.links[0].from_node.bl_idname == 'ShaderNodeTexImage':
                         tex_node = disp_height_input.links[0].from_node
                         if tex_node.image:
-                            img_hash = _hash_image(tex_node.image) # MODIFIED: Removed second argument
+                            img_hash = _hash_image(tex_node.image, image_hash_cache=image_hash_cache) # Pass cache
                             if img_hash: pbr_image_hashes.add(img_hash)
-                            tex_hash = img_hash if img_hash else f"TEX_DISP_IMG_NO_HASH_BGW_{getattr(tex_node.image, 'name', 'Unnamed')}"
+                            tex_hash = img_hash if img_hash else f"TEX_DISP_IMG_NO_HASH_{getattr(tex_node.image, 'name', 'Unnamed')}"
                     hash_inputs.append(f"MAT_OUTPUT_DISPLACEMENT=DISP_NODE(Mid:{_stable_repr(disp_midlevel)},Scale:{_stable_repr(disp_scale)},Tex:{tex_hash})")
                 elif source_node.bl_idname == 'ShaderNodeTexImage' and source_node.image:
-                    img_hash = _hash_image(source_node.image) # MODIFIED: Removed second argument
+                    img_hash = _hash_image(source_node.image, image_hash_cache=image_hash_cache) # Pass cache
                     if img_hash: pbr_image_hashes.add(img_hash)
-                    tex_hash = img_hash if img_hash else f"TEX_DISP_DIRECT_IMG_NO_HASH_BGW_{getattr(source_node.image, 'name', 'Unnamed')}"
+                    tex_hash = img_hash if img_hash else f"TEX_DISP_DIRECT_IMG_NO_HASH_{getattr(source_node.image, 'name', 'Unnamed')}"
                     hash_inputs.append(f"MAT_OUTPUT_DISPLACEMENT=TEX:{tex_hash}")
-                else:
+                else: 
                     hash_inputs.append(f"MAT_OUTPUT_DISPLACEMENT=LINKED_NODE:{source_node.bl_idname}_SOCKET:{source_socket_name}")
 
         if mat.use_nodes and mat.node_tree:
             for node in mat.node_tree.nodes:
                 if node.bl_idname == 'ShaderNodeTexImage' and node.image:
-                    img_hash_general = _hash_image(node.image) # MODIFIED: Removed second argument
+                    img_hash_general = _hash_image(node.image, image_hash_cache=image_hash_cache) # Pass cache
                     if img_hash_general:
                         pbr_image_hashes.add(img_hash_general)
 
         if pbr_image_hashes:
             sorted_pbr_image_hashes = sorted(list(pbr_image_hashes))
             hash_inputs.append(f"ALL_UNIQUE_IMAGE_HASHES_COMBINED:{'|'.join(sorted_pbr_image_hashes)}")
-
-        final_hash_string = f"VERSION:{HASH_VERSION_FOR_WORKER}|||" + "|||".join(sorted(hash_inputs))
+        
+        final_hash_string = f"VERSION:{HASH_VERSION}|||" + "|||".join(sorted(hash_inputs))
         digest = hashlib.md5(final_hash_string.encode('utf-8')).hexdigest()
 
+        if mat_uuid:
+            global_hash_cache[mat_uuid] = digest 
+            if not force and mat_uuid not in material_hashes:
+                material_hashes[mat_uuid] = digest
         return digest
 
     except Exception as e:
-        print(f"[BG_WORKER get_material_hash] Error hashing mat '{mat_name_for_debug}': {type(e).__name__} - {e}", file=sys.stderr)
+        print(f"[get_material_hash - CONTENT_ONLY] Error hashing mat '{mat_name_for_debug}': {type(e).__name__} - {e}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
         return None
 
