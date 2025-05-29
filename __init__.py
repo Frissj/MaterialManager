@@ -323,60 +323,97 @@ def _stable_repr(value):
         # Fallback to standard repr for any other types
         return repr(value)
 
-# _hash_image (Version from background_writer.py)
-def _hash_image(img):
-    """
-    Returns md5 digest.
-    For packed images: hashes the first 128KB of img.packed_file.data.
-    For external files: hashes the first 128KB of the file content.
-    Handles library materials by resolving '//' paths relative to the library file.
-    Falls back to metadata-based hash if content cannot be accessed.
-    """
+# _hash_image (Version from background_writer.py, modified for image_hash_cache)
+def _hash_image(img, image_hash_cache=None): # Added image_hash_cache parameter
     if not img: 
         return "NO_IMAGE_DATABLOCK"
 
-    # 1. Handle PACKED images first by hashing their actual data
+    # --- Cache Key Generation ---
+    # Try to create a reasonably unique key for the image datablock for caching purposes.
+    # id(img.original) would be ideal if always reliable for content source.
+    # For now, using a combination of available attributes.
+    cache_key = None
+    if hasattr(img, 'name_full') and img.name_full: # Includes library path
+        cache_key = img.name_full 
+    elif hasattr(img, 'name') and img.name:
+        cache_key = img.name # Fallback if name_full is not good
+    
+    # If it's a packed file, its content is self-contained. The name should be unique enough within bpy.data.images.
+    # If it's external, the filepath_raw (resolved) is critical.
+    if img.packed_file:
+        if cache_key:
+            cache_key += "|PACKED"
+        else: # Should not happen if img.name exists
+            cache_key = f"PACKED_IMG_ID_{id(img)}" 
+    elif hasattr(img, 'filepath_raw') and img.filepath_raw:
+        # For external files, the raw path (which might be relative) is part of its identity.
+        # The actual content hash will depend on the resolved absolute path.
+        # For caching, we can use the raw path plus library info if any.
+        if cache_key:
+            cache_key += f"|EXT_RAW:{img.filepath_raw}"
+        else:
+            cache_key = f"EXT_RAW:{img.filepath_raw}_ID_{id(img)}"
+
+    if image_hash_cache is not None and cache_key is not None and cache_key in image_hash_cache:
+        # print(f"[_hash_image CACHE HIT] For key: {cache_key} -> {image_hash_cache[cache_key][:8]}") # DEBUG
+        return image_hash_cache[cache_key]
+    # --- End Cache Key Generation & Check ---
+
+    calculated_digest = None # This will store the final hash for this image
+
+    # 1. Handle PACKED images first
     if hasattr(img, 'packed_file') and img.packed_file and hasattr(img.packed_file, 'data') and img.packed_file.data:
         try:
-            # Hash the first 128KB of packed data for consistency and performance
-            # img.packed_file.data is a bpy_prop_array of bytes
-            data_to_hash = bytes(img.packed_file.data[:131072]) # Ensure it's plain bytes
-            return hashlib.md5(data_to_hash).hexdigest()
+            data_to_hash = bytes(img.packed_file.data[:131072])
+            calculated_digest = hashlib.md5(data_to_hash).hexdigest()
         except Exception as e_pack_hash:
             print(f"[_hash_image Warning] Could not hash packed_file.data for image '{getattr(img, 'name', 'N/A')}': {e_pack_hash}", file=sys.stderr)
             # Fall through to metadata-based fallback if direct data hashing fails
 
-    # 2. Handle EXTERNAL images (original logic for non-packed or if packed failed above)
-    raw_path = img.filepath_raw if hasattr(img, 'filepath_raw') and img.filepath_raw else ""
-    resolved_abs_path = ""
-    try:
-        if hasattr(img, 'library') and img.library and hasattr(img.library, 'filepath') and img.library.filepath and raw_path.startswith('//'):
-            library_blend_abs_path = bpy.path.abspath(img.library.filepath)
-            library_dir = os.path.dirname(library_blend_abs_path)
-            path_relative_to_lib_root = raw_path[2:]
-            path_relative_to_lib_root = path_relative_to_lib_root.replace('\\', os.sep).replace('/', os.sep)
-            resolved_abs_path = os.path.join(library_dir, path_relative_to_lib_root)
-        elif raw_path: # For non-library images or non-// paths in library images (e.g. absolute paths)
-            resolved_abs_path = bpy.path.abspath(raw_path) # Resolves relative to current .blend if path is relative
+    # 2. Handle EXTERNAL images (if not packed or packed hashing failed)
+    if calculated_digest is None: # Only if not already hashed from packed data
+        raw_path = img.filepath_raw if hasattr(img, 'filepath_raw') and img.filepath_raw else ""
+        resolved_abs_path = ""
+        try:
+            if hasattr(img, 'library') and img.library and hasattr(img.library, 'filepath') and img.library.filepath and raw_path.startswith('//'):
+                library_blend_abs_path = bpy.path.abspath(img.library.filepath)
+                library_dir = os.path.dirname(library_blend_abs_path)
+                path_relative_to_lib_root = raw_path[2:]
+                path_relative_to_lib_root = path_relative_to_lib_root.replace('\\', os.sep).replace('/', os.sep)
+                resolved_abs_path = os.path.join(library_dir, path_relative_to_lib_root)
+            elif raw_path:
+                resolved_abs_path = bpy.path.abspath(raw_path)
+            
+            if resolved_abs_path and os.path.exists(resolved_abs_path) and os.path.isfile(resolved_abs_path):
+                try:
+                    with open(resolved_abs_path, "rb") as f: 
+                        data_from_file = f.read(131072)
+                    calculated_digest = hashlib.md5(data_from_file).hexdigest()
+                except Exception as read_err:
+                    print(f"[_hash_image Warning] Could not read external file '{resolved_abs_path}' (from raw '{raw_path}', image '{getattr(img, 'name', 'N/A')}'): {read_err}", file=sys.stderr)
+                    # Fall through to fallback
+            # else: (file not found by resolved_abs_path, fall through to fallback)
+        except Exception as path_err: 
+            print(f"[_hash_image Warning] Error during path resolution/check for external file '{raw_path}' (image '{getattr(img, 'name', 'N/A')}'): {path_err}", file=sys.stderr)
+            # Fall through to fallback
         
-        if resolved_abs_path and os.path.exists(resolved_abs_path) and os.path.isfile(resolved_abs_path):
-            try:
-                with open(resolved_abs_path, "rb") as f: 
-                    data_from_file = f.read(131072) # Read first 128k
-                return hashlib.md5(data_from_file).hexdigest()
-            except Exception as read_err:
-                print(f"[_hash_image Warning] Could not read external file '{resolved_abs_path}' (from raw '{raw_path}', image '{getattr(img, 'name', 'N/A')}'): {read_err}", file=sys.stderr)
-    except Exception as path_err: 
-        print(f"[_hash_image Warning] Error during path resolution/check for external file '{raw_path}' (image '{getattr(img, 'name', 'N/A')}'): {path_err}", file=sys.stderr)
-    
     # 3. Fallback if neither packed data nor external file content could be successfully hashed
-    img_name_for_fallback = getattr(img, 'name_full', getattr(img, 'name', 'UnknownImage'))
-    is_packed_for_fallback = hasattr(img, 'packed_file') and (img.packed_file is not None)
-    source_for_fallback = getattr(img, 'source', 'UNKNOWN_SOURCE')
-    
-    fallback_data = f"FALLBACK_HASH_FOR_IMG|NAME:{img_name_for_fallback}|RAW_PATH:{raw_path}|IS_PACKED_STATE:{is_packed_for_fallback}|SOURCE:{source_for_fallback}"
-    # print(f"[_hash_image Fallback] Using fallback for image '{img_name_for_fallback}'. Data: {fallback_data}", file=sys.stderr) # Optional: for debugging
-    return hashlib.md5(fallback_data.encode('utf-8')).hexdigest()
+    if calculated_digest is None:
+        img_name_for_fallback = getattr(img, 'name_full', getattr(img, 'name', 'UnknownImage'))
+        is_packed_for_fallback = hasattr(img, 'packed_file') and (img.packed_file is not None)
+        source_for_fallback = getattr(img, 'source', 'UNKNOWN_SOURCE')
+        raw_path_for_fallback = img.filepath_raw if hasattr(img, 'filepath_raw') and img.filepath_raw else "" # Add raw path to fallback
+        
+        fallback_data = f"FALLBACK_HASH_FOR_IMG|NAME:{img_name_for_fallback}|RAW_PATH:{raw_path_for_fallback}|IS_PACKED_STATE:{is_packed_for_fallback}|SOURCE:{source_for_fallback}"
+        calculated_digest = hashlib.md5(fallback_data.encode('utf-8')).hexdigest()
+
+    # --- Cache Storing ---
+    if image_hash_cache is not None and cache_key is not None and calculated_digest is not None:
+        image_hash_cache[cache_key] = calculated_digest
+        # print(f"[_hash_image CACHE SET] For key: {cache_key} -> {calculated_digest[:8]}") # DEBUG
+    # --- End Cache Storing ---
+
+    return calculated_digest if calculated_digest is not None else "IMAGE_HASHING_ERROR_FALLBACK"
 
 # find_principled_bsdf (Kept from your __init__.py)
 def find_principled_bsdf(mat):
@@ -427,31 +464,20 @@ def find_principled_bsdf(mat):
         return next((n for n in mat.node_tree.nodes if n.bl_idname == 'ShaderNodeBsdfPrincipled'), None)
 
 # get_material_hash (Structure from __init__.py, using updated helpers)
-def get_material_hash(mat, force=True): # Default for 'force' is True as in your original
+def get_material_hash(mat, force=True, image_hash_cache=None): # Added image_hash_cache parameter
     HASH_VERSION = "v_RTX_REMIX_PBR_COMPREHENSIVE_2_CONTENT_ONLY" 
 
     if not mat: 
-        # print("[GetHash] Material object is None. Returning None.")
         return None
     
     mat_name_for_debug = getattr(mat, 'name_full', getattr(mat, 'name', 'UnknownMaterial'))
-    mat_uuid = mat.get("uuid") # Used for caching
+    mat_uuid = mat.get("uuid")
 
-    # --- CACHING LOGIC ---
     if not force and mat_uuid:
-        # Check primary DB-backed cache first (material_hashes global)
         if mat_uuid in material_hashes:
-            # print(f"[GetHash - CACHE HIT from material_hashes] Mat: {mat_name_for_debug}, UUID: {mat_uuid}. Returning: {material_hashes[mat_uuid][:8]}")
             return material_hashes[mat_uuid]
-        # Optionally, check a session-only volatile cache like global_hash_cache
-        # This might be useful if a hash was just calculated but not yet saved to material_hashes by save_handler
         if mat_uuid in global_hash_cache:
-            # print(f"[GetHash - CACHE HIT from global_hash_cache] Mat: {mat_name_for_debug}, UUID: {mat_uuid}. Returning: {global_hash_cache[mat_uuid][:8]}")
             return global_hash_cache[mat_uuid]
-    # If force=True, or if not found in cache when force=False, proceed to calculate.
-    # --- END CACHING LOGIC ---
-
-    # print(f"[GetHash - CALCULATING] Mat: {mat_name_for_debug}, UUID: {mat_uuid}, Force: {force}. No cache hit or forced.")
 
     hash_inputs = []
     pbr_image_hashes = set() 
@@ -476,7 +502,6 @@ def get_material_hash(mat, force=True): # Default for 'force' is True as in your
             hash_inputs.append(f"DiffuseColor:{_stable_repr(mat.diffuse_color)}")
             hash_inputs.append(f"Metallic:{_stable_repr(mat.metallic)}")
             hash_inputs.append(f"Roughness:{_stable_repr(mat.roughness)}")
-            # Add other relevant non-node properties
 
         if principled_node:
             hash_inputs.append(f"SHADER_TYPE:{principled_node.bl_idname}")
@@ -493,7 +518,7 @@ def get_material_hash(mat, force=True): # Default for 'force' is True as in your
                 ("Specular IOR Level", "value_texture"), ("Specular Tint", "color_texture"),
                 ("Sheen Weight", "value_texture"), ("Sheen Tint", "color_texture"),
                 ("Sheen Roughness", "value_texture"),
-                ("Transmission Weight", "value_texture"), ("Transmission Roughness", "value_texture"), # Transmission roughness added
+                ("Transmission Weight", "value_texture"), ("Transmission Roughness", "value_texture"),
                 ("Anisotropic", "value_texture"),("Anisotropic Rotation", "value_texture"),
             ]
             coat_inputs_to_check = [
@@ -521,7 +546,7 @@ def get_material_hash(mat, force=True): # Default for 'force' is True as in your
                             if nm_color_input and nm_color_input.is_linked and nm_color_input.links[0].from_node.bl_idname == 'ShaderNodeTexImage':
                                 tex_node = nm_color_input.links[0].from_node
                                 if tex_node.image:
-                                    img_hash = _hash_image(tex_node.image)
+                                    img_hash = _hash_image(tex_node.image, image_hash_cache=image_hash_cache) # Pass cache
                                     if img_hash: pbr_image_hashes.add(img_hash)
                                     tex_hash = img_hash if img_hash else f"TEX_NORMALMAP_IMG_NO_HASH_{getattr(tex_node.image, 'name', 'Unnamed')}"
                             hash_inputs.append(f"{input_key_str}=NORMALMAP(Strength:{_stable_repr(nm_strength)},Tex:{tex_hash})")
@@ -535,19 +560,19 @@ def get_material_hash(mat, force=True): # Default for 'force' is True as in your
                             if bump_height_input and bump_height_input.is_linked and bump_height_input.links[0].from_node.bl_idname == 'ShaderNodeTexImage':
                                 tex_node = bump_height_input.links[0].from_node
                                 if tex_node.image:
-                                    img_hash = _hash_image(tex_node.image)
+                                    img_hash = _hash_image(tex_node.image, image_hash_cache=image_hash_cache) # Pass cache
                                     if img_hash: pbr_image_hashes.add(img_hash)
                                     tex_hash = img_hash if img_hash else f"TEX_BUMP_IMG_NO_HASH_{getattr(tex_node.image, 'name', 'Unnamed')}"
                             hash_inputs.append(f"{input_key_str}=BUMPMAP(Strength:{_stable_repr(bump_strength)},Distance:{_stable_repr(bump_distance)},Tex:{tex_hash})")
                         elif source_node.bl_idname == 'ShaderNodeTexImage' and source_node.image:
-                            img_hash = _hash_image(source_node.image)
+                            img_hash = _hash_image(source_node.image, image_hash_cache=image_hash_cache) # Pass cache
                             if img_hash: pbr_image_hashes.add(img_hash)
                             tex_hash = img_hash if img_hash else f"TEX_NORMAL_IMG_NO_HASH_{getattr(source_node.image, 'name', 'Unnamed')}"
                             hash_inputs.append(f"{input_key_str}=TEX:{tex_hash}")
                         else:
                             hash_inputs.append(f"{input_key_str}=LINKED_NODE:{source_node.bl_idname}_SOCKET:{source_socket_name}")
                     elif source_node.bl_idname == 'ShaderNodeTexImage' and source_node.image:
-                        img_hash = _hash_image(source_node.image)
+                        img_hash = _hash_image(source_node.image, image_hash_cache=image_hash_cache) # Pass cache
                         if img_hash: pbr_image_hashes.add(img_hash)
                         tex_hash = img_hash if img_hash else f"TEX_{input_name.replace(' ','')}_IMG_NO_HASH_{getattr(source_node.image, 'name', 'Unnamed')}"
                         hash_inputs.append(f"{input_key_str}=TEX:{tex_hash}")
@@ -570,54 +595,42 @@ def get_material_hash(mat, force=True): # Default for 'force' is True as in your
                     if disp_height_input and disp_height_input.is_linked and disp_height_input.links[0].from_node.bl_idname == 'ShaderNodeTexImage':
                         tex_node = disp_height_input.links[0].from_node
                         if tex_node.image:
-                            img_hash = _hash_image(tex_node.image)
+                            img_hash = _hash_image(tex_node.image, image_hash_cache=image_hash_cache) # Pass cache
                             if img_hash: pbr_image_hashes.add(img_hash)
                             tex_hash = img_hash if img_hash else f"TEX_DISP_IMG_NO_HASH_{getattr(tex_node.image, 'name', 'Unnamed')}"
                     hash_inputs.append(f"MAT_OUTPUT_DISPLACEMENT=DISP_NODE(Mid:{_stable_repr(disp_midlevel)},Scale:{_stable_repr(disp_scale)},Tex:{tex_hash})")
-                elif source_node.bl_idname == 'ShaderNodeTexImage' and source_node.image: # Direct image to displacement
-                    img_hash = _hash_image(source_node.image)
+                elif source_node.bl_idname == 'ShaderNodeTexImage' and source_node.image:
+                    img_hash = _hash_image(source_node.image, image_hash_cache=image_hash_cache) # Pass cache
                     if img_hash: pbr_image_hashes.add(img_hash)
                     tex_hash = img_hash if img_hash else f"TEX_DISP_DIRECT_IMG_NO_HASH_{getattr(source_node.image, 'name', 'Unnamed')}"
                     hash_inputs.append(f"MAT_OUTPUT_DISPLACEMENT=TEX:{tex_hash}")
-                else: # Other node linked to displacement
+                else: 
                     hash_inputs.append(f"MAT_OUTPUT_DISPLACEMENT=LINKED_NODE:{source_node.bl_idname}_SOCKET:{source_socket_name}")
 
-        # General scan for all unique image textures used, regardless of PBR input slot
         if mat.use_nodes and mat.node_tree:
             for node in mat.node_tree.nodes:
                 if node.bl_idname == 'ShaderNodeTexImage' and node.image:
-                    img_hash_general = _hash_image(node.image) 
+                    img_hash_general = _hash_image(node.image, image_hash_cache=image_hash_cache) # Pass cache
                     if img_hash_general:
-                        pbr_image_hashes.add(img_hash_general) # Add to set to ensure uniqueness
+                        pbr_image_hashes.add(img_hash_general)
 
         if pbr_image_hashes:
-            sorted_pbr_image_hashes = sorted(list(pbr_image_hashes)) # Sort for consistent order
+            sorted_pbr_image_hashes = sorted(list(pbr_image_hashes))
             hash_inputs.append(f"ALL_UNIQUE_IMAGE_HASHES_COMBINED:{'|'.join(sorted_pbr_image_hashes)}")
         
-        # HASH_IDENTITY_UID line is intentionally removed for pure content hashing.
-
         final_hash_string = f"VERSION:{HASH_VERSION}|||" + "|||".join(sorted(hash_inputs))
         digest = hashlib.md5(final_hash_string.encode('utf-8')).hexdigest()
 
-        # --- Post-calculation cache update ---
-        if mat_uuid: # Only update caches if we have a UUID
-            # Update the session-volatile global_hash_cache
+        if mat_uuid:
             global_hash_cache[mat_uuid] = digest 
-            
-            # If force was False and we had to calculate it (meaning it wasn't in material_hashes),
-            # it implies this hash might be new or missing from our persistent DB cache.
-            # We can update the in-memory material_hashes here.
-            # save_handler will be responsible for persisting material_hashes to the DB.
             if not force and mat_uuid not in material_hashes:
                 material_hashes[mat_uuid] = digest
-                # print(f"[GetHash - NEW CALC & CACHE] Mat: {mat_name_for_debug}, UUID: {mat_uuid}. Stored new hash in material_hashes/global_hash_cache: {digest[:8]}")
-
         return digest
 
     except Exception as e:
         print(f"[get_material_hash - CONTENT_ONLY] Error hashing mat '{mat_name_for_debug}': {type(e).__name__} - {e}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
-        return None # Return None on error
+        return None
 
 def preload_existing_thumbnails():
     global custom_icons, THUMBNAIL_FOLDER # Ensure THUMBNAIL_FOLDER is accessible
@@ -1781,18 +1794,14 @@ def initialize_db_connection_pool(): # MODIFIED
 # --------------------------
 @persistent
 def save_handler(dummy):
-    """
-    Pre-save handler with optimizations and timing.
-    MODIFIED: To use a global list for passing thumbnail tasks to save_post_handler.
-    """
-    global materials_modified, material_names, material_hashes # Existing globals
-    global g_matlist_transient_tasks_for_post_save # Use the addon's global list
+    global materials_modified, material_names, material_hashes
+    global g_matlist_transient_tasks_for_post_save
 
     if getattr(bpy.context.window_manager, 'matlist_save_handler_processed', False):
         return
     bpy.context.window_manager.matlist_save_handler_processed = True
     
-    g_matlist_transient_tasks_for_post_save.clear() # Clear the global list for the current save event
+    g_matlist_transient_tasks_for_post_save.clear()
 
     start_time_total = time.time()
     print(f"\n[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] ----- Starting pre-save process ({len(bpy.data.materials)} materials total) -----")
@@ -1803,12 +1812,12 @@ def save_handler(dummy):
     actual_material_modifications_this_run = False 
 
     if not material_names and bpy.data.filepath:
-        print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] material_names dictionary empty, attempting load from DB...")
         load_names_timer_start = time.time()
         load_material_names()
         print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] load_material_names() took {time.time() - load_names_timer_start:.4f}s.")
 
     phase1_start_time = time.time()
+    # ... (Phase 1 logic remains the same as in your provided code) ...
     mats_to_process_phase1 = list(bpy.data.materials)
     uuid_assigned_in_phase1_count = 0
     datablock_renamed_in_phase1_count = 0
@@ -1827,7 +1836,7 @@ def save_handler(dummy):
         if not current_display_name_for_processing.startswith("mat_"):
             if current_uuid_prop:
                 if current_uuid_prop not in material_names:
-                    material_names[current_uuid_prop] = original_datablock_name
+                    material_names[current_uuid_prop] = original_datablock_name # Or a better default display name logic
                     db_name_entry_added_in_phase1_count +=1
                     needs_name_db_save = True
                     needs_metadata_update = True
@@ -1855,43 +1864,51 @@ def save_handler(dummy):
 
     phase2_start_time = time.time()
     hashes_to_save_to_db = {}
-    hashes_actually_changed_in_db = False
+    hashes_actually_changed_in_db = False # Renamed this from your original for clarity
     deleted_old_thumb_count = 0
     recalculated_hash_count = 0
     mats_to_process_phase2 = list(bpy.data.materials)
 
+    # --- NEW: Session-scoped cache for image hashes ---
+    _session_image_hash_cache = {} 
+    # --- END NEW ---
+
     for mat in mats_to_process_phase2:
         if not mat: continue
-        # mat_name_debug = getattr(mat, 'name_full', getattr(mat, 'name', 'N/A_Material')) # Keep for debugging if needed
         actual_uuid_for_hash_storage = mat.get("uuid")
         if not actual_uuid_for_hash_storage:
             continue
+        
         db_stored_hash_for_this_uuid = material_hashes.get(actual_uuid_for_hash_storage)
-        current_hash_to_compare_with_db = db_stored_hash_for_this_uuid
+        current_hash_to_compare_with_db = db_stored_hash_for_this_uuid 
         needs_recalc = False
+
         if not mat.library:
             is_dirty_from_prop = mat.get("hash_dirty", True)
             if is_dirty_from_prop or db_stored_hash_for_this_uuid is None:
                 needs_recalc = True
-        elif db_stored_hash_for_this_uuid is None :
+        elif db_stored_hash_for_this_uuid is None : 
             needs_recalc = True
 
         if needs_recalc:
             recalculated_hash_count +=1
-            recalculated_hash = get_material_hash(mat, force=True)
+            # --- MODIFIED: Pass the cache to get_material_hash ---
+            recalculated_hash = get_material_hash(mat, force=True, image_hash_cache=_session_image_hash_cache)
+            # --- END MODIFIED ---
             if not recalculated_hash:
                 if "hash_dirty" in mat and not mat.library: mat["hash_dirty"] = False
                 continue
             current_hash_to_compare_with_db = recalculated_hash
         
         if db_stored_hash_for_this_uuid != current_hash_to_compare_with_db:
-            actual_material_modifications_this_run = True
+            actual_material_modifications_this_run = True 
             hashes_to_save_to_db[actual_uuid_for_hash_storage] = current_hash_to_compare_with_db
             update_material_timestamp(actual_uuid_for_hash_storage)
             timestamp_updated_for_recency = True
-            if db_stored_hash_for_this_uuid is not None:
-                hashes_actually_changed_in_db = True
-                if not mat.library:
+            if db_stored_hash_for_this_uuid is not None: # Hash changed for existing UUID in DB
+                # This flag is more about "did a hash stored in the DB actually change value"
+                hashes_actually_changed_in_db = True 
+                if not mat.library: # Only delete old thumbs for local mats if their hash changes
                     old_thumbnail_path = get_thumbnail_path(db_stored_hash_for_this_uuid)
                     if os.path.isfile(old_thumbnail_path):
                         try:
@@ -1899,8 +1916,9 @@ def save_handler(dummy):
                             deleted_old_thumb_count += 1
                         except Exception as e_del_thumb:
                             print(f"[SAVE DB] Phase 2 Error deleting old thumbnail {old_thumbnail_path}: {e_del_thumb}")
-            
-            # *** MODIFIED: Collect task detail into the global list ***
+            else: # Hash is new to the DB for this UUID (or UUID itself is new to DB hashes)
+                hashes_actually_changed_in_db = True # Treat as a change that needs DB save
+
             blend_file_path_for_worker_task = None
             if mat.library and mat.library.filepath:
                 blend_file_path_for_worker_task = bpy.path.abspath(mat.library.filepath)
@@ -1919,8 +1937,7 @@ def save_handler(dummy):
                         'retries': 0
                     }
                     g_matlist_transient_tasks_for_post_save.append(task_detail_for_post)
-            # *** END MODIFICATION ***
-
+        
         if "hash_dirty" in mat and not mat.library:
             try: mat["hash_dirty"] = False
             except Exception: pass
@@ -1935,23 +1952,26 @@ def save_handler(dummy):
         save_material_names()
         saved_names_this_run = True
         actual_material_modifications_this_run = True 
-    if hashes_to_save_to_db:
-        material_hashes.update(hashes_to_save_to_db)
-        save_material_hashes()
+    if hashes_to_save_to_db: # Check if there are actually hashes to save
+        material_hashes.update(hashes_to_save_to_db) # Update the global in-memory cache
+        save_material_hashes() # Persist the entire global in-memory cache to DB
         saved_hashes_this_run = True
-        actual_material_modifications_this_run = True
+        actual_material_modifications_this_run = True 
         
     if saved_names_this_run or saved_hashes_this_run:
         print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] Database write operations took {time.time() - db_write_start_time:.4f}s. (Names saved: {saved_names_this_run}, Hashes saved: {saved_hashes_this_run})")
 
     if actual_material_modifications_this_run:
-        materials_modified = True # Set the global flag if actual changes occurred
+        materials_modified = True
 
     phase3_start_time = time.time()
     library_update_queued_type = "None"
-    if hashes_actually_changed_in_db or needs_metadata_update:
-        update_material_library(force_update=True)
+    # Condition for forced update is if a hash VALUE in the DB actually changed, or metadata needed update
+    if hashes_actually_changed_in_db or needs_metadata_update : 
+        update_material_library(force_update=True) 
         library_update_queued_type = "Forced"
+    # Condition for non-forced update: new hashes were added to DB (but no existing ones changed), 
+    # or new names added, or just timestamps updated
     elif hashes_to_save_to_db or needs_name_db_save or timestamp_updated_for_recency: 
         update_material_library(force_update=False)
         library_update_queued_type = "Non-Forced"
@@ -6089,30 +6109,33 @@ def unregister():
             print(f"  Worker {worker_idx + 1}: Process already terminated with exit code {poll_result}.")
             continue
 
-        # Process is still running, attempt to kill directly
+        # Process is still running, attempt to kill directly.
         try:
             pid = getattr(process, 'pid', 'Unknown')
-            print(f"  Worker {worker_idx + 1}: Attempting to kill running process (PID: {pid})...")
+            print(f"  Worker {worker_idx + 1}: Attempting to instantly kill running process (PID: {pid})...")
+            process.kill()
+            print(f"  Worker {worker_idx + 1}: Kill signal sent for PID: {pid}.")
+            # Optionally, a very brief wait can be added if immediate confirmation is needed,
+            # but the request was for an instant kill.
+            # For example, a non-blocking poll to log the outcome:
+            final_exit_code = process.poll()
+            if final_exit_code is not None:
+                print(f"  Worker {worker_idx + 1}: Process (PID: {pid}) confirmed killed with exit code {final_exit_code} shortly after signal.")
+            else:
+                print(f"  Worker {worker_idx + 1}: Process (PID: {pid}) status after instant kill signal is still running or unknown. OS will handle cleanup.")
+                # You might still want to try a very short wait if the OS takes a moment.
+                # try:
+                #     process.wait(timeout=0.05) # Extremely short, non-blocking wait
+                # except subprocess.TimeoutExpired:
+                #     pass # It's fine if it doesn't exit this quickly
+                # final_exit_code_after_brief_wait = process.poll()
+                # if final_exit_code_after_brief_wait is not None:
+                #     print(f"  Worker {worker_idx + 1}: Process (PID: {pid}) confirmed killed with exit code {final_exit_code_after_brief_wait} after brief wait.")
 
-            process.kill() # Using kill() directly
-            print(f"  Worker {worker_idx + 1}: Kill signal sent, waiting up to 0.15 seconds...")
-
-            try:
-                process.wait(timeout=0.15) # MODIFIED Wait time
-                final_exit_code = process.poll()
-                if final_exit_code is not None:
-                    print(f"  Worker {worker_idx + 1}: Process confirmed killed with exit code {final_exit_code}.")
-                else:
-                    # This case would be unusual after a kill and wait
-                    print(f"  Worker {worker_idx + 1}: WARNING - Process state unclear after kill signal and wait. PID: {pid}")
-            except subprocess.TimeoutExpired:
-                print(f"  Worker {worker_idx + 1}: WARNING - Process (PID: {pid}) did not confirm exit within 0.15 seconds after kill signal.")
-            except Exception as e_wait_kill:
-                print(f"  Worker {worker_idx + 1}: Error during wait after kill (PID: {pid}): {e_wait_kill}")
 
         except AttributeError as e_attr:
             print(f"  Worker {worker_idx + 1}: Process object missing expected attributes for kill: {e_attr}")
-        except Exception as e_kill_general: # Changed variable name for clarity
+        except Exception as e_kill_general:
             print(f"  Worker {worker_idx + 1}: Unexpected error during kill attempt: {e_kill_general}")
 
     thumbnail_worker_pool.clear()
