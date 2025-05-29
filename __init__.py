@@ -2834,6 +2834,7 @@ class MATERIALLIST_OT_assign_selected_material(Operator):
     bl_idname = "materiallist.assign_selected_material"
     bl_label = "Assign Selected Material"
     bl_description = "Assign selected material to object/faces"
+    bl_options = {'REGISTER', 'UNDO'} # <--- ADD 'UNDO' HERE
 
     @classmethod
     def poll(cls, context):
