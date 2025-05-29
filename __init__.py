@@ -2678,52 +2678,50 @@ class MATERIALLIST_OT_scroll_to_top(Operator):
             self.report({'INFO'}, "Material list is empty.")
         return {'FINISHED'}
 
-def _is_mat_prefixed(slot_mat):
-    """True if the visible *display* name starts with 'mat_'."""
+def is_mat_prefixed(slot_mat):
+    """True if the visible display name starts with 'mat_'."""
     return (
         slot_mat
         and mat_get_display_name(slot_mat).startswith("mat_")
     )
 
 class MATERIALLIST_OT_unassign_mat(bpy.types.Operator):
+    """Remove material slots containing materials that start with 'mat_' from all mesh objects"""
     bl_idname = "materiallist.unassign_mat"
-    bl_label  = "Unassign mat_"
-    bl_description = "Remove material slots containing materials whose **display name** starts with 'mat_'"
+    bl_label = "Remove 'mat_' Material Slots"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        scene = get_first_scene()
-        if not scene:
-            self.report({'WARNING'}, "No scene found")
-            return {'CANCELLED'}
+        # Store the current active object to restore later
+        view_layer = context.view_layer
+        initial_active = getattr(view_layer.objects, 'active', None)
 
-        processed_objects = removed_slots = 0
-        for obj in scene.objects:
-            if obj.type != 'MESH':
-                continue
+        processed_objects = 0
+        total_removed = 0
 
-            slots_to_remove = [
-                idx for idx, slot in enumerate(obj.material_slots)
-                if _is_mat_prefixed(slot.material)
-            ]
-            if not slots_to_remove:
+        # Iterate all mesh objects in the scene
+        for obj in (o for o in context.scene.objects if o.type == 'MESH'):
+            mats = obj.data.materials
+            # Identify indices of materials to remove (those prefixed 'mat_')
+            to_remove = [i for i, m in enumerate(mats)
+                         if m and m.name.startswith('mat_')]
+            if not to_remove:
                 continue
 
             processed_objects += 1
-            # --- existing override block stays the same ---
-            with context.temp_override(
-                    window=context.window, area=context.area,
-                    region=context.region, selected_objects=[obj],
-                    active_object=obj, object=obj):
-                for idx in reversed(sorted(slots_to_remove)):
-                    obj.active_material_index = idx
-                    bpy.ops.object.material_slot_remove()
-                    removed_slots += 1
+            total_removed += len(to_remove)
 
-        self.report(
-            {'INFO'},
-            f"Removed {removed_slots} material slots from {processed_objects} objects"
-        )
+            # Remove materials in reverse order to avoid reindexing issues
+            for idx in reversed(to_remove):
+                mats.pop(index=idx)
+
+        # Restore the original active object if still valid
+        if initial_active and initial_active.name in bpy.data.objects:
+            view_layer.objects.active = bpy.data.objects[initial_active.name]
+
+        # Report summary
+        self.report({'INFO'},
+                    f"Processed {processed_objects} mesh objects, removed {total_removed} 'mat_' slots")
         return {'FINISHED'}
 
 class MATERIALLIST_OT_backup_reference(Operator):
