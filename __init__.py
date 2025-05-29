@@ -5357,12 +5357,6 @@ def create_reference_snapshot(context: bpy.types.Context) -> bool:
             joined_obj = context.active_object
             joined_obj.name = f"REF_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
-            # 5a) Remove any empty (None) material slots
-            mats = joined_obj.data.materials
-            for i in range(len(mats) - 1, -1, -1):
-                if mats[i] is None:
-                    mats.pop(index=i)
-
         except Exception as e_join:
             context.report({'ERROR'}, f"Join failed: {e_join}")
             for name in original_duplicate_names:
