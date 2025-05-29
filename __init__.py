@@ -5266,77 +5266,152 @@ def _load_visible_objects() -> list[str]: # Unchanged
 # ------------------------------------------------------------------
 # create_reference_snapshot (Unchanged from your version)
 # ------------------------------------------------------------------
-def create_reference_snapshot(context: bpy.types.Context) -> bool: # Unchanged
-    duplicates_refs = []; original_duplicate_names = []; joined_obj = None; original_active = context.view_layer.objects.active
+def create_reference_snapshot(context: bpy.types.Context) -> bool:
+    duplicates_refs = []
+    original_duplicate_names = []
+    joined_obj = None
+    original_active = context.view_layer.objects.active
+
     try:
+        # 1) Ensure “Reference” collection exists
         ref_coll_name = "Reference"
         if ref_coll_name not in bpy.data.collections:
             ref_coll = bpy.data.collections.new(ref_coll_name)
-            if context.scene and context.scene.collection: context.scene.collection.children.link(ref_coll)
-            else: context.report({'ERROR'}, "Scene context missing for collection linking."); return False
-        else: ref_coll = bpy.data.collections[ref_coll_name]
-        visible_objs = [obj for obj in context.visible_objects if not obj.name.startswith('UTIL_') and obj.type == 'MESH']
-        if not visible_objs: context.report({'WARNING'}, "No visible MESH objects to create reference"); return False
+            if context.scene and context.scene.collection:
+                context.scene.collection.children.link(ref_coll)
+            else:
+                context.report({'ERROR'}, "Scene context missing for collection linking.")
+                return False
+        else:
+            ref_coll = bpy.data.collections[ref_coll_name]
+
+        # 2) Gather visible mesh objects (skip UTIL_)
+        visible_objs = [
+            obj for obj in context.visible_objects
+            if not obj.name.startswith('UTIL_') and obj.type == 'MESH'
+        ]
+        if not visible_objs:
+            context.report({'WARNING'}, "No visible MESH objects to create reference")
+            return False
+
+        # 3) Rename all UV layers to the same name so join() will preserve them
+        for obj in visible_objs:
+            for uv in obj.data.uv_layers:
+                uv.name = "UVMap"
+
+        # 4) Duplicate each visible mesh
         for obj in visible_objs:
             try:
-                dup = obj.copy(); dup.data = obj.data.copy(); dup.animation_data_clear()
-                context.collection.objects.link(dup); duplicates_refs.append(dup); original_duplicate_names.append(dup.name)
+                dup = obj.copy()
+                dup.data = obj.data.copy()
+                dup.animation_data_clear()
+                context.collection.objects.link(dup)
+                duplicates_refs.append(dup)
+                original_duplicate_names.append(dup.name)
             except Exception as e_dup:
-                context.report({'ERROR'}, f"Error duplicating {obj.name}: {str(e_dup)}")
-                for name in original_duplicate_names: bpy.data.objects.remove(bpy.data.objects.get(name), do_unlink=True)
+                context.report({'ERROR'}, f"Error duplicating {obj.name}: {e_dup}")
+                # cleanup any successful duplicates
+                for name in original_duplicate_names:
+                    obj_rm = bpy.data.objects.get(name)
+                    if obj_rm:
+                        bpy.data.objects.remove(obj_rm, do_unlink=True)
                 return False
-        if not duplicates_refs: context.report({'ERROR'}, "Failed to duplicate any valid objects"); return False
+
+        if not duplicates_refs:
+            context.report({'ERROR'}, "Failed to duplicate any valid objects")
+            return False
+
+        # 5) Join all duplicates into one mesh
         try:
             bpy.ops.object.select_all(action='DESELECT')
-            valid_duplicates_for_join = [dup_ref for dup_ref in duplicates_refs if dup_ref and dup_ref.name in context.view_layer.objects]
-            if not valid_duplicates_for_join:
-                context.report({'ERROR'}, "No valid duplicates for join.");
-                for name in original_duplicate_names: bpy.data.objects.remove(bpy.data.objects.get(name), do_unlink=True)
+            valid_for_join = [
+                dup for dup in duplicates_refs
+                if dup and dup.name in context.view_layer.objects
+            ]
+            if not valid_for_join:
+                context.report({'ERROR'}, "No valid duplicates for join.")
+                for name in original_duplicate_names:
+                    obj_rm = bpy.data.objects.get(name)
+                    if obj_rm:
+                        bpy.data.objects.remove(obj_rm, do_unlink=True)
                 return False
-            for dup_ref in valid_duplicates_for_join: dup_ref.select_set(True)
-            context.view_layer.objects.active = valid_duplicates_for_join[0]
-            bpy.ops.object.join(); joined_obj = context.active_object
+
+            for dup in valid_for_join:
+                dup.select_set(True)
+            context.view_layer.objects.active = valid_for_join[0]
+            bpy.ops.object.join()
+
+            joined_obj = context.active_object
             joined_obj.name = f"REF_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
         except Exception as e_join:
-            context.report({'ERROR'}, f"Join failed: {str(e_join)}")
-            for name in original_duplicate_names: bpy.data.objects.remove(bpy.data.objects.get(name), do_unlink=True)
+            context.report({'ERROR'}, f"Join failed: {e_join}")
+            for name in original_duplicate_names:
+                obj_rm = bpy.data.objects.get(name)
+                if obj_rm:
+                    bpy.data.objects.remove(obj_rm, do_unlink=True)
             return False
+
         finally:
-            if original_active and original_active.name in context.view_layer.objects: context.view_layer.objects.active = original_active
-            elif context.view_layer.objects: context.view_layer.objects.active = context.view_layer.objects[0]
-        if joined_obj is None or joined_obj.name not in bpy.data.objects:
+            # restore original active object
+            if original_active and original_active.name in context.view_layer.objects:
+                context.view_layer.objects.active = original_active
+            elif context.view_layer.objects:
+                context.view_layer.objects.active = context.view_layer.objects[0]
+
+        # 6) Validate join result
+        if not joined_obj or joined_obj.name not in bpy.data.objects:
             context.report({'ERROR'}, "Joined object invalid.")
-            for name in original_duplicate_names: bpy.data.objects.remove(bpy.data.objects.get(name), do_unlink=True)
+            for name in original_duplicate_names:
+                obj_rm = bpy.data.objects.get(name)
+                if obj_rm:
+                    bpy.data.objects.remove(obj_rm, do_unlink=True)
             return False
+
+        # 7) Move the joined object into the Reference collection
         try:
-            for coll in list(joined_obj.users_collection): coll.objects.unlink(joined_obj) # Unlink from all
-            ref_coll.objects.link(joined_obj) # Link to Reference collection
+            for coll in list(joined_obj.users_collection):
+                coll.objects.unlink(joined_obj)
+            ref_coll.objects.link(joined_obj)
         except Exception as e_move:
-            context.report({'ERROR'}, f"Collection move failed: {str(e_move)}")
-            if joined_obj.name in bpy.data.objects: bpy.data.objects.remove(joined_obj, do_unlink=True)
+            context.report({'ERROR'}, f"Collection move failed: {e_move}")
+            if joined_obj.name in bpy.data.objects:
+                bpy.data.objects.remove(joined_obj, do_unlink=True)
             for name in original_duplicate_names:
-                obj_rem = bpy.data.objects.get(name)
-                if obj_rem and obj_rem != joined_obj: bpy.data.objects.remove(obj_rem, do_unlink=True)
+                obj_rm = bpy.data.objects.get(name)
+                if obj_rm and obj_rm != joined_obj:
+                    bpy.data.objects.remove(obj_rm, do_unlink=True)
             return False
-        joined_obj_name = joined_obj.name
-        for dup_name in original_duplicate_names:
-            obj_to_remove = bpy.data.objects.get(dup_name)
-            if obj_to_remove and obj_to_remove.name != joined_obj_name:
-                try: bpy.data.objects.remove(obj_to_remove, do_unlink=True)
-                except Exception: pass
+
+        # 8) Clean up the original duplicates
+        for name in original_duplicate_names:
+            if name != joined_obj.name:
+                obj_rm = bpy.data.objects.get(name)
+                if obj_rm:
+                    try:
+                        bpy.data.objects.remove(obj_rm, do_unlink=True)
+                    except Exception:
+                        pass
+
         return True
+
     except Exception as e:
-        print(f"CRITICAL ERROR in create_reference_snapshot: {str(e)}"); traceback.print_exc()
+        print(f"CRITICAL ERROR in create_reference_snapshot: {e}")
+        traceback.print_exc()
         try:
-            if context: context.report({'ERROR'}, f"Snapshot creation failed: {str(e)}")
-        except Exception: pass
+            context.report({'ERROR'}, f"Snapshot creation failed: {e}")
+        except Exception:
+            pass
+        # final cleanup on catastrophic failure
         if 'original_duplicate_names' in locals():
-            joined_obj_name_final = joined_obj.name if joined_obj else None
+            final_name = joined_obj.name if joined_obj else None
             for name in original_duplicate_names:
-                obj_rem = bpy.data.objects.get(name)
-                if obj_rem and name != joined_obj_name_final:
-                    try: bpy.data.objects.remove(obj_rem, do_unlink=True)
-                    except Exception: pass
+                obj_rm = bpy.data.objects.get(name)
+                if obj_rm and name != final_name:
+                    try:
+                        bpy.data.objects.remove(obj_rm, do_unlink=True)
+                    except Exception:
+                        pass
         return False
 
 # This global `start worker once` block is removed as the new thumbnail system
