@@ -5790,7 +5790,6 @@ class MATERIALLIST_PT_panel(bpy.types.Panel): # Ensure bpy.types.Panel is inheri
         library_ops_box = layout.box()
         library_ops_box.label(text="Library Operations", icon='ASSET_MANAGER')
         library_ops_box.operator("materiallist.integrate_library", text="Integrate External Library", icon='IMPORT')
-        library_ops_box.operator("materiallist.pack_library_textures", text="Pack All Library Data", icon='PACKAGE') # Restored this line
 
         # --- Batch Utilities ---
         project_util_box = layout.box()
