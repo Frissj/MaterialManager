@@ -2678,50 +2678,52 @@ class MATERIALLIST_OT_scroll_to_top(Operator):
             self.report({'INFO'}, "Material list is empty.")
         return {'FINISHED'}
 
-class MATERIALLIST_OT_unassign_mat(Operator):
+def _is_mat_prefixed(slot_mat):
+    """True if the visible *display* name starts with 'mat_'."""
+    return (
+        slot_mat
+        and mat_get_display_name(slot_mat).startswith("mat_")
+    )
+
+class MATERIALLIST_OT_unassign_mat(bpy.types.Operator):
     bl_idname = "materiallist.unassign_mat"
-    bl_label = "Unassign mat_"
-    bl_description = "Remove material slots containing materials starting with 'mat_'"
+    bl_label  = "Unassign mat_"
+    bl_description = "Remove material slots containing materials whose **display name** starts with 'mat_'"
+    bl_options = {'REGISTER', 'UNDO'}
+
     def execute(self, context):
         scene = get_first_scene()
         if not scene:
             self.report({'WARNING'}, "No scene found")
             return {'CANCELLED'}
-        original_active = context.view_layer.objects.active
-        original_selection = list(context.selected_objects)
-        remove_materials = {
-            mat.name
-            for mat in bpy.data.materials
-            if mat_get_display_name(mat).startswith("mat_")
-        }
-        processed_objects = 0
-        removed_slots = 0
+
+        processed_objects = removed_slots = 0
         for obj in scene.objects:
             if obj.type != 'MESH':
                 continue
-            slots_to_remove = []
-            for idx, slot in enumerate(obj.material_slots):
-                if slot.material and slot.material.name in remove_materials:
-                    slots_to_remove.append(idx)
+
+            slots_to_remove = [
+                idx for idx, slot in enumerate(obj.material_slots)
+                if _is_mat_prefixed(slot.material)
+            ]
             if not slots_to_remove:
                 continue
+
+            processed_objects += 1
+            # --- existing override block stays the same ---
             with context.temp_override(
-                window=context.window,
-                area=context.area,
-                region=context.region,
-                selected_objects=[obj],
-                active_object=obj,
-                object=obj
-            ):
+                    window=context.window, area=context.area,
+                    region=context.region, selected_objects=[obj],
+                    active_object=obj, object=obj):
                 for idx in reversed(sorted(slots_to_remove)):
                     obj.active_material_index = idx
                     bpy.ops.object.material_slot_remove()
                     removed_slots += 1
-            processed_objects += 1
-        context.view_layer.objects.active = original_active
-        for obj in original_selection:
-            obj.select_set(True)
-        self.report({'INFO'}, f"Removed {removed_slots} material slots from {processed_objects} objects")
+
+        self.report(
+            {'INFO'},
+            f"Removed {removed_slots} material slots from {processed_objects} objects"
+        )
         return {'FINISHED'}
 
 class MATERIALLIST_OT_backup_reference(Operator):
