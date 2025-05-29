@@ -463,7 +463,72 @@ def create_sphere_preview_thumbnail_bg_worker(mat_to_render, output_thumb_path, 
         else:
             preview_obj.material_slots[0].material = temp_mat_copy
 
-        # UV Map linking (same as before)
+        # --- MODIFICATION START: Ensure correct colorspace for PBR maps ---
+        if temp_mat_copy.use_nodes and temp_mat_copy.node_tree:
+            principled_bsdf = next((n for n in temp_mat_copy.node_tree.nodes if n.bl_idname == 'ShaderNodeBsdfPrincipled'), None)
+            if principled_bsdf:
+                # Inputs that typically use Non-Color data
+                pbr_non_color_inputs = [
+                    "Metallic", "Roughness", 
+                    "Specular", # Blender docs say "Non-color data" for value, color for tint
+                    "Sheen", # Similar to Specular
+                    "Clearcoat", "Clearcoat Roughness",
+                    "IOR", "Transmission", "Transmission Roughness", 
+                    "Anisotropic", "Anisotropic Rotation",
+                    # Custom ones if your Principled has them e.g. Coat Weight, Subsurface Weight if texture driven
+                ]
+                # Inputs that use Color data (sRGB typically)
+                # pbr_color_inputs = ["Base Color", "Subsurface Color", "Emission Color", "Specular Tint", "Sheen Tint", "Clearcoat Tint"]
+
+
+                for input_name in pbr_non_color_inputs:
+                    input_socket = principled_bsdf.inputs.get(input_name)
+                    if input_socket and input_socket.is_linked:
+                        # Trace back to the image texture, skipping utility nodes if any (e.g. separate RGB)
+                        current_link_node = input_socket.links[0].from_node
+                        for _ in range(5): # Limit search depth for texture node
+                            if current_link_node.bl_idname == 'ShaderNodeTexImage' and current_link_node.image:
+                                if current_link_node.image.colorspace_settings.name != 'Non-Color':
+                                    try:
+                                        current_link_node.image.colorspace_settings.name = 'Non-Color'
+                                        print(f"    [Thumb BG Worker] Set image '{current_link_node.image.name}' for '{input_name}' to Non-Color colorspace. Mat: {temp_mat_copy.name}", file=sys.stderr)
+                                    except TypeError as te_cs: # Handles read-only colorspaces like 'Linear REC.709'
+                                        if 'readonly' in str(te_cs).lower() or 'cannot be set' in str(te_cs).lower():
+                                            print(f"    [Thumb BG Worker] Colorspace for image '{current_link_node.image.name}' ('{current_link_node.image.colorspace_settings.name}') is read-only or invalid target. Mat: {temp_mat_copy.name}", file=sys.stderr)
+                                        else:
+                                            print(f"    [Thumb BG Worker] TypeError setting colorspace for '{current_link_node.image.name}' to Non-Color: {te_cs}. Mat: {temp_mat_copy.name}", file=sys.stderr)
+                                    except Exception as e_cs:
+                                        print(f"    [Thumb BG Worker] Error setting colorspace for '{current_link_node.image.name}' to Non-Color: {e_cs}. Mat: {temp_mat_copy.name}", file=sys.stderr)
+                                break # Found and processed the TexImage node
+                            if not hasattr(current_link_node, 'inputs') or not current_link_node.inputs[0].is_linked: # Simplistic trace back via first input
+                                break
+                            current_link_node = current_link_node.inputs[0].links[0].from_node
+                        # else: print(f"    [Thumb BG Worker] No direct ShaderNodeTexImage found for '{input_name}' after tracing back.")
+
+
+                # Special handling for Normal maps
+                normal_input_socket = principled_bsdf.inputs.get("Normal")
+                if normal_input_socket and normal_input_socket.is_linked:
+                    normal_map_node_candidate = normal_input_socket.links[0].from_node
+                    if normal_map_node_candidate.bl_idname == 'ShaderNodeNormalMap':
+                        color_input_of_normal_map = normal_map_node_candidate.inputs.get("Color")
+                        if color_input_of_normal_map and color_input_of_normal_map.is_linked:
+                            normal_tex_node = color_input_of_normal_map.links[0].from_node
+                            if normal_tex_node.bl_idname == 'ShaderNodeTexImage' and normal_tex_node.image:
+                                if normal_tex_node.image.colorspace_settings.name != 'Non-Color':
+                                    try:
+                                        normal_tex_node.image.colorspace_settings.name = 'Non-Color'
+                                        print(f"    [Thumb BG Worker] Set image '{normal_tex_node.image.name}' for Normal Map to Non-Color. Mat: {temp_mat_copy.name}", file=sys.stderr)
+                                    except TypeError as te_norm_cs:
+                                        if 'readonly' in str(te_norm_cs).lower() or 'cannot be set' in str(te_norm_cs).lower():
+                                             print(f"    [Thumb BG Worker] Colorspace for Normal image '{normal_tex_node.image.name}' ('{normal_tex_node.image.colorspace_settings.name}') is read-only or invalid target. Mat: {temp_mat_copy.name}", file=sys.stderr)
+                                        else:
+                                            print(f"    [Thumb BG Worker] TypeError setting colorspace for Normal image '{normal_tex_node.image.name}': {te_norm_cs}. Mat: {temp_mat_copy.name}", file=sys.stderr)
+                                    except Exception as e_cs_norm:
+                                        print(f"    [Thumb BG Worker] Error setting colorspace for Normal image '{normal_tex_node.image.name}': {e_cs_norm}. Mat: {temp_mat_copy.name}", file=sys.stderr)
+        # --- MODIFICATION END ---
+
+        # UV Map linking (existing logic)
         if temp_mat_copy.use_nodes and temp_mat_copy.node_tree:
             active_uv_map = preview_obj.data.uv_layers.active or (preview_obj.data.uv_layers[0] if preview_obj.data.uv_layers else None)
             if active_uv_map:
@@ -475,16 +540,16 @@ def create_sphere_preview_thumbnail_bg_worker(mat_to_render, output_thumb_path, 
                         vector_input = tex_node.inputs.get("Vector")
                         if vector_input and not vector_input.is_linked:
                             try: temp_mat_copy.node_tree.links.new(uv_map_node.outputs['UV'], vector_input)
-                            except Exception: pass # Minor error
+                            except Exception: pass 
 
         render_scene_for_item.render.filepath = temp_render_output_path
         bpy.ops.render.render(scene=render_scene_for_item.name, write_still=True)
-        time.sleep(0.1) # Pause
+        time.sleep(0.1) 
 
         if not os.path.exists(temp_render_output_path) or os.path.getsize(temp_render_output_path) == 0:
             print(f"[BG Worker - ItemRender] ERROR: Temp render output missing or empty: {temp_render_output_path}", file=sys.stderr)
-            if os.path.exists(temp_render_output_path): 
-                try: os.remove(temp_render_output_path) 
+            if os.path.exists(temp_render_output_path):
+                try: os.remove(temp_render_output_path)
                 except Exception: pass
             return False
         
@@ -492,8 +557,8 @@ def create_sphere_preview_thumbnail_bg_worker(mat_to_render, output_thumb_path, 
             shutil.move(temp_render_output_path, final_output_path)
         except Exception as e_move:
             print(f"[BG Worker - ItemRender] ERROR: Failed to move temp render to final: {e_move}", file=sys.stderr)
-            if os.path.exists(temp_render_output_path): 
-                try: os.remove(temp_render_output_path) 
+            if os.path.exists(temp_render_output_path):
+                try: os.remove(temp_render_output_path)
                 except Exception: pass
             return False
 
@@ -504,8 +569,8 @@ def create_sphere_preview_thumbnail_bg_worker(mat_to_render, output_thumb_path, 
     except Exception as e_render_process:
         print(f"[BG Worker - ItemRender] Critical error rendering '{temp_mat_copy.name if temp_mat_copy else mat_to_render.name}': {e_render_process}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
-        if os.path.exists(temp_render_output_path): 
-            try: os.remove(temp_render_output_path) 
+        if os.path.exists(temp_render_output_path):
+            try: os.remove(temp_render_output_path)
             except Exception: pass
         return False
     finally:
