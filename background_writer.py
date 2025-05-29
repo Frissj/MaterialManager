@@ -19,6 +19,8 @@ ICON_TEMPLATE_FILE_WORKER = None
 THUMBNAIL_SIZE_WORKER = 256 # Default, overridden by arg
 persistent_icon_template_scene_worker = None # Cache for loaded template scene within this worker instance
 HASH_VERSION_FOR_WORKER = "v_RTX_REMIX_PBR_COMPREHENSIVE_2_CONTENT_ONLY"
+global_hash_cache = {}
+material_hashes = {}
 
 # --- Hashing Functions (Ensure these match your main addon's implementation) ---
 def _float_repr(f):
