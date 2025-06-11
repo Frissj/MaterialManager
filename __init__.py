@@ -164,14 +164,14 @@ def initialize_database():
     c.execute('''CREATE TABLE IF NOT EXISTS clear_list
                  (material_name TEXT PRIMARY KEY)''')
     c.execute('''CREATE TABLE IF NOT EXISTS cache_version
-                 (version INTEGER)''') # Consider renaming rowid to avoid confusion if version is not at rowid 1
+                 (version INTEGER)''')
     c.execute('''CREATE TABLE IF NOT EXISTS groups
                  (hash TEXT PRIMARY KEY, local_uuid TEXT, library_uuid TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS backups
                  (blend_filepath TEXT PRIMARY KEY, reference BLOB, editing BLOB)''')
     c.execute('''CREATE TABLE IF NOT EXISTS localisation_log
-                 (id           INTEGER  PRIMARY KEY AUTOINCREMENT,
-                  timestamp    INTEGER,
+                 (id              INTEGER  PRIMARY KEY AUTOINCREMENT,
+                  timestamp       INTEGER,
                   blend_filepath TEXT,
                   library_uuid   TEXT,
                   local_uuid     TEXT)''')
@@ -190,11 +190,20 @@ def initialize_database():
                   source_material_name_in_file TEXT, 
                   source_material_uuid_in_file TEXT,
                   timestamp_added_to_library INTEGER)''')
-    # Ensure cache_version has at least one row, typically rowid 1 for single version value
+
+    # --- MODIFICATION: ADD NEW EFFICIENT HASH TABLE ---
+    c.execute('''CREATE TABLE IF NOT EXISTS material_hash_cache
+                   (blend_filepath TEXT NOT NULL,
+                    material_uuid TEXT NOT NULL,
+                    hash TEXT NOT NULL,
+                    timestamp INTEGER,
+                    PRIMARY KEY (blend_filepath, material_uuid))''')
+    # --- END MODIFICATION ---
+
     c.execute("SELECT COUNT(*) FROM cache_version")
     if c.fetchone()[0] == 0:
         c.execute("INSERT INTO cache_version (version) VALUES (0)")
-    else: # Ensure the specific row we might target by rowid exists if that's the plan
+    else:
         c.execute("INSERT OR IGNORE INTO cache_version (rowid, version) VALUES (1,0)")
 
     conn.commit()
@@ -253,33 +262,53 @@ def save_material_names():
         print(f"[MaterialList] Error saving material names: {e}")
         traceback.print_exc()
 
-def load_material_hashes():
+def load_material_hashes(blend_filepath):
+    """
+    --- MODIFIED: Now loads hashes only for a specific .blend file. ---
+    This populates the global `material_hashes` dictionary for the current session.
+    """
     global material_hashes
+    material_hashes = {}  # Clear the global cache for the new file context
+
+    if not blend_filepath:
+        return
+
     try:
         with get_db_connection() as conn:
             c = conn.cursor()
-            c.execute("SELECT uuid, hash FROM material_hashes")
+            # Query the new, file-specific table
+            c.execute("SELECT material_uuid, hash FROM material_hash_cache WHERE blend_filepath = ?", (blend_filepath,))
             material_hashes = {row[0]: row[1] for row in c.fetchall()}
     except Exception as e:
-        print(f"[MaterialList] Error loading material hashes: {e}")
+        print(f"[MaterialList] Error loading material hashes for {os.path.basename(blend_filepath)}: {e}")
         material_hashes = {}
 
-def save_material_hashes():
-    global material_hashes
-    BATCH_SIZE = 1000
+def save_material_hashes(blend_filepath, hashes_to_save):
+    """
+    --- NEW/MODIFIED: Now saves/updates hashes for a specific .blend file into the new cache table. ---
+    """
+    if not blend_filepath or not hashes_to_save:
+        return
+        
+    BATCH_SIZE = 500
     try:
-        with get_db_connection() as conn, hash_lock: # hash_lock protects material_hashes dict
+        with get_db_connection() as conn:
             c = conn.cursor()
-            entries = list(material_hashes.items())
-            for i in range(0, len(entries), BATCH_SIZE):
-                batch = entries[i:i+BATCH_SIZE]
-                c.executemany(
-                    "INSERT OR REPLACE INTO material_hashes (uuid, hash) VALUES (?, ?)", # Explicit columns
-                    [(k, v) for k, v in batch]
-                )
+            
+            entries = []
+            current_time = int(time.time())
+            for uuid, hash_val in hashes_to_save.items():
+                entries.append((blend_filepath, uuid, hash_val, current_time))
+
+            # Use INSERT OR REPLACE with the composite primary key to update existing entries
+            # or insert new ones.
+            c.executemany(
+                "INSERT OR REPLACE INTO material_hash_cache (blend_filepath, material_uuid, hash, timestamp) VALUES (?, ?, ?, ?)",
+                entries
+            )
             conn.commit()
     except Exception as e:
-        print(f"[MaterialList] Error saving material hashes: {e}")
+        print(f"[MaterialList] Error saving material hashes for {os.path.basename(blend_filepath)}: {e}")
         traceback.print_exc()
 
 # --- START OF HASHING FUNCTIONS ---
@@ -1154,23 +1183,26 @@ def _perform_library_update(force: bool = False):
     if g_thumbnail_process_ongoing:
         print("[DEBUG LibUpdate MainAddon] Thumbnail generation is ongoing. Deferring library update.")
         g_library_update_pending = True
-        if force: # If the deferred update was forced, keep that forced status
+        if force: 
             if hasattr(bpy.context.window_manager, 'matlist_pending_lib_update_is_forced'):
                 bpy.context.window_manager.matlist_pending_lib_update_is_forced = True
-        return False # Indicate update was deferred
+        return False
 
-    # Check if a previously deferred update was forced
     effective_force = force
     if hasattr(bpy.context.window_manager, 'matlist_pending_lib_update_is_forced') and bpy.context.window_manager.matlist_pending_lib_update_is_forced:
         print("[DEBUG LibUpdate MainAddon] Pending library update was flagged as forced. Applying force.")
         effective_force = True
-        bpy.context.window_manager.matlist_pending_lib_update_is_forced = False # Reset the flag
+        bpy.context.window_manager.matlist_pending_lib_update_is_forced = False
 
     print(f"[DEBUG LibUpdate MainAddon] Effective force for this run: {effective_force}")
 
-    load_material_hashes()
+    # --- MODIFICATION START ---
+    # The function was missing the required 'blend_filepath' argument here.
+    # For updating the library, we need to compare against the hashes OF the library file.
+    load_material_hashes(LIBRARY_FILE)
+    # --- MODIFICATION END ---
 
-    existing_names_in_lib_file = set() # Stores UUIDs (datablock names) present in material_library.blend
+    existing_names_in_lib_file = set()
 
     if os.path.exists(LIBRARY_FILE):
         try:
@@ -1184,8 +1216,6 @@ def _perform_library_update(force: bool = False):
 
     to_transfer = []
     processed_content_hashes_for_this_transfer_op = set()
-
-    # MODIFICATION 1: Initialize list for deferred fake user setting
     mats_needing_fake_user_setting = []
 
     print(f"[DEBUG LibUpdate MainAddon] Iterating {len(bpy.data.materials)} materials in current .blend file for potential transfer.")
@@ -1242,19 +1272,14 @@ def _perform_library_update(force: bool = False):
                     try:
                         existing_mat_with_target_name = bpy.data.materials.get(uid)
                         if existing_mat_with_target_name and existing_mat_with_target_name != mat:
-                            print(f"      WARNING: Cannot rename '{mat.name}' to UUID '{uid}' for transfer. Target name exists and is a different datablock. Skipping this material.")
+                            print(f"       WARNING: Cannot rename '{mat.name}' to UUID '{uid}' for transfer. Target name exists and is a different datablock. Skipping this material.")
                             continue
                         mat.name = uid
                     except Exception as rename_err:
-                        print(f"      WARNING: Failed to rename datablock '{mat.name}' to UUID '{uid}' for transfer: {rename_err}. Skipping this material.")
+                        print(f"       WARNING: Failed to rename datablock '{mat.name}' to UUID '{uid}' for transfer: {rename_err}. Skipping this material.")
                         continue
                 
-                # MODIFICATION 2: Remove direct setting of use_fake_user from here
-                # if hasattr(mat, 'use_fake_user'):
-                #     mat.use_fake_user = True # <--- ORIGINAL ERROR LINE (REMOVED)
-
-                # MODIFICATION 3: Add to list for deferred setting
-                if mat and not mat.library: # Ensure it's local and should be processed
+                if mat and not mat.library:
                     mats_needing_fake_user_setting.append(mat)
 
                 try:
@@ -1263,9 +1288,9 @@ def _perform_library_update(force: bool = False):
                     mat["ml_origin_mat_name"] = display_name
                     mat["ml_origin_mat_uuid"] = uid
                 except Exception as e_set_origin_prop:
-                    print(f"      Warning: Could not set origin custom properties on '{mat.name}': {e_set_origin_prop}")
+                    print(f"       Warning: Could not set origin custom properties on '{mat.name}': {e_set_origin_prop}")
 
-                print(f"      >>> ADDING '{mat.name}' (orig display name: '{display_name}', ContentHash: {current_content_hash[:8]}) TO TRANSFER LIST. Reason: {reason_for_transfer}")
+                print(f"       >>> ADDING '{mat.name}' (orig display name: '{display_name}', ContentHash: {current_content_hash[:8]}) TO TRANSFER LIST. Reason: {reason_for_transfer}")
                 to_transfer.append(mat)
                 processed_content_hashes_for_this_transfer_op.add(current_content_hash)
                 material_hashes[uid] = current_content_hash
@@ -1276,27 +1301,23 @@ def _perform_library_update(force: bool = False):
             print(f"[DEBUG LibUpdate MainAddon] Error processing material {mat_name_debug} in loop: {loop_error}")
             traceback.print_exc()
     
-    # --- MODIFICATION 4: Insert the deferred setting of use_fake_user ---
     if mats_needing_fake_user_setting:
         print(f"[DEBUG LibUpdate MainAddon] Setting use_fake_user for {len(mats_needing_fake_user_setting)} materials.")
         for mat_to_set in mats_needing_fake_user_setting:
             try:
-                # Ensure it's a valid, local material from bpy.data before attempting to set fake user
                 if mat_to_set and mat_to_set.name in bpy.data.materials and \
                    not mat_to_set.library and hasattr(mat_to_set, 'use_fake_user'):
-                    if not mat_to_set.use_fake_user: # Only set if not already True
+                    if not mat_to_set.use_fake_user:
                         mat_to_set.use_fake_user = True
-            except AttributeError as e_attr: # Catch the specific error
+            except AttributeError as e_attr:
                 print(f"  Error setting use_fake_user for {getattr(mat_to_set, 'name', 'N/A')} (AttributeError): {e_attr}", file=sys.stderr)
-                # traceback.print_exc(file=sys.stderr) # Keep commented unless detailed trace is needed
             except Exception as e_general:
                 print(f"  Error setting use_fake_user for {getattr(mat_to_set, 'name', 'N/A')}: {e_general}", file=sys.stderr)
-                # traceback.print_exc(file=sys.stderr) # Keep commented unless detailed trace is needed
-    # --- End of MODIFICATION 4 ---
 
     if not to_transfer:
         print("[DEBUG LibUpdate MainAddon] Nothing to transfer to library.")
-        save_material_hashes()
+        if LIBRARY_FILE: # Only save if we have a library file to associate with
+            save_material_hashes(LIBRARY_FILE, material_hashes)
         return True
 
     print(f"[DEBUG LibUpdate MainAddon] Preparing to transfer {len(to_transfer)} materials.")
@@ -1313,18 +1334,17 @@ def _perform_library_update(force: bool = False):
     try:
         tmp_dir_for_transfer = tempfile.mkdtemp(prefix="matlib_transfer_")
         transfer_blend_file_path = os.path.join(tmp_dir_for_transfer, f"transfer_data_{uuid.uuid4().hex[:8]}.blend")
-
         valid_mats_for_bpy_write = {m for m in to_transfer if isinstance(m, bpy.types.Material)}
 
         if not valid_mats_for_bpy_write:
             print("[DEBUG LibUpdate MainAddon] No valid material objects in the transfer list after filtering. Nothing to write.")
             if tmp_dir_for_transfer and os.path.exists(tmp_dir_for_transfer):
                 shutil.rmtree(tmp_dir_for_transfer, ignore_errors=True)
-            save_material_hashes()
+            if LIBRARY_FILE:
+                save_material_hashes(LIBRARY_FILE, material_hashes)
             return True
 
         actual_mats_written_to_transfer_file = valid_mats_for_bpy_write
-
         print(f"[DEBUG LibUpdate MainAddon] Writing {len(actual_mats_written_to_transfer_file)} materials to transfer file: {transfer_blend_file_path}")
         bpy.data.libraries.write(transfer_blend_file_path, actual_mats_written_to_transfer_file, fake_user=True, compress=True)
         print(f"[DEBUG LibUpdate MainAddon] Successfully wrote materials to transfer file.")
@@ -1334,7 +1354,8 @@ def _perform_library_update(force: bool = False):
         traceback.print_exc()
         if tmp_dir_for_transfer and os.path.exists(tmp_dir_for_transfer):
             shutil.rmtree(tmp_dir_for_transfer, ignore_errors=True)
-        save_material_hashes()
+        if LIBRARY_FILE:
+            save_material_hashes(LIBRARY_FILE, material_hashes)
         return False
 
     if actual_mats_written_to_transfer_file and tmp_dir_for_transfer:
@@ -1377,15 +1398,28 @@ def _perform_library_update(force: bool = False):
             staged_count = 0; failed_copy_count = 0
             for src_path, temp_dest_path in unique_images_to_stage.items():
                 try:
+                    abs_src_path = os.path.abspath(src_path)
+                    abs_dest_path = os.path.abspath(temp_dest_path)
+
+                    if abs_src_path == abs_dest_path:
+                        print(f"     INFO STAGING: Source and destination resolve to the same file. Skipping copy for '{os.path.basename(src_path)}'")
+                        staged_count += 1
+                        continue
+
                     os.makedirs(os.path.dirname(temp_dest_path), exist_ok=True)
                     shutil.copy2(src_path, temp_dest_path)
                     staged_count +=1
+                except shutil.SameFileError:
+                    print(f"     INFO STAGING: shutil.SameFileError caught. Skipping copy for '{os.path.basename(src_path)}'")
+                    staged_count += 1
+                    continue
                 except Exception as e_stage_copy:
-                    print(f"    ERROR STAGING: Failed to copy '{src_path}' to '{temp_dest_path}': {e_stage_copy}")
+                    print(f"     ERROR STAGING: Failed to copy '{src_path}' to '{temp_dest_path}': {e_stage_copy}")
                     failed_copy_count +=1
             print(f"[DEBUG LibUpdate MainAddon] Staging of {staged_count} relatively-pathed images complete. Failed copies: {failed_copy_count}.")
 
-    save_material_hashes()
+    if LIBRARY_FILE:
+        save_material_hashes(LIBRARY_FILE, material_hashes)
     print(f"[DEBUG LibUpdate MainAddon] Updated and saved material_hashes to DB for materials processed in this update.")
 
     if not BACKGROUND_WORKER_PY or not os.path.exists(BACKGROUND_WORKER_PY):
@@ -1805,6 +1839,13 @@ def save_handler(dummy):
 
     start_time_total = time.time()
     print(f"\n[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] ----- Starting pre-save process ({len(bpy.data.materials)} materials total) -----")
+    
+    # --- MODIFICATION: Get current file path early ---
+    current_blend_file = bpy.data.filepath
+    if not current_blend_file:
+        print("[SAVE DB] File is not saved. Cannot process file-specific hashes or library updates.")
+        # We can still process UUIDs and names for the session, but can't save hashes to the new table.
+    # --- END MODIFICATION ---
 
     needs_metadata_update = False
     needs_name_db_save = False
@@ -1817,7 +1858,6 @@ def save_handler(dummy):
         print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] load_material_names() took {time.time() - load_names_timer_start:.4f}s.")
 
     phase1_start_time = time.time()
-    # ... (Phase 1 logic remains the same as in your provided code) ...
     mats_to_process_phase1 = list(bpy.data.materials)
     uuid_assigned_in_phase1_count = 0
     datablock_renamed_in_phase1_count = 0
@@ -1836,7 +1876,7 @@ def save_handler(dummy):
         if not current_display_name_for_processing.startswith("mat_"):
             if current_uuid_prop:
                 if current_uuid_prop not in material_names:
-                    material_names[current_uuid_prop] = original_datablock_name # Or a better default display name logic
+                    material_names[current_uuid_prop] = original_datablock_name
                     db_name_entry_added_in_phase1_count +=1
                     needs_name_db_save = True
                     needs_metadata_update = True
@@ -1858,20 +1898,21 @@ def save_handler(dummy):
             
     print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] Phase 1 (UUIDs/Names) took {time.time() - phase1_start_time:.4f}s. Assigned: {uuid_assigned_in_phase1_count} UUIDs, Renamed: {datablock_renamed_in_phase1_count} DBs, Added: {db_name_entry_added_in_phase1_count} NameEntries.")
 
+    # --- MODIFICATION: Use new file-specific hash loading ---
     load_hashes_start_time = time.time()
-    load_material_hashes()
-    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] load_material_hashes() took {time.time() - load_hashes_start_time:.4f}s. ({len(material_hashes)} hashes loaded).")
+    if current_blend_file:
+        load_material_hashes(current_blend_file)
+    else:
+        material_hashes.clear() # No file, no hashes to load
+    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] load_material_hashes() took {time.time() - load_hashes_start_time:.4f}s. ({len(material_hashes)} hashes loaded for this file).")
+    # --- END MODIFICATION ---
 
     phase2_start_time = time.time()
-    hashes_to_save_to_db = {}
-    hashes_actually_changed_in_db = False # Renamed this from your original for clarity
+    hashes_to_save_this_session = {} # Use a local dict for this specific save operation
     deleted_old_thumb_count = 0
     recalculated_hash_count = 0
     mats_to_process_phase2 = list(bpy.data.materials)
-
-    # --- NEW: Session-scoped cache for image hashes ---
     _session_image_hash_cache = {} 
-    # --- END NEW ---
 
     for mat in mats_to_process_phase2:
         if not mat: continue
@@ -1892,9 +1933,7 @@ def save_handler(dummy):
 
         if needs_recalc:
             recalculated_hash_count +=1
-            # --- MODIFIED: Pass the cache to get_material_hash ---
             recalculated_hash = get_material_hash(mat, force=True, image_hash_cache=_session_image_hash_cache)
-            # --- END MODIFIED ---
             if not recalculated_hash:
                 if "hash_dirty" in mat and not mat.library: mat["hash_dirty"] = False
                 continue
@@ -1902,13 +1941,13 @@ def save_handler(dummy):
         
         if db_stored_hash_for_this_uuid != current_hash_to_compare_with_db:
             actual_material_modifications_this_run = True 
-            hashes_to_save_to_db[actual_uuid_for_hash_storage] = current_hash_to_compare_with_db
+            # --- MODIFICATION: Add to local dictionary for this session ---
+            hashes_to_save_this_session[actual_uuid_for_hash_storage] = current_hash_to_compare_with_db
+            # --- END MODIFICATION ---
             update_material_timestamp(actual_uuid_for_hash_storage)
             timestamp_updated_for_recency = True
-            if db_stored_hash_for_this_uuid is not None: # Hash changed for existing UUID in DB
-                # This flag is more about "did a hash stored in the DB actually change value"
-                hashes_actually_changed_in_db = True 
-                if not mat.library: # Only delete old thumbs for local mats if their hash changes
+            if db_stored_hash_for_this_uuid is not None:
+                if not mat.library:
                     old_thumbnail_path = get_thumbnail_path(db_stored_hash_for_this_uuid)
                     if os.path.isfile(old_thumbnail_path):
                         try:
@@ -1916,8 +1955,6 @@ def save_handler(dummy):
                             deleted_old_thumb_count += 1
                         except Exception as e_del_thumb:
                             print(f"[SAVE DB] Phase 2 Error deleting old thumbnail {old_thumbnail_path}: {e_del_thumb}")
-            else: # Hash is new to the DB for this UUID (or UUID itself is new to DB hashes)
-                hashes_actually_changed_in_db = True # Treat as a change that needs DB save
 
             blend_file_path_for_worker_task = None
             if mat.library and mat.library.filepath:
@@ -1952,11 +1989,14 @@ def save_handler(dummy):
         save_material_names()
         saved_names_this_run = True
         actual_material_modifications_this_run = True 
-    if hashes_to_save_to_db: # Check if there are actually hashes to save
-        material_hashes.update(hashes_to_save_to_db) # Update the global in-memory cache
-        save_material_hashes() # Persist the entire global in-memory cache to DB
+
+    # --- MODIFICATION: Use new file-specific save function ---
+    if hashes_to_save_this_session and current_blend_file:
+        save_material_hashes(current_blend_file, hashes_to_save_this_session)
+        material_hashes.update(hashes_to_save_this_session) # Also update the in-memory global cache
         saved_hashes_this_run = True
         actual_material_modifications_this_run = True 
+    # --- END MODIFICATION ---
         
     if saved_names_this_run or saved_hashes_this_run:
         print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] Database write operations took {time.time() - db_write_start_time:.4f}s. (Names saved: {saved_names_this_run}, Hashes saved: {saved_hashes_this_run})")
@@ -1966,15 +2006,14 @@ def save_handler(dummy):
 
     phase3_start_time = time.time()
     library_update_queued_type = "None"
-    # Condition for forced update is if a hash VALUE in the DB actually changed, or metadata needed update
-    if hashes_actually_changed_in_db or needs_metadata_update : 
-        update_material_library(force_update=True) 
-        library_update_queued_type = "Forced"
-    # Condition for non-forced update: new hashes were added to DB (but no existing ones changed), 
-    # or new names added, or just timestamps updated
-    elif hashes_to_save_to_db or needs_name_db_save or timestamp_updated_for_recency: 
-        update_material_library(force_update=False)
-        library_update_queued_type = "Non-Forced"
+    if current_blend_file: # Only queue library updates if the file is saved
+        hashes_actually_changed_in_db = bool(hashes_to_save_this_session) # Simplified check
+        if hashes_actually_changed_in_db or needs_metadata_update : 
+            update_material_library(force_update=True) 
+            library_update_queued_type = "Forced"
+        elif hashes_to_save_this_session or needs_name_db_save or timestamp_updated_for_recency: 
+            update_material_library(force_update=False)
+            library_update_queued_type = "Non-Forced"
         
     print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] Phase 3 (Lib Update Queue) took {time.time() - phase3_start_time:.4f}s. Queued: {library_update_queued_type}")
     print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] ----- Pre-save handler total time: {time.time() - start_time_total:.4f}s. -----")
@@ -2152,26 +2191,34 @@ def file_changed_handler(scene): # Unchanged
     except Exception as e: print(f"Error in file_changed_handler: {e}")
 
 @persistent
-def delayed_load_post(): # Unchanged in core logic, but benefits from other fixes (cache clearing in load_post_handler)
+def delayed_load_post():
     global custom_icons, material_names, material_hashes, global_hash_cache
     print("[DEBUG] delayed_load_post (v3 - Stable custom_icons): Start")
-    scene = get_first_scene(); # Get scene early
+    scene = get_first_scene();
     if not scene:
         print("[DEBUG] delayed_load_post: No scene found, aborting.");
         return None
 
-    print("[DEBUG delayed_load_post] Loading names and hashes...")
-    load_material_names() # Loads into global material_names
-    load_material_hashes() # Loads into global material_hashes
-    with hash_lock: # Protect global_hash_cache
-        global_hash_cache.clear() # Clear before repopulating
+    print("[DEBUG delayed_load_post] Loading names and hashes for current file...")
+    load_material_names()
+    
+    # --- MODIFICATION: Use new file-specific hash loader ---
+    if bpy.data.filepath:
+        load_material_hashes(bpy.data.filepath)
+    else:
+        # Clear hashes if the file is unsaved and we are starting fresh
+        material_hashes.clear()
+    # --- END MODIFICATION ---
+
+    with hash_lock:
+        global_hash_cache.clear()
         for uid, h_val in material_hashes.items(): global_hash_cache[uid] = h_val
 
     for mat in bpy.data.materials:
         if not mat.library:
-            try: mat["hash_dirty"] = False # Reset dirty flag
+            try: mat["hash_dirty"] = False
             except Exception: pass
-    print(f"[DEBUG delayed_load_post] Loaded {len(material_names)} names, {len(material_hashes)} hashes.")
+    print(f"[DEBUG delayed_load_post] Loaded {len(material_names)} names, {len(material_hashes)} hashes for this file.")
 
     print("[Delayed Load] Managing preview icon cache...")
     if custom_icons is None:
@@ -2181,15 +2228,14 @@ def delayed_load_post(): # Unchanged in core logic, but benefits from other fixe
             if custom_icons is not None:
                 print(f"[Delayed Load] New preview collection created: {custom_icons}")
                 if 'preload_existing_thumbnails' in globals() and callable(preload_existing_thumbnails):
-                    preload_existing_thumbnails() # Preload into the new collection
+                    preload_existing_thumbnails()
             else: print("[Delayed Load] CRITICAL ERROR: bpy.utils.previews.new() returned None!")
         except Exception as e_new_delayed: print(f"[Delayed Load] CRITICAL Error creating preview collection: {e_new_delayed}"); traceback.print_exc()
-    else: # custom_icons already exists
+    else:
         print(f"[Delayed Load] custom_icons already exists ({custom_icons}). Calling preload to update.")
         if 'preload_existing_thumbnails' in globals() and callable(preload_existing_thumbnails):
-            preload_existing_thumbnails() # Safe to call, skips already loaded
+            preload_existing_thumbnails()
 
-    # --- Link Library Materials & Correct Names Post-Link ---
     if os.path.exists(LIBRARY_FILE):
         print("[DEBUG] delayed_load_post: Linking library materials...")
         try:
@@ -2250,27 +2296,21 @@ def delayed_load_post(): # Unchanged in core logic, but benefits from other fixe
                             print(f"[DEBUG PostLink] Error setting UUID prop for linked '{mat.name}': {e_set_uuid}")
                     elif current_uuid_prop != base_uuid_from_datablock_name:
                         if len(current_uuid_prop) == 36 and current_uuid_prop != base_uuid_from_datablock_name:
-                             print(f"[DEBUG PostLink] Warning: Linked mat '{mat.name}' has UUID prop '{current_uuid_prop}' "
-                                   f"which differs from its datablock base name '{base_uuid_from_datablock_name}'. "
-                                   f"Check consistency of material_library.blend.")
+                                print(f"[DEBUG PostLink] Warning: Linked mat '{mat.name}' has UUID prop '{current_uuid_prop}' "
+                                      f"which differs from its datablock base name '{base_uuid_from_datablock_name}'. "
+                                      f"Check consistency of material_library.blend.")
                         pass
         except Exception as e: print(f"[DEBUG] delayed_load_post: Error linking library materials: {e}"); traceback.print_exc()
     else: print(f"[DEBUG] delayed_load_post: Library file not found at {LIBRARY_FILE}.")
 
-    # Initialize material properties (UUIDs, datablock names for local non-"mat_" materials)
-    # This is crucial after initial file load and potential linking of library materials.
-    # This is already being called per your logs for "New File" scenario.
     if 'initialize_material_properties' in globals() and callable(initialize_material_properties):
         print("[DEBUG delayed_load_post] Calling initialize_material_properties.")
         initialize_material_properties()
     else:
         print("[DEBUG delayed_load_post] ERROR: initialize_material_properties function not found!")
 
-    # --- Key section for UI refresh and thumbnail initiation on ANY file load ---
     if 'populate_material_list' in globals() and callable(populate_material_list):
         print(f"[DEBUG delayed_load_post] Calling populate_material_list for scene '{scene.name}' on file load.")
-        # The `called_from_finalize_run` flag will be False by default here,
-        # so populate_material_list will call update_material_thumbnails.
         populate_material_list(scene)
     else:
         print("[DEBUG delayed_load_post] ERROR: populate_material_list function not found!")
@@ -2278,10 +2318,9 @@ def delayed_load_post(): # Unchanged in core logic, but benefits from other fixe
     if 'force_redraw' in globals() and callable(force_redraw):
         print("[DEBUG delayed_load_post] Forcing redraw after populate_material_list.")
         force_redraw()
-    # --- End key section ---
 
     print("[DEBUG] delayed_load_post (v3 - Stable custom_icons): End")
-    return None # Timer will stop
+    return None
 
 def get_first_scene(): # Unchanged
     scenes = getattr(bpy.data, "scenes", [])
@@ -6191,40 +6230,29 @@ def unregister():
             print(f"  Worker {worker_idx + 1}: Process object has no poll method, skipping.")
             continue
 
-        # Check if process is still running
         poll_result = process.poll()
         if poll_result is not None:
             print(f"  Worker {worker_idx + 1}: Process already terminated with exit code {poll_result}.")
             continue
-
-        # Process is still running, attempt to kill directly.
+            
+        # --- MODIFICATION START ---
+        # Per user request: bypass graceful terminate, wait briefly, then kill.
         try:
             pid = getattr(process, 'pid', 'Unknown')
-            print(f"  Worker {worker_idx + 1}: Attempting to instantly kill running process (PID: {pid})...")
+            print(f"  Worker {worker_idx + 1}: Delaying 0.1s before killing process (PID: {pid})...")
+            time.sleep(0.1) 
             process.kill()
             print(f"  Worker {worker_idx + 1}: Kill signal sent for PID: {pid}.")
-            # Optionally, a very brief wait can be added if immediate confirmation is needed,
-            # but the request was for an instant kill.
-            # For example, a non-blocking poll to log the outcome:
             final_exit_code = process.poll()
             if final_exit_code is not None:
                 print(f"  Worker {worker_idx + 1}: Process (PID: {pid}) confirmed killed with exit code {final_exit_code} shortly after signal.")
             else:
                 print(f"  Worker {worker_idx + 1}: Process (PID: {pid}) status after instant kill signal is still running or unknown. OS will handle cleanup.")
-                # You might still want to try a very short wait if the OS takes a moment.
-                # try:
-                #     process.wait(timeout=0.05) # Extremely short, non-blocking wait
-                # except subprocess.TimeoutExpired:
-                #     pass # It's fine if it doesn't exit this quickly
-                # final_exit_code_after_brief_wait = process.poll()
-                # if final_exit_code_after_brief_wait is not None:
-                #     print(f"  Worker {worker_idx + 1}: Process (PID: {pid}) confirmed killed with exit code {final_exit_code_after_brief_wait} after brief wait.")
-
-
         except AttributeError as e_attr:
             print(f"  Worker {worker_idx + 1}: Process object missing expected attributes for kill: {e_attr}")
         except Exception as e_kill_general:
             print(f"  Worker {worker_idx + 1}: Unexpected error during kill attempt: {e_kill_general}")
+        # --- MODIFICATION END ---
 
     thumbnail_worker_pool.clear()
     print(f"[Unregister] Worker pool cleared. Processing task queue...")
@@ -6318,7 +6346,6 @@ def unregister():
     material_list_cache.clear()
     _display_name_cache.clear()
     thumbnail_generation_scheduled.clear()
-    # Clear new batch globals
     g_tasks_for_current_run.clear()
     g_current_run_task_hashes_being_processed.clear()
 
