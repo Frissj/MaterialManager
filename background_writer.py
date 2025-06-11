@@ -550,7 +550,7 @@ def create_sphere_preview_thumbnail_bg_worker(mat_to_render, output_thumb_path, 
                                     except Exception as e_cs:
                                         print(f"    [Thumb BG Worker] Error setting colorspace for '{current_link_node.image.name}' to Non-Color: {e_cs}. Mat: {temp_mat_copy.name}", file=sys.stderr)
                                 break # Found and processed the TexImage node
-                            if not hasattr(current_link_node, 'inputs') or not current_link_node.inputs[0].is_linked: # Simplistic trace back via first input
+                            if not hasattr(current_link_node, 'inputs') or not current_link_node.inputs or not current_link_node.inputs[0].is_linked:
                                 break
                             current_link_node = current_link_node.inputs[0].links[0].from_node
                         # else: print(f"    [Thumb BG Worker] No direct ShaderNodeTexImage found for '{input_name}' after tracing back.")
