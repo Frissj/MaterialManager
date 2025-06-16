@@ -471,6 +471,65 @@ def load_icon_template_scene_bg_worker():
         persistent_icon_template_scene_worker = None
         return None
 
+def main_repack_material(args):
+    """
+    Worker operation to open a .blend file, find specific materials,
+    and pack all of their external image textures.
+    """
+    print(f"[BG Worker - Repack Op] START. Processing: {bpy.data.filepath}", file=sys.stderr)
+    
+    if not args.material_uuids:
+        print("[BG Worker - Repack Op] ERROR: --material-uuids argument is required.", file=sys.stderr)
+        return 1
+        
+    try:
+        uuids_to_fix = json.loads(args.material_uuids)
+    except json.JSONDecodeError:
+        print("[BG Worker - Repack Op] ERROR: Invalid JSON in --material-uuids.", file=sys.stderr)
+        return 1
+
+    print(f"  Will attempt to repack textures for {len(uuids_to_fix)} materials.", file=sys.stderr)
+    any_changes_made = False
+
+    for mat_uuid in uuids_to_fix:
+        # In library files, the datablock name IS the UUID.
+        mat = bpy.data.materials.get(mat_uuid)
+        if not mat:
+            print(f"  WARNING: Material with UUID '{mat_uuid}' not found in this file.", file=sys.stderr)
+            continue
+
+        if not mat.use_nodes or not mat.node_tree:
+            continue
+            
+        print(f"  Processing material: '{mat.name}'")
+        for node in mat.node_tree.nodes:
+            if node.type == 'TEX_IMAGE' and node.image:
+                img = node.image
+                # We only need to pack images that are external files
+                if img.packed_file is None and img.source == 'FILE':
+                    try:
+                        # This simple call will find the file (if possible) and embed it.
+                        img.pack()
+                        print(f"    [SUCCESS] Packed texture: '{img.name}'")
+                        any_changes_made = True
+                    except RuntimeError as e:
+                        # This happens if the file can't be found on disk from this context.
+                        print(f"    [FAILURE] Could not pack texture '{img.name}': {e}", file=sys.stderr)
+
+    if any_changes_made:
+        print("  Changes were made, saving file...", file=sys.stderr)
+        try:
+            bpy.ops.wm.save_mainfile()
+            print("  File saved successfully.", file=sys.stderr)
+        except Exception as e_save:
+            print(f"  CRITICAL ERROR saving file: {e_save}", file=sys.stderr)
+            return 1
+    else:
+        print("  No textures were packed. No changes to save.", file=sys.stderr)
+        
+    print("[BG Worker - Repack Op] FINISHED.", file=sys.stderr)
+    return 0
+
 def create_sphere_preview_thumbnail_bg_worker(mat_to_render, output_thumb_path, render_scene_for_item):
     if not render_scene_for_item:
         print(f"[BG Worker - ItemRender] Error for '{getattr(mat_to_render, 'name', 'N/A')}': No render_scene provided.", file=sys.stderr)
@@ -1465,10 +1524,9 @@ def main_worker_entry():
     print(f"[BG Worker - Entry] Current .blend file context (loaded by -b): {bpy.data.filepath if bpy.data.filepath else 'Unsaved/None'}", file=sys.stderr)
     sys.stderr.flush()
 
-    parser = argparse.ArgumentParser(description="Background worker for MaterialList Addon.")
+    parser = argparse.ArgumentParser(...)
     parser.add_argument("--operation", 
-                        choices=['merge_library', 'render_thumbnail', 
-                                 'pack_to_external', 'pack_to_internal'], # Added new choices
+                        choices=['merge_library', 'render_thumbnail', 'pack_to_external', 'pack_to_internal', 'repack_material'], # ADD 'repack_material'
                         required=True,
                         help="The operation to perform.")
 
@@ -1488,7 +1546,8 @@ def main_worker_entry():
     # parser.add_argument("--target-blend-file", help="Path to the .blend file to be processed (for packing ops).") # Redundant if -b is used
     parser.add_argument("--library-file", help="Path to the central material_library.blend (for identifying lib materials).")
     parser.add_argument("--external-dir-name", help="Directory name for unpacking external textures (for pack_to_external).")
-    
+    parser.add_argument("--material-uuids", help="JSON string of a list of material UUIDs to process.")
+
     try:
         # Get arguments after '--'
         app_args = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else sys.argv[1:]
@@ -1524,6 +1583,10 @@ def main_worker_entry():
             # Note: target_blend_file is assumed to be loaded by Blender via `-b`
             parser.error("--library-file is required for 'pack_to_internal'.")
         return main_process_pack_internal(args)
+    elif args.operation == 'repack_material':
+        if not args.material_uuids:
+            parser.error("--material-uuids is required for 'repack_material' operation.")
+        return main_repack_material(args)
     else:
         # This case should ideally not be reached due to 'choices' in parser
         print(f"[BG Worker - Entry] Unknown operation specified: {args.operation}", file=sys.stderr)
