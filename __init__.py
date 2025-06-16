@@ -88,6 +88,9 @@ _ICON_TEMPLATE_VALIDATED = False
 _LEGACY_THUMBNAIL_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+_([a-f0-9]{32})\.png$", re.IGNORECASE) # ADD THIS LINE
 g_thumbnails_loaded_in_current_UMT_run = False # Add this new global
 g_matlist_transient_tasks_for_post_save = []
+g_uuid_to_mat_map = {}
+g_dirty_materials_set = set()
+g_material_timestamps = {}
 
 THUMBNAIL_SIZE = 128
 VISIBLE_ITEMS = 30
@@ -493,7 +496,7 @@ def find_principled_bsdf(mat):
         return next((n for n in mat.node_tree.nodes if n.bl_idname == 'ShaderNodeBsdfPrincipled'), None)
 
 # get_material_hash (Structure from __init__.py, using updated helpers)
-def get_material_hash(mat, force=True, image_hash_cache=None): # Added image_hash_cache parameter
+def get_material_hash(mat, force=True, image_hash_cache=None):
     HASH_VERSION = "v_RTX_REMIX_PBR_COMPREHENSIVE_2_CONTENT_ONLY" 
 
     if not mat: 
@@ -508,10 +511,17 @@ def get_material_hash(mat, force=True, image_hash_cache=None): # Added image_has
         if mat_uuid in global_hash_cache:
             return global_hash_cache[mat_uuid]
 
+    # --- TIMING AND DEBUG START ---
+    start_recalc_time = time.time()
+    print(f"[DEBUG Hash] Cache MISS. Recalculating hash for '{mat_name_for_debug}' (Force: {force})")
+    # --- END TIMING AND DEBUG ---
+
     hash_inputs = []
     pbr_image_hashes = set() 
-
+    
     try:
+        # (The entire try...except block for hashing logic remains unchanged)
+        # ...
         principled_node = None
         material_output_node = None
 
@@ -649,6 +659,11 @@ def get_material_hash(mat, force=True, image_hash_cache=None): # Added image_has
         
         final_hash_string = f"VERSION:{HASH_VERSION}|||" + "|||".join(sorted(hash_inputs))
         digest = hashlib.md5(final_hash_string.encode('utf-8')).hexdigest()
+
+        # --- TIMING END ---
+        duration = time.time() - start_recalc_time
+        print(f"[DEBUG Hash] Recalculation finished. Took {duration:.4f} seconds.")
+        # --- END TIMING ---
 
         if mat_uuid:
             global_hash_cache[mat_uuid] = digest 
@@ -1196,11 +1211,8 @@ def _perform_library_update(force: bool = False):
 
     print(f"[DEBUG LibUpdate MainAddon] Effective force for this run: {effective_force}")
 
-    # --- MODIFICATION START ---
-    # The function was missing the required 'blend_filepath' argument here.
     # For updating the library, we need to compare against the hashes OF the library file.
     load_material_hashes(LIBRARY_FILE)
-    # --- MODIFICATION END ---
 
     existing_names_in_lib_file = set()
 
@@ -1256,16 +1268,20 @@ def _perform_library_update(force: bool = False):
             if effective_force:
                 should_transfer = True
                 reason_for_transfer.append("ForcedUpdate")
+                update_material_timestamp(uid) # <<< MODIFICATION: Update timestamp on force
             else:
                 if not uid_is_in_library_file:
                     should_transfer = True
                     reason_for_transfer.append("NewUUIDToLibrary")
+                    update_material_timestamp(uid) # This was already correct
                 elif db_hash_for_this_uid is None:
                     should_transfer = True
                     reason_for_transfer.append("UUIDInLibFileButNotInDBHashCache")
+                    update_material_timestamp(uid) # <<< MODIFICATION: Update timestamp for newly recognized material
                 elif current_content_hash != db_hash_for_this_uid:
                     should_transfer = True
                     reason_for_transfer.append("ContentChangedForExistingUUID")
+                    update_material_timestamp(uid) # <<< MODIFICATION: Update timestamp for modified material
 
             if should_transfer:
                 if mat.name != uid:
@@ -1498,15 +1514,25 @@ def run_localisation_worker(blend_path: str | None = None, wait: bool = False) -
     return subprocess.run(cmd) if wait else subprocess.Popen(cmd)
 
 # --- NEW Helper Function: Update Timestamp --- (Unchanged)
-def update_material_timestamp(material_uuid: str): # Unchanged
+def update_material_timestamp(material_uuid: str):
+    global g_material_timestamps
     if not material_uuid: return
     current_time = int(time.time())
+    
+    # --- FIX START ---
+    # Update the in-memory cache instantly. This is the new source of truth for live UI sorting.
+    g_material_timestamps[material_uuid] = current_time
+    # --- FIX END ---
+    
+    # Write to the database for persistence across sessions.
     try:
         with get_db_connection() as conn:
-            c = conn.cursor(); c.execute("CREATE TABLE IF NOT EXISTS mat_time (uuid TEXT PRIMARY KEY, ts INTEGER)")
+            c = conn.cursor()
+            c.execute("CREATE TABLE IF NOT EXISTS mat_time (uuid TEXT PRIMARY KEY, ts INTEGER)")
             c.execute("INSERT OR REPLACE INTO mat_time (uuid, ts) VALUES (?, ?)", (material_uuid, current_time))
             conn.commit()
-    except Exception as e: print(f"[Timestamp] Error for UUID {material_uuid}: {e}")
+    except Exception as e:
+        print(f"[Timestamp] Error writing to DB for UUID {material_uuid}: {e}")
 
 # -------------------------------------------------
 # Operator – run localisation worker (Unchanged)
@@ -1610,180 +1636,156 @@ def _parse_material_suffix(name: str) -> tuple[str, int]:
     else:
         return base_name, int(suffix_str)
 
+def update_material_list_view(self, context):
+    """
+    This is the new high-speed filtering and display engine for the UI list.
+    It reads from a hidden, complete data store (`material_list_full_items`),
+    applies all active filters (search, toggles) in Python, and then
+    populates the small, visible list (`material_list_view_items`) that the UI displays.
+    This process is extremely fast.
+    """
+    scene = context.scene
+    
+    full_list = scene.material_list_full_items
+    view_list = scene.material_list_view_items
+    
+    # Preserve the active selection if possible
+    active_uuid = ""
+    if scene.material_list_active_index >= 0 and scene.material_list_active_index < len(view_list):
+        active_uuid = view_list[scene.material_list_active_index].material_uuid
+        
+    view_list.clear()
+
+    # Get all filter states
+    search_term = scene.material_search.lower()
+    hide_mat = scene.hide_mat_materials
+    show_local_only = scene.material_list_show_only_local
+    
+    # Pre-calculate used materials only if the filter is active
+    used_uuids = set()
+    if show_local_only:
+        used_uuids = {get_material_uuid(slot.material) for obj in context.scene.objects for slot in obj.material_slots if slot.material}
+
+    # This loop is fast because it's just reading properties, not creating them.
+    for item_from_full_list in full_list:
+        # --- Apply all filters ---
+        if hide_mat and item_from_full_list.material_name.startswith("mat_"):
+            continue
+        if show_local_only and item_from_full_list.is_library and item_from_full_list.material_uuid not in used_uuids:
+            continue
+        if search_term and search_term not in item_from_full_list.material_name.lower():
+            continue
+            
+        # --- If item passes all filters, add it to the visible list ---
+        new_view_item = view_list.add()
+        # Copy all properties from the full item to the view item
+        new_view_item.material_name = item_from_full_list.material_name
+        new_view_item.material_uuid = item_from_full_list.material_uuid
+        new_view_item.is_library = item_from_full_list.is_library
+        new_view_item.original_name = item_from_full_list.original_name
+        new_view_item.is_protected = item_from_full_list.is_protected
+
+    # Restore selection
+    if active_uuid:
+        for i, item in enumerate(view_list):
+            if item.material_uuid == active_uuid:
+                scene.material_list_active_index = i
+                break
+
 # --------------------------
 # MATERIAL LIST ITEM CLASS
-def populate_material_list(scene, *, called_from_finalize_run=False): # called_from_finalize_run is now mostly for context/logging
+def populate_material_list(scene, context):
     """
-    Rebuilds the material list items.
-    If scene.hide_mat_materials is True, materials with display name starting "mat_" are excluded.
-    If scene.hide_mat_materials is False, only the "mat_" material with the lowest suffix is shown.
-    Sorts and applies "Show Only Local/Used".
-    Triggers a thumbnail update check after populating. <-- This behavior is REMOVED.
+    COMPLETE VERSION for the 'Smarter Fix'.
+    This function's ONLY job is to populate the hidden, complete data store (`material_list_full_items`).
+    This is the slow operation that now only runs once when a full refresh is needed (like changing sort order or on file load).
+    After it's done, it triggers the fast view update.
     """
-    if not scene:
-        print("[Populate List] Error: Scene object is None.")
-        return
+    global g_material_timestamps # --- FIX: Use the global in-memory cache ---
+    print(f"[DEBUG Populate] Populating FULL data store...")
+    start_time = time.time()
 
-    sort_mode = "Alphabetical" if scene.material_list_sort_alpha else "Recency"
-    filter_local_used_active = scene.material_list_show_only_local
+    # --- Data Gathering and Sorting Logic (Complete) ---
+    global g_uuid_to_mat_map
+    g_uuid_to_mat_map = {get_material_uuid(mat): mat for mat in bpy.data.materials if mat}
+    
     hide_mat_prefix_materials = scene.hide_mat_materials
 
-    log_message = (
-        f"[Populate List] Starting (Sort: {sort_mode}, "
-        f"Filter Local/Used: {filter_local_used_active}, "
-        f"Hide 'mat_' Materials: {hide_mat_prefix_materials}"
-    )
-    if not hide_mat_prefix_materials:
-        log_message += " - Showing lowest suffix for 'mat_' materials."
-    # Add called_from context if needed for debugging:
-    # log_message += f", Called from finalize: {called_from_finalize_run}"
-    print(log_message + ")...")
-
-    try:
-        if hasattr(scene, "material_list_items"):
-            scene.material_list_items.clear()
-        else:
-            print("[Populate List] Error: Scene missing 'material_list_items'. Cannot populate.")
-            return
-
-        current_material_collection = bpy.data.materials
-        # print(f"[Populate List] Initial scan of {len(current_material_collection)} materials...")
-
-        all_mats_data = [] 
-        for mat_idx, mat in enumerate(current_material_collection):
-            if not mat or not hasattr(mat, 'name'):
-                continue
-            try:
-                display_name = mat_get_display_name(mat) 
-                mat_uuid = get_material_uuid(mat) 
-                if not mat_uuid: 
-                    print(f"[Populate List] Warning: Could not get UUID for material '{mat.name}'. Skipping.")
-                    continue
-
-                content_hash = get_material_hash(mat, force=False)
-                if not content_hash:
-                    print(f"[Populate List] Warning: Could not get content hash for '{mat.name}' (UUID: {mat_uuid}).")
-                
-                all_mats_data.append({
-                    'mat_obj': mat, 
-                    'display_name': display_name,
-                    'uuid': mat_uuid,
-                    'is_library': bool(mat.library),
-                    'is_protected': mat.get('is_protected', False),
-                    'original_name': mat.get("orig_name", display_name), 
-                    'content_hash': content_hash
-                })
-            except ReferenceError:
-                # print(f"[Populate List] ReferenceError for a material during initial scan. Skipping.")
-                continue
-            except Exception as e_proc_scan:
-                print(f"[Populate List] Error processing '{getattr(mat, 'name', 'N/A')}' during initial scan: {e_proc_scan}")
-
-        material_info_map = {} 
-        mat_prefix_candidates = {} 
-
-        # print(f"[Populate List] Processing {len(all_mats_data)} collected material data items for UI list...")
-        for item_info_dict in all_mats_data:
-            mat_uuid_for_map = item_info_dict['uuid']
-            display_name_for_map = item_info_dict['display_name']
-
-            if display_name_for_map.startswith("mat_"):
-                if hide_mat_prefix_materials:
-                    continue 
-                else: 
-                    base_name, suffix_num = _parse_material_suffix(display_name_for_map)
-                    item_info_dict['suffix_num'] = suffix_num 
-                    existing_candidate = mat_prefix_candidates.get(base_name)
-                    if not existing_candidate or suffix_num < existing_candidate['suffix_num']:
-                        mat_prefix_candidates[base_name] = item_info_dict
-            else: 
-                existing_entry = material_info_map.get(mat_uuid_for_map)
-                if existing_entry: 
-                    if not item_info_dict['is_library'] and existing_entry['is_library']:
-                        material_info_map[mat_uuid_for_map] = item_info_dict
-                else: 
-                    material_info_map[mat_uuid_for_map] = item_info_dict
-
-        if not hide_mat_prefix_materials:
-            for base_name, chosen_mat_info in mat_prefix_candidates.items():
-                chosen_uuid = chosen_mat_info['uuid']
-                existing_entry_in_map = material_info_map.get(chosen_uuid)
-                if existing_entry_in_map: 
-                    if not chosen_mat_info['is_library'] and existing_entry_in_map['is_library']:
-                        material_info_map[chosen_uuid] = chosen_mat_info 
-                else: 
-                    material_info_map[chosen_uuid] = chosen_mat_info
-
-        items_to_process_for_ui = list(material_info_map.values())
-
-        if filter_local_used_active:
-            used_material_uuids_in_scene = set()
-            for obj in bpy.data.objects: 
-                if hasattr(obj, 'material_slots'):
-                    for slot in obj.material_slots:
-                        if slot.material:
-                            slot_mat_uuid = get_material_uuid(slot.material)
-                            if slot_mat_uuid:
-                                used_material_uuids_in_scene.add(slot_mat_uuid)
-            
-            items_to_process_for_ui = [
-                info_item for info_item in items_to_process_for_ui
-                if not info_item['is_library'] or \
-                   (info_item['is_library'] and info_item['uuid'] in used_material_uuids_in_scene)
-            ]
-
-        material_timestamps = {}
-        if not scene.material_list_sort_alpha: 
-            try:
-                with get_db_connection() as conn:
-                    c = conn.cursor()
-                    # Ensure mat_time table exists (it should be created by initialize_database or update_material_timestamp)
-                    c.execute("CREATE TABLE IF NOT EXISTS mat_time (uuid TEXT PRIMARY KEY, ts INTEGER)")
-                    c.execute("SELECT uuid, ts FROM mat_time") 
-                    material_timestamps = {row[0]: row[1] for row in c.fetchall()}
-            except Exception as e_ts:
-                print(f"[Populate List] Error loading timestamps: {e_ts}")
-
-        for info in items_to_process_for_ui: 
-            info['timestamp'] = material_timestamps.get(info['uuid'], 0) 
-
+    all_mats_data = []
+    for mat in bpy.data.materials:
+        if not mat or not hasattr(mat, 'name'):
+            continue
         try:
-            sort_key_func = (lambda item: item['display_name'].lower()) if scene.material_list_sort_alpha \
-                else (lambda item: -item['timestamp']) 
-            sorted_list_for_ui = sorted(items_to_process_for_ui, key=sort_key_func)
-        except Exception as sort_error:
-            print(f"[Populate List] Error sorting list: {sort_error}. Proceeding with current order.")
-            sorted_list_for_ui = items_to_process_for_ui 
+            mat_uuid = get_material_uuid(mat)
+            if not mat_uuid: continue
 
-        items_added_to_ui_list_count = 0
-        for item_data_final in sorted_list_for_ui:
-            try:
-                list_item = scene.material_list_items.add()
-                list_item.material_name = item_data_final['display_name']
-                list_item.material_uuid = item_data_final['uuid']
-                list_item.is_library = item_data_final['is_library']
-                list_item.original_name = item_data_final['original_name']
-                list_item.is_protected = item_data_final['is_protected']
-                items_added_to_ui_list_count += 1
-            except Exception as add_error:
-                print(f"[Populate List UI] Error adding item for UUID {item_data_final.get('uuid','N/A')}: {add_error}")
+            all_mats_data.append({
+                'display_name': mat_get_display_name(mat),
+                'uuid': mat_uuid,
+                'is_library': bool(mat.library),
+                'is_protected': mat.get('is_protected', False),
+                'original_name': mat.get("orig_name", mat_get_display_name(mat)),
+            })
+        except ReferenceError:
+            continue
+        except Exception as e_proc_scan:
+            print(f"[Populate List] Error processing '{getattr(mat, 'name', 'N/A')}' during initial scan: {e_proc_scan}")
 
-        print(f"[Populate List] Material list populated with {items_added_to_ui_list_count} items.")
+    material_info_map = {}
+    mat_prefix_candidates = {}
 
-        if items_added_to_ui_list_count > 0:
-            if scene.material_list_active_index >= items_added_to_ui_list_count:
-                scene.material_list_active_index = items_added_to_ui_list_count - 1
-            elif scene.material_list_active_index < 0 : 
-                scene.material_list_active_index = 0
-        else: 
-            scene.material_list_active_index = -1 
-        
-        # THE CALL TO update_material_thumbnails() HAS BEEN REMOVED FROM THIS FUNCTION.
-        # It should be called explicitly by the calling context (e.g., save_post_handler or finalize_thumbnail_run) if needed.
+    for item_info_dict in all_mats_data:
+        mat_uuid_for_map = item_info_dict['uuid']
+        display_name_for_map = item_info_dict['display_name']
 
-    except Exception as e:
-        print(f"[Populate List] CRITICAL error during list population: {e}")
-        traceback.print_exc()
+        if display_name_for_map.startswith("mat_"):
+            if hide_mat_prefix_materials:
+                continue
+            else:
+                base_name, suffix_num = _parse_material_suffix(display_name_for_map)
+                item_info_dict['suffix_num'] = suffix_num
+                existing_candidate = mat_prefix_candidates.get(base_name)
+                if not existing_candidate or suffix_num < existing_candidate['suffix_num']:
+                    mat_prefix_candidates[base_name] = item_info_dict
+        else:
+            material_info_map[mat_uuid_for_map] = item_info_dict
+
+    if not hide_mat_prefix_materials:
+        for base_name, chosen_mat_info in mat_prefix_candidates.items():
+            material_info_map[chosen_mat_info['uuid']] = chosen_mat_info
+
+    items_to_process_for_ui = list(material_info_map.values())
+
+    # --- FIX START ---
+    # This section is now simplified. It no longer queries the database.
+    # It reads directly from the fast, always-current in-memory cache.
+    if not scene.material_list_sort_alpha:
+        for info in items_to_process_for_ui:
+            info['timestamp'] = g_material_timestamps.get(info['uuid'], 0)
+    # --- FIX END ---
+
+    # The sorting logic now uses the timestamp assigned from the in-memory cache.
+    sort_key_func = (lambda item: item['display_name'].lower()) if scene.material_list_sort_alpha else (lambda item: -item.get('timestamp', 0))
+    sorted_list_for_ui = sorted(items_to_process_for_ui, key=sort_key_func)
+
+    # --- UI Population Logic (Complete) ---
+    # This now populates the HIDDEN data store.
+    full_list_collection = scene.material_list_full_items
+    full_list_collection.clear()
+    
+    for item_data in sorted_list_for_ui:
+        item = full_list_collection.add()
+        item.material_name = item_data['display_name']
+        item.material_uuid = item_data['uuid']
+        item.is_library = item_data['is_library']
+        item.original_name = item_data['original_name']
+        item.is_protected = item_data['is_protected']
+
+    duration = time.time() - start_time
+    print(f"[DEBUG Populate] Finished populating FULL data store with {len(full_list_collection)} items. Took {duration:.4f}s.")
+    
+    # After the full list is ready, trigger an update of the small, visible list.
+    update_material_list_view(scene, context)
 
 def get_material_by_unique_id(unique_id): # Unchanged
     for mat in bpy.data.materials:
@@ -1828,7 +1830,7 @@ def initialize_db_connection_pool(): # MODIFIED
 # --------------------------
 @persistent
 def save_handler(dummy):
-    global materials_modified, material_names, material_hashes
+    global materials_modified, material_names, material_hashes, g_dirty_materials_set
     global g_matlist_transient_tasks_for_post_save
 
     if getattr(bpy.context.window_manager, 'matlist_save_handler_processed', False):
@@ -1838,32 +1840,23 @@ def save_handler(dummy):
     g_matlist_transient_tasks_for_post_save.clear()
 
     start_time_total = time.time()
-    print(f"\n[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] ----- Starting pre-save process ({len(bpy.data.materials)} materials total) -----")
+    print(f"\n[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] ----- Starting pre-save process (Robust Handler) -----")
     
-    # --- MODIFICATION: Get current file path early ---
     current_blend_file = bpy.data.filepath
     if not current_blend_file:
         print("[SAVE DB] File is not saved. Cannot process file-specific hashes or library updates.")
-        # We can still process UUIDs and names for the session, but can't save hashes to the new table.
-    # --- END MODIFICATION ---
+        return
 
     needs_metadata_update = False
     needs_name_db_save = False
-    timestamp_updated_for_recency = False
     actual_material_modifications_this_run = False 
 
-    if not material_names and bpy.data.filepath:
-        load_names_timer_start = time.time()
+    if not material_names:
         load_material_names()
-        print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] load_material_names() took {time.time() - load_names_timer_start:.4f}s.")
 
+    # --- Phase 1: UUID and Name Validation (remains the same) ---
     phase1_start_time = time.time()
-    mats_to_process_phase1 = list(bpy.data.materials)
-    uuid_assigned_in_phase1_count = 0
-    datablock_renamed_in_phase1_count = 0
-    db_name_entry_added_in_phase1_count = 0
-
-    for mat in mats_to_process_phase1:
+    for mat in list(bpy.data.materials):
         if not mat: continue
         original_datablock_name = mat.name
         old_uuid_prop = mat.get("uuid", "")
@@ -1871,13 +1864,12 @@ def save_handler(dummy):
         if old_uuid_prop != current_uuid_prop:
             needs_metadata_update = True
             actual_material_modifications_this_run = True
-            uuid_assigned_in_phase1_count +=1
+        
         current_display_name_for_processing = mat_get_display_name(mat)
         if not current_display_name_for_processing.startswith("mat_"):
             if current_uuid_prop:
                 if current_uuid_prop not in material_names:
                     material_names[current_uuid_prop] = original_datablock_name
-                    db_name_entry_added_in_phase1_count +=1
                     needs_name_db_save = True
                     needs_metadata_update = True
                     actual_material_modifications_this_run = True
@@ -1886,7 +1878,6 @@ def save_handler(dummy):
                         existing_mat_with_target_name = bpy.data.materials.get(current_uuid_prop)
                         if not existing_mat_with_target_name or existing_mat_with_target_name == mat:
                             mat.name = current_uuid_prop
-                            datablock_renamed_in_phase1_count +=1
                             needs_metadata_update = True
                             actual_material_modifications_this_run = True
                     except Exception as rename_err:
@@ -1895,127 +1886,92 @@ def save_handler(dummy):
             try:
                 if not mat.use_fake_user: mat.use_fake_user = True
             except Exception: pass
-            
-    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] Phase 1 (UUIDs/Names) took {time.time() - phase1_start_time:.4f}s. Assigned: {uuid_assigned_in_phase1_count} UUIDs, Renamed: {datablock_renamed_in_phase1_count} DBs, Added: {db_name_entry_added_in_phase1_count} NameEntries.")
+    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] Phase 1 (UUIDs/Names) took {time.time() - phase1_start_time:.4f}s.")
 
-    # --- MODIFICATION: Use new file-specific hash loading ---
-    load_hashes_start_time = time.time()
-    if current_blend_file:
-        load_material_hashes(current_blend_file)
-    else:
-        material_hashes.clear() # No file, no hashes to load
-    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] load_material_hashes() took {time.time() - load_hashes_start_time:.4f}s. ({len(material_hashes)} hashes loaded for this file).")
-    # --- END MODIFICATION ---
-
+    load_material_hashes(current_blend_file)
+    
+    # --- Phase 2: Hash Processing (Robust Version) ---
     phase2_start_time = time.time()
-    hashes_to_save_this_session = {} # Use a local dict for this specific save operation
+    hashes_to_save_this_session = {}
     deleted_old_thumb_count = 0
-    recalculated_hash_count = 0
-    mats_to_process_phase2 = list(bpy.data.materials)
+    timestamp_updated_for_recency = False
     _session_image_hash_cache = {} 
 
-    for mat in mats_to_process_phase2:
-        if not mat: continue
-        actual_uuid_for_hash_storage = mat.get("uuid")
-        if not actual_uuid_for_hash_storage:
+    # --- FIX START: Revert to the robust logic from your old code ---
+    # Instead of iterating over the fragile `g_dirty_materials_set`, we now iterate over ALL local materials.
+    # This guarantees new materials are always processed on the first save.
+    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] Robust check: Processing all {len(bpy.data.materials)} materials for hash updates.")
+    
+    for mat in bpy.data.materials:
+        if not mat or mat.library:
+            continue
+
+        mat_uuid = get_material_uuid(mat)
+        if not mat_uuid:
+            continue
+            
+        recalculated_hash = get_material_hash(mat, force=True, image_hash_cache=_session_image_hash_cache)
+        if not recalculated_hash:
             continue
         
-        db_stored_hash_for_this_uuid = material_hashes.get(actual_uuid_for_hash_storage)
-        current_hash_to_compare_with_db = db_stored_hash_for_this_uuid 
-        needs_recalc = False
-
-        if not mat.library:
-            is_dirty_from_prop = mat.get("hash_dirty", True)
-            if is_dirty_from_prop or db_stored_hash_for_this_uuid is None:
-                needs_recalc = True
-        elif db_stored_hash_for_this_uuid is None : 
-            needs_recalc = True
-
-        if needs_recalc:
-            recalculated_hash_count +=1
-            recalculated_hash = get_material_hash(mat, force=True, image_hash_cache=_session_image_hash_cache)
-            if not recalculated_hash:
-                if "hash_dirty" in mat and not mat.library: mat["hash_dirty"] = False
-                continue
-            current_hash_to_compare_with_db = recalculated_hash
+        db_stored_hash = material_hashes.get(mat_uuid)
         
-        if db_stored_hash_for_this_uuid != current_hash_to_compare_with_db:
+        # This condition now correctly identifies any new material (db_stored_hash is None)
+        # or any material whose content has changed.
+        if db_stored_hash != recalculated_hash:
             actual_material_modifications_this_run = True 
-            # --- MODIFICATION: Add to local dictionary for this session ---
-            hashes_to_save_this_session[actual_uuid_for_hash_storage] = current_hash_to_compare_with_db
-            # --- END MODIFICATION ---
-            update_material_timestamp(actual_uuid_for_hash_storage)
+            hashes_to_save_this_session[mat_uuid] = recalculated_hash
+            update_material_timestamp(mat_uuid) # This is the critical call for sorting
             timestamp_updated_for_recency = True
-            if db_stored_hash_for_this_uuid is not None:
-                if not mat.library:
-                    old_thumbnail_path = get_thumbnail_path(db_stored_hash_for_this_uuid)
-                    if os.path.isfile(old_thumbnail_path):
-                        try:
-                            os.remove(old_thumbnail_path)
-                            deleted_old_thumb_count += 1
-                        except Exception as e_del_thumb:
-                            print(f"[SAVE DB] Phase 2 Error deleting old thumbnail {old_thumbnail_path}: {e_del_thumb}")
 
-            blend_file_path_for_worker_task = None
-            if mat.library and mat.library.filepath:
-                blend_file_path_for_worker_task = bpy.path.abspath(mat.library.filepath)
-            elif not mat.library and bpy.data.filepath:
-                blend_file_path_for_worker_task = bpy.path.abspath(bpy.data.filepath)
+            if db_stored_hash is not None:
+                old_thumbnail_path = get_thumbnail_path(db_stored_hash)
+                if os.path.isfile(old_thumbnail_path):
+                    try:
+                        os.remove(old_thumbnail_path)
+                        deleted_old_thumb_count += 1
+                    except Exception as e_del_thumb:
+                        print(f"[SAVE DB] Phase 2 Error deleting old thumbnail {old_thumbnail_path}: {e_del_thumb}")
 
-            if blend_file_path_for_worker_task and os.path.exists(blend_file_path_for_worker_task) and actual_uuid_for_hash_storage:
-                thumb_path_for_task = get_thumbnail_path(current_hash_to_compare_with_db) if current_hash_to_compare_with_db else None
-                if thumb_path_for_task:
-                    task_detail_for_post = {
-                        'blend_file': blend_file_path_for_worker_task,
-                        'mat_uuid': actual_uuid_for_hash_storage,
-                        'thumb_path': thumb_path_for_task,
-                        'hash_value': current_hash_to_compare_with_db,
-                        'mat_name_debug': mat.name, 
-                        'retries': 0
-                    }
-                    g_matlist_transient_tasks_for_post_save.append(task_detail_for_post)
-        
-        if "hash_dirty" in mat and not mat.library:
-            try: mat["hash_dirty"] = False
-            except Exception: pass
+            # Queue thumbnail generation for the new hash
+            blend_file_path_for_worker_task = bpy.path.abspath(bpy.data.filepath)
+            thumb_path_for_task = get_thumbnail_path(recalculated_hash)
+            task_detail_for_post = {
+                'blend_file': blend_file_path_for_worker_task,
+                'mat_uuid': mat_uuid,
+                'thumb_path': thumb_path_for_task,
+                'hash_value': recalculated_hash,
+                'mat_name_debug': mat.name, 
+                'retries': 0
+            }
+            g_matlist_transient_tasks_for_post_save.append(task_detail_for_post)
+    # --- FIX END ---
+    
+    g_dirty_materials_set.clear() # The old set is still cleared for hygiene
 
-    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] Phase 2 (Hashes/Timestamps) took {time.time() - phase2_start_time:.4f}s. Recalculated: {recalculated_hash_count} hashes. Deleted: {deleted_old_thumb_count} old thumbs.")
-
-    db_write_start_time = time.time()
-    saved_names_this_run = False
-    saved_hashes_this_run = False
-
+    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] Phase 2 (Hashes/Timestamps) took {time.time() - phase2_start_time:.4f}s. Deleted: {deleted_old_thumb_count} old thumbs.")
+    
+    # --- Database Write Operations ---
     if needs_name_db_save:
         save_material_names()
-        saved_names_this_run = True
-        actual_material_modifications_this_run = True 
-
-    # --- MODIFICATION: Use new file-specific save function ---
-    if hashes_to_save_this_session and current_blend_file:
+    if hashes_to_save_this_session:
         save_material_hashes(current_blend_file, hashes_to_save_this_session)
-        material_hashes.update(hashes_to_save_this_session) # Also update the in-memory global cache
-        saved_hashes_this_run = True
+        material_hashes.update(hashes_to_save_this_session) # Update in-memory cache
         actual_material_modifications_this_run = True 
-    # --- END MODIFICATION ---
-        
-    if saved_names_this_run or saved_hashes_this_run:
-        print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] Database write operations took {time.time() - db_write_start_time:.4f}s. (Names saved: {saved_names_this_run}, Hashes saved: {saved_hashes_this_run})")
 
+    # --- Phase 3: Library Update Queueing ---
+    phase3_start_time = time.time()
+    hashes_actually_changed_in_db = bool(hashes_to_save_this_session)
+    if hashes_actually_changed_in_db or needs_metadata_update : 
+        update_material_library(force_update=True) 
+    elif timestamp_updated_for_recency: 
+        update_material_library(force_update=False)
+
+    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] Phase 3 (Lib Update Queue) took {time.time() - phase3_start_time:.4f}s.")
+    
     if actual_material_modifications_this_run:
         materials_modified = True
-
-    phase3_start_time = time.time()
-    library_update_queued_type = "None"
-    if current_blend_file: # Only queue library updates if the file is saved
-        hashes_actually_changed_in_db = bool(hashes_to_save_this_session) # Simplified check
-        if hashes_actually_changed_in_db or needs_metadata_update : 
-            update_material_library(force_update=True) 
-            library_update_queued_type = "Forced"
-        elif hashes_to_save_this_session or needs_name_db_save or timestamp_updated_for_recency: 
-            update_material_library(force_update=False)
-            library_update_queued_type = "Non-Forced"
-        
-    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] Phase 3 (Lib Update Queue) took {time.time() - phase3_start_time:.4f}s. Queued: {library_update_queued_type}")
+    
     print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] ----- Pre-save handler total time: {time.time() - start_time_total:.4f}s. -----")
 
 @persistent
@@ -2034,7 +1990,7 @@ def save_post_handler(dummy=None):
 
     if ui_list_needs_refresh_and_redraw and scene:
         if callable(populate_material_list):
-            populate_material_list(scene)
+            populate_material_list(scene, bpy.context)
         if callable(force_redraw):
             force_redraw()
 
@@ -2161,6 +2117,9 @@ def load_post_handler(dummy):
 
     # --- Clear Caches that should be file-specific (as before) ---
     global _display_name_cache, global_hash_cache, material_list_cache, material_names, material_hashes, list_version, _display_name_cache_version
+    # --- ADD THE NEW GLOBAL TO THE LIST ---
+    global g_uuid_to_mat_map
+    
     # print("[DEBUG LoadPost] Clearing file-specific caches: _display_name_cache, global_hash_cache, material_list_cache, material_names, material_hashes")
     _display_name_cache.clear()
     _display_name_cache_version = 0
@@ -2168,11 +2127,15 @@ def load_post_handler(dummy):
     material_list_cache.clear() 
     material_names.clear()
     material_hashes.clear()
+    
+    # --- ADD THIS LINE TO CLEAR THE MAP ---
+    g_uuid_to_mat_map.clear()
+
     list_version = 0 # Reset UI list version as well
 
 
     if not bpy.app.timers.is_registered(delayed_load_post):
-        bpy.app.timers.register(delayed_load_post, first_interval=0.3) 
+        bpy.app.timers.register(delayed_load_post, first_interval=0.3)
 
 def file_changed_handler(scene): # Unchanged
     try:
@@ -2192,11 +2155,11 @@ def file_changed_handler(scene): # Unchanged
 
 @persistent
 def delayed_load_post():
-    global custom_icons, material_names, material_hashes, global_hash_cache
+    global custom_icons, material_names, material_hashes, global_hash_cache, g_material_timestamps
     print("[DEBUG] delayed_load_post (v3 - Stable custom_icons): Start")
-    scene = get_first_scene();
+    scene = get_first_scene()
     if not scene:
-        print("[DEBUG] delayed_load_post: No scene found, aborting.");
+        print("[DEBUG] delayed_load_post: No scene found, aborting.")
         return None
 
     print("[DEBUG delayed_load_post] Loading names and hashes for current file...")
@@ -2209,6 +2172,26 @@ def delayed_load_post():
         # Clear hashes if the file is unsaved and we are starting fresh
         material_hashes.clear()
     # --- END MODIFICATION ---
+
+    # --- FIX START ---
+    # Populate the in-memory timestamp cache from the database on file load.
+    print("[Delayed Load] Populating in-memory timestamp cache from DB...")
+    try:
+        with get_db_connection() as conn:
+            c = conn.cursor()
+            # Check if the table exists before querying
+            c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='mat_time'")
+            if c.fetchone():
+                c.execute("SELECT uuid, ts FROM mat_time")
+                g_material_timestamps = {row[0]: row[1] for row in c.fetchall()}
+                print(f"[Delayed Load] Loaded {len(g_material_timestamps)} timestamps into memory cache.")
+            else:
+                g_material_timestamps = {} # Ensure it's a dict if table doesn't exist
+                print("[Delayed Load] 'mat_time' table not found in DB. Timestamp cache is empty.")
+    except Exception as e_ts_load:
+        print(f"[Delayed Load] CRITICAL Error loading timestamps into memory cache: {e_ts_load}")
+        g_material_timestamps = {} # Ensure it's a dict on failure
+    # --- FIX END ---
 
     with hash_lock:
         global_hash_cache.clear()
@@ -2311,7 +2294,7 @@ def delayed_load_post():
 
     if 'populate_material_list' in globals() and callable(populate_material_list):
         print(f"[DEBUG delayed_load_post] Calling populate_material_list for scene '{scene.name}' on file load.")
-        populate_material_list(scene)
+        populate_material_list(scene, bpy.context)
     else:
         print("[DEBUG delayed_load_post] ERROR: populate_material_list function not found!")
 
@@ -2352,11 +2335,11 @@ class MATERIALLIST_OT_rename_material(Operator):
         scene = context.scene
         idx = scene.material_list_active_index
 
-        if not (0 <= idx < len(scene.material_list_items)):
+        if not (0 <= idx < len(scene.material_list_view_items)):
             self.report({'WARNING'}, "No material selected or index out of bounds.")
             return {'CANCELLED'}
 
-        selected_list_item = scene.material_list_items[idx]
+        selected_list_item = scene.material_list_view_items[idx]
         primary_material_uuid = selected_list_item.material_uuid # UUID of the material user wants to rename
         
         # Get the actual material object for the primary rename
@@ -2365,7 +2348,7 @@ class MATERIALLIST_OT_rename_material(Operator):
 
         if not primary_mat_obj:
             self.report({'WARNING'}, f"Material for UUID '{primary_material_uuid}' not found in Blender data. List may be outdated.")
-            populate_material_list(scene) # Refresh list if material is missing
+            populate_material_list(scene, context) # Refresh list if material is missing
             return {'CANCELLED'}
 
         new_display_name_str = self.new_name.strip()
@@ -2403,7 +2386,7 @@ class MATERIALLIST_OT_rename_material(Operator):
 
         # 4. Clear display name cache and refresh UI list to reflect all changes
         _display_name_cache.clear()
-        populate_material_list(scene) # This will rebuild the list items based on new names from material_names
+        populate_material_list(scene, context) # This will rebuild the list items based on new names from material_names
         
         # 5. Report results to the user
         report_message = f"Updated display name for selected material to '{new_display_name_str}'."
@@ -2411,7 +2394,7 @@ class MATERIALLIST_OT_rename_material(Operator):
         
         # Try to find the originally selected (primary) material in the newly populated list and select it
         new_idx_for_primary = -1
-        for i, current_list_item_iter in enumerate(scene.material_list_items):
+        for i, current_list_item_iter in enumerate(scene.material_list_view_items):
             if current_list_item_iter.material_uuid == primary_material_uuid:
                 new_idx_for_primary = i
                 break
@@ -2422,7 +2405,7 @@ class MATERIALLIST_OT_rename_material(Operator):
         else:
             # Fallback if the primary item (somehow) isn't found after refresh.
             print(f"[Rename DB] Warning: Could not find primary item with UUID {primary_material_uuid} after renaming and list refresh. List may have changed significantly.")
-            scene.material_list_active_index = 0 if len(scene.material_list_items) > 0 else -1
+            scene.material_list_active_index = 0 if len(scene.material_list_view_items) > 0 else -1
             
         return {'FINISHED'}
 
@@ -2431,8 +2414,8 @@ class MATERIALLIST_OT_rename_material(Operator):
         idx = scene.material_list_active_index
         self.new_name = "" # Default to empty for the dialog
 
-        if 0 <= idx < len(scene.material_list_items):
-            item = scene.material_list_items[idx]
+        if 0 <= idx < len(scene.material_list_view_items):
+            item = scene.material_list_view_items[idx]
             # It's better to get the material object and then its display name
             # to ensure we're pre-filling with the most current display name.
             mat_obj = get_material_by_uuid(item.material_uuid)
@@ -2455,19 +2438,19 @@ Textures use original file paths, not duplicated image files."""
     def poll(cls, context):
         scene = context.scene
         # Check if an item is selected in the list
-        return scene and hasattr(scene, 'material_list_items') and \
-               0 <= scene.material_list_active_index < len(scene.material_list_items)
+        return scene and hasattr(scene, 'material_list_view_items') and \
+               0 <= scene.material_list_active_index < len(scene.material_list_view_items)
 
     def execute(self, context):
         global material_names, _display_name_cache # Ensure global access
         scene = context.scene
         idx = scene.material_list_active_index
         
-        if not (0 <= idx < len(scene.material_list_items)):
+        if not (0 <= idx < len(scene.material_list_view_items)):
             self.report({'WARNING'}, "No material selected in the list.")
             return {'CANCELLED'}
             
-        selected_list_item = scene.material_list_items[idx]
+        selected_list_item = scene.material_list_view_items[idx]
         original_mat_uuid_in_list = selected_list_item.material_uuid
         
         # Get the actual material datablock from Blender's data
@@ -2475,7 +2458,7 @@ Textures use original file paths, not duplicated image files."""
 
         if not original_mat_datablock:
             self.report({'WARNING'}, f"Original material (UUID: {original_mat_uuid_in_list}) not found in current Blender data. List might be outdated.")
-            populate_material_list(scene) # Refresh list
+            populate_material_list(scene, context) # Refresh list
             return {'CANCELLED'}
 
         try:
@@ -2536,11 +2519,11 @@ Textures use original file paths, not duplicated image files."""
             new_mat.use_fake_user = True # Ensure the new local material is saved with the current .blend file
             update_material_timestamp(new_local_uuid) # For recency sort, so it appears at the top
 
-            populate_material_list(scene) # Refresh the UI list
+            populate_material_list(scene, context) # Refresh the UI list
 
             # Find and select the newly duplicated material in the list
             new_list_idx = -1
-            for i, item_in_list in enumerate(scene.material_list_items):
+            for i, item_in_list in enumerate(scene.material_list_view_items):
                 if item_in_list.material_uuid == new_local_uuid:
                     new_list_idx = i
                     break
@@ -2548,7 +2531,7 @@ Textures use original file paths, not duplicated image files."""
             if new_list_idx != -1:
                 scene.material_list_active_index = new_list_idx
             else: # Fallback if not found (should not happen if populate_material_list worked)
-                scene.material_list_active_index = 0 if scene.material_list_items else -1
+                scene.material_list_active_index = 0 if scene.material_list_view_items else -1
             
             self.report({'INFO'}, f"Duplicated '{original_display_name}' as local material '{new_display_name}'")
 
@@ -2708,7 +2691,7 @@ class MATERIALLIST_OT_scroll_to_top(Operator):
 
     def execute(self, context):
         scene = context.scene
-        if scene.material_list_items:
+        if scene.material_list_view_items:
             scene.material_list_active_index = 0
             # Force redraw to ensure UI updates, as active_index change might not always trigger list scroll immediately
             force_redraw() 
@@ -2812,6 +2795,160 @@ class MATERIALLIST_OT_backup_editing(Operator):
             print("[BACKUP EDITING OPERATOR END - FAIL] <<<<<<<<<<<<<<<<\n")
             return {'CANCELLED'}
 
+class MATERIALLIST_OT_verify_and_fix_textures(bpy.types.Operator):
+    """Checks all materials for broken texture links and attempts to fix them by repacking them in their source files."""
+    bl_idname = "materiallist.verify_and_fix_textures"
+    bl_label = "Verify & Repack All Textures"
+    bl_description = "Checks all materials for broken texture links and attempts to fix them by repacking them in their source files"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        return True
+
+    def get_source_blend_from_db(self, material_uuid):
+        """Queries the database to find the original source file for a given material UUID."""
+        if not material_uuid: return None
+        try:
+            with get_db_connection() as conn:
+                c = conn.cursor()
+                c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='library_material_origins'")
+                if c.fetchone() is None:
+                    return None
+                
+                c.execute("SELECT source_blend_filepath FROM library_material_origins WHERE library_material_uuid = ?", (material_uuid,))
+                result = c.fetchone()
+                if result and result[0]:
+                    return result[0]
+        except Exception as e:
+            print(f"[Verify Tex DB] Error querying source for UUID {material_uuid}: {e}", file=sys.stderr)
+        return None
+
+    def execute(self, context):
+        if not (DATABASE_FILE and os.path.exists(DATABASE_FILE)):
+            self.report({'ERROR'}, "Database file not found. Cannot perform operation.")
+            return {'CANCELLED'}
+        if not (BACKGROUND_WORKER_PY and os.path.exists(BACKGROUND_WORKER_PY)):
+            self.report({'ERROR'}, "Background worker script not found. Cannot perform operation.")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, "Starting texture verification (with debugging)...")
+        print("\n[Verify Tex] Starting detailed texture verification process...")
+        print("="*50)
+
+        broken_textures_map = {}
+        
+        for mat in bpy.data.materials:
+            if not mat.use_nodes or not mat.node_tree:
+                continue
+            
+            print(f"\n[Checking Material]: '{mat.name}'")
+            
+            for node in mat.node_tree.nodes:
+                if node.type == 'TEX_IMAGE' and node.image:
+                    img = node.image
+                    print(f"  - Found Image Node: '{node.name}' -> Image Datablock: '{img.name}' (Source: {img.source})")
+
+                    if img.source != 'FILE':
+                        print(f"    - Skipped: Image source is '{img.source}', not 'FILE'.")
+                        continue
+
+                    # --- DETAILED DEBUGGING LOGIC ---
+                    try:
+                        # Check 1: Is it packed?
+                        if img.packed_file is not None:
+                            print(f"    - Skipped: Image is packed.")
+                            continue
+
+                        # Check 2: Does it have a filepath property?
+                        if not img.filepath:
+                            print(f"    - Skipped: Image has no filepath value (it's empty).")
+                            continue
+
+                        # If we passed the checks, let's see the details.
+                        print(f"    - Raw filepath: '{img.filepath}'")
+                        if img.library and hasattr(img.library, 'filepath') and img.library.filepath:
+                            print(f"    - Source Library: '{img.library.filepath}'")
+                        else:
+                            print(f"    - Source Library: None (local to current file or library path missing)")
+
+                        # The critical resolution step
+                        abs_path = ""
+                        try:
+                            abs_path = bpy.path.abspath(img.filepath)
+                            print(f"    - Resolved absolute path: '{abs_path}'")
+                        except Exception as e_abspath:
+                            print(f"    - ERROR: bpy.path.abspath() failed: {e_abspath}")
+                            continue
+
+                        # The final existence check
+                        path_exists = os.path.exists(abs_path)
+                        print(f"    - os.path.exists() check result: {path_exists}")
+
+                        if not path_exists:
+                            # It's confirmed broken by our logic.
+                            print(f"    - >>> MARKED AS BROKEN <<<")
+                            mat_uuid = get_material_uuid(mat)
+                            if mat_uuid not in broken_textures_map:
+                                broken_textures_map[mat_uuid] = []
+                            if img.name not in broken_textures_map[mat_uuid]:
+                                broken_textures_map[mat_uuid].append(img.name)
+                        else:
+                            print(f"    - OK: Path exists.")
+
+                    except Exception as e:
+                        print(f"    - An unexpected error occurred while checking image '{img.name}': {e}")
+                        traceback.print_exc()
+                        continue
+
+        print("="*50)
+        print("[Verify Tex] Verification scan complete.")
+
+        if not broken_textures_map:
+            self.report({'INFO'}, "Verification complete. No broken texture paths found (see console for details).")
+            print("[Verify Tex] Final result: No paths were flagged as broken.")
+            return {'FINISHED'}
+
+        # --- FIXING LOGIC (UNCHANGED) ---
+        print(f"[Verify Tex] Final result: Found {len(broken_textures_map)} materials with broken textures. Preparing fix jobs...")
+        fix_jobs = {}
+        unfixable_mats = []
+
+        for mat_uuid, broken_img_names in broken_textures_map.items():
+            source_blend = self.get_source_blend_from_db(mat_uuid)
+            
+            if source_blend and os.path.exists(source_blend):
+                if source_blend not in fix_jobs:
+                    fix_jobs[source_blend] = []
+                fix_jobs[source_blend].append(mat_uuid)
+            else:
+                mat_obj = get_material_by_uuid(mat_uuid)
+                if mat_obj:
+                    unfixable_mats.append(mat_obj.name)
+
+        if unfixable_mats:
+            self.report({'WARNING'}, f"Cannot fix materials with unknown source: {', '.join(unfixable_mats)}")
+
+        if not fix_jobs:
+            self.report({'INFO'}, "Found broken textures, but could not determine their source file from the database.")
+            return {'CANCELLED'}
+
+        for source_blend, mat_uuids in fix_jobs.items():
+            print(f"  [DISPATCH] Job for '{os.path.basename(source_blend)}' with {len(mat_uuids)} materials.")
+            cmd = [
+                bpy.app.binary_path,
+                "--background",
+                source_blend,
+                "--python", BACKGROUND_WORKER_PY,
+                "--",
+                "--operation", "repack_material",
+                "--material-uuids", json.dumps(mat_uuids)
+            ]
+            subprocess.Popen(cmd)
+
+        self.report({'INFO'}, f"Dispatched {len(fix_jobs)} background jobs to repack materials. Reload file when complete.")
+        return {'FINISHED'}
+
 class MATERIALLIST_OT_add_material_to_slot(Operator):
     bl_idname = "materiallist.add_material_to_slot"
     bl_label = "Add Selected to Object"
@@ -2823,14 +2960,14 @@ class MATERIALLIST_OT_add_material_to_slot(Operator):
         active_obj = context.active_object
         scene = context.scene
         return (active_obj and active_obj.type == 'MESH' and
-                scene and hasattr(scene, 'material_list_items') and
-                0 <= scene.material_list_active_index < len(scene.material_list_items))
+                scene and hasattr(scene, 'material_list_view_items') and
+                0 <= scene.material_list_active_index < len(scene.material_list_view_items))
 
     def execute(self, context):
         scene = context.scene
         active_obj = context.active_object
         mesh_data = active_obj.data
-        selected_item = scene.material_list_items[scene.material_list_active_index]
+        selected_item = scene.material_list_view_items[scene.material_list_active_index]
         target_uuid = selected_item.material_uuid
         target_mat = get_material_by_uuid(target_uuid)
 
@@ -2871,14 +3008,14 @@ class MATERIALLIST_OT_add_material_to_slot(Operator):
 
         if action_taken:
             update_material_timestamp(target_uuid)
-            populate_material_list(scene)
+            populate_material_list(scene, context)
             new_idx = -1
-            for i, itm in enumerate(scene.material_list_items):
+            for i, itm in enumerate(scene.material_list_view_items):
                 if itm.material_uuid == target_uuid:
                     new_idx = i
                     break
             scene.material_list_active_index = (
-                new_idx if new_idx != -1 else 0 if scene.material_list_items else -1
+                new_idx if new_idx != -1 else 0 if scene.material_list_view_items else -1
             )
         return {"FINISHED"}
 
@@ -2893,18 +3030,18 @@ class MATERIALLIST_OT_assign_selected_material(Operator):
         active_obj = context.active_object
         scene = context.scene
         return (active_obj and active_obj.type == 'MESH' and
-                scene and hasattr(scene, 'material_list_items') and
-                0 <= scene.material_list_active_index < len(scene.material_list_items))
+                scene and hasattr(scene, 'material_list_view_items') and
+                0 <= scene.material_list_active_index < len(scene.material_list_view_items))
 
     def execute(self, context):
         scene = context.scene
         if not (
-            0 <= scene.material_list_active_index < len(scene.material_list_items)
+            0 <= scene.material_list_active_index < len(scene.material_list_view_items)
         ):
             self.report({"WARNING"}, "Invalid material selection.")
             return {"CANCELLED"}
 
-        target_item = scene.material_list_items[scene.material_list_active_index]
+        target_item = scene.material_list_view_items[scene.material_list_active_index]
         target_uuid = target_item.material_uuid
         target_mat = get_material_by_uuid(target_uuid)
 
@@ -2933,14 +3070,14 @@ class MATERIALLIST_OT_assign_selected_material(Operator):
 
         if result == {"FINISHED"} and assign_op_called:
             update_material_timestamp(target_uuid)
-            populate_material_list(scene)
+            populate_material_list(scene, context)
             new_idx = -1
-            for i, itm in enumerate(scene.material_list_items):
+            for i, itm in enumerate(scene.material_list_view_items):
                 if itm.material_uuid == target_uuid:
                     new_idx = i
                     break
             scene.material_list_active_index = (
-                new_idx if new_idx != -1 else 0 if scene.material_list_items else -1
+                new_idx if new_idx != -1 else 0 if scene.material_list_view_items else -1
             )
         return result
 
@@ -2954,13 +3091,13 @@ class MATERIALLIST_OT_prepare_material(Operator):
         return (
             context.scene
             and context.scene.material_list_active_index >= 0
-            and len(context.scene.material_list_items) > 0
+            and len(context.scene.material_list_view_items) > 0
         )
 
     @classmethod
     def get_target_material(cls, context):
         scene = context.scene
-        list_item = scene.material_list_items[scene.material_list_active_index]
+        list_item = scene.material_list_view_items[scene.material_list_active_index]
         target = get_material_by_uuid(list_item.material_uuid)
         if not target:
             print(f"[ERROR] Material '{list_item.material_name}' not found")
@@ -3132,10 +3269,10 @@ class MATERIALLIST_OT_make_local(Operator):
     @classmethod
     def poll(cls, context):
         scene = context.scene
-        if not (scene and hasattr(scene, 'material_list_items')): return False
+        if not (scene and hasattr(scene, 'material_list_view_items')): return False
         idx = getattr(scene, "material_list_active_index", -1)
-        if idx < 0 or idx >= len(scene.material_list_items): return False
-        item = scene.material_list_items[idx]
+        if idx < 0 or idx >= len(scene.material_list_view_items): return False
+        item = scene.material_list_view_items[idx]
         mat = bpy.data.materials.get(item.material_uuid)
         return mat is not None and mat.library is not None
 
@@ -3143,15 +3280,15 @@ class MATERIALLIST_OT_make_local(Operator):
         global material_names, _display_name_cache
         scene = context.scene
         idx = scene.material_list_active_index
-        if not (0 <= idx < len(scene.material_list_items)):
+        if not (0 <= idx < len(scene.material_list_view_items)):
             self.report({'WARNING'}, "Selected list index is invalid.")
             return {'CANCELLED'}
-        item = scene.material_list_items[idx]
+        item = scene.material_list_view_items[idx]
         lib_mat_uuid = item.material_uuid
         lib_mat = bpy.data.materials.get(lib_mat_uuid)
         if lib_mat is None or not lib_mat.library:
             self.report({'ERROR'}, "Selected material is already local, missing, or changed since selection.")
-            populate_material_list(scene)
+            populate_material_list(scene, context)
             return {'CANCELLED'}
         try:
             display_name_from_lib = mat_get_display_name(lib_mat)
@@ -3193,9 +3330,9 @@ class MATERIALLIST_OT_make_local(Operator):
                             print(f"[Make Local DB] Error assigning to data slot {idx_slot} on {obj.data.name}: {e_assign}")
         print(f"[Make Local DB] Replaced library material on approx {replaced_count} slots.")
         _display_name_cache.clear()
-        populate_material_list(scene)
+        populate_material_list(scene, context)
         new_idx = -1
-        for i, current_item in enumerate(scene.material_list_items):
+        for i, current_item in enumerate(scene.material_list_view_items):
             if current_item.material_uuid == new_local_uuid:
                 new_idx = i
                 break
@@ -3204,7 +3341,7 @@ class MATERIALLIST_OT_make_local(Operator):
             print(f"[Make Local DB] Selected newly created local material in list at index {new_idx}.")
         else:
             print("[Make Local DB] Warning: Could not find newly created local material in list after populate.")
-            scene.material_list_active_index = 0 if len(scene.material_list_items) > 0 else -1
+            scene.material_list_active_index = 0 if len(scene.material_list_view_items) > 0 else -1
         if hasattr(local_mat, "preview"):
             force_update_preview(local_mat)
         self.report({'INFO'}, f"Converted '{mat_get_display_name(local_mat)}' to a local material.")
@@ -3305,7 +3442,7 @@ class MATERIALLIST_OT_refresh_material_list(Operator): # Uses updated populate_m
         scene = context.scene
         print("[Refresh Op] Refreshing UI List and triggering thumbnail check.")
         try:
-            populate_material_list(scene) # This now excludes "mat_"
+            populate_material_list(scene, context) # This now excludes "mat_"
             if 'update_material_thumbnails' in globals() and callable(update_material_thumbnails):
                 update_material_thumbnails() # This now includes orphan cleanup scheduling
             else: print("[Refresh Op] ERROR: update_material_thumbnails not found.")
@@ -4002,7 +4139,7 @@ class MATERIALLIST_OT_select_dominant(Operator):
             return {'CANCELLED'}
 
         found_in_list = False
-        for i, itm in enumerate(scene.material_list_items):
+        for i, itm in enumerate(scene.material_list_view_items):
             if itm.material_uuid == dominant_uuid:
                 scene.material_list_active_index = i
                 found_in_list = True
@@ -4014,7 +4151,7 @@ class MATERIALLIST_OT_select_dominant(Operator):
         else:
             self.report({'WARNING'}, f"Dominant material '{mat_get_display_name(dominant_mat)}' not found in the UI list.")
             # Optionally, refresh the list here if this happens
-            # populate_material_list(scene) 
+            # populate_material_list(scene, context) 
             # force_redraw()
 
         return {'FINISHED'}
@@ -4468,155 +4605,152 @@ def migrate_thumbnail_files(dummy): # Unchanged in core logic, just uses pre-com
 # Thumbnail Generation Core Logic (get_custom_icon, generate_thumbnail_async, update_material_thumbnails)
 # --------------------------
 def get_custom_icon(mat, collect_mode=False):
-    global custom_icons, thumbnail_generation_scheduled, thumbnail_task_queue, thumbnail_pending_on_disk_check
-    global g_tasks_for_current_run, g_current_run_task_hashes_being_processed, THUMBNAIL_SIZE
-    global _ICON_TEMPLATE_VALIDATED
+    """
+    Safely gets a custom icon for a material, handling cases where the
+    material datablock might have been removed from memory.
+    """
+    try:
+        # Immediately check the validity of the 'mat' reference.
+        # Accessing any property will trigger the error if it's invalid.
+        if not mat or not mat.name: # A simple check
+             return 0
 
-    mat_name_debug = getattr(mat, 'name', 'None_Material_Name')
+        global custom_icons, thumbnail_generation_scheduled, thumbnail_task_queue, thumbnail_pending_on_disk_check
+        global g_tasks_for_current_run, g_current_run_task_hashes_being_processed, THUMBNAIL_SIZE
+        global _ICON_TEMPLATE_VALIDATED
 
-    if not mat:
-        return 0
+        mat_name_debug = getattr(mat, 'name', 'None_Material_Name')
 
-    if not _ICON_TEMPLATE_VALIDATED:
-        try:
-            if not _verify_icon_template():
-                return 0 
-            _ICON_TEMPLATE_VALIDATED = True
-        except Exception as e_tpl_chk:
-            print(f"[GetIcon - {mat_name_debug}] CRITICAL: Exception during _verify_icon_template call: {e_tpl_chk}. Ret 0.", file=sys.stderr, flush=True)
-            traceback.print_exc(file=sys.stderr)
-            return 0
-
-    if custom_icons is None:
-        try:
-            custom_icons = bpy.utils.previews.new()
-            if custom_icons is None:
-                print(f"[GetIcon - {mat_name_debug}] CRITICAL: Reinitialization of custom_icons failed. Ret 0.", file=sys.stderr, flush=True)
+        if not _ICON_TEMPLATE_VALIDATED:
+            try:
+                if not _verify_icon_template():
+                    return 0
+                _ICON_TEMPLATE_VALIDATED = True
+            except Exception as e_tpl_chk:
+                print(f"[GetIcon - {mat_name_debug}] CRITICAL: Exception during _verify_icon_template call: {e_tpl_chk}. Ret 0.", file=sys.stderr, flush=True)
+                traceback.print_exc(file=sys.stderr)
                 return 0
-            if 'preload_existing_thumbnails' in globals() and callable(preload_existing_thumbnails):
-                preload_existing_thumbnails()
-        except Exception as e_reinit_previews:
-            print(f"[GetIcon - {mat_name_debug}] CRITICAL: Exception reinitializing custom_icons: {e_reinit_previews}. Ret 0.", file=sys.stderr, flush=True)
-            traceback.print_exc(file=sys.stderr)
+
+        if custom_icons is None:
+            try:
+                custom_icons = bpy.utils.previews.new()
+                if custom_icons is None:
+                    print(f"[GetIcon - {mat_name_debug}] CRITICAL: Reinitialization of custom_icons failed. Ret 0.", file=sys.stderr, flush=True)
+                    return 0
+                if 'preload_existing_thumbnails' in globals() and callable(preload_existing_thumbnails):
+                    preload_existing_thumbnails()
+            except Exception as e_reinit_previews:
+                print(f"[GetIcon - {mat_name_debug}] CRITICAL: Exception reinitializing custom_icons: {e_reinit_previews}. Ret 0.", file=sys.stderr, flush=True)
+                traceback.print_exc(file=sys.stderr)
+                return 0
+
+        current_material_hash = get_material_hash(mat, force=False)
+
+        if not current_material_hash:
             return 0
 
-    current_material_hash = get_material_hash(mat) 
-    if not current_material_hash:
-        return 0
+        if current_material_hash in custom_icons:
+            cached_preview_item = custom_icons[current_material_hash]
+            is_cached_item_acceptable = False
 
-    # 1. Check Blender's preview cache (custom_icons) - OPTIMIZED CHECK
-    if current_material_hash in custom_icons:
-        cached_preview_item = custom_icons[current_material_hash]
-        is_cached_item_acceptable = False # Assume not acceptable initially
-
-        if hasattr(cached_preview_item, 'icon_id') and cached_preview_item.icon_id > 0:
-            actual_w, actual_h = cached_preview_item.icon_size
-            if actual_w > 1 and actual_h > 1: # Icon has a non-zero, practical size
-                # If preloaded and size is reasonable, trust it to avoid frequent disk I/O.
-                # Assumes preload_existing_thumbnails handled initial file validation.
-                is_cached_item_acceptable = True
-            else: # Zero or near-zero size, definitely invalid if found in cache.
-                print(f"    [GetIcon - Cache VERY BAD SIZE] HASH {current_material_hash[:8]} (Mat: {mat_name_debug}): Cached ID {cached_preview_item.icon_id} but size {actual_w}x{actual_h}. Invalidating from cache.")
-                if current_material_hash in custom_icons: # Ensure key exists before del
-                    del custom_icons[current_material_hash] 
-                # Do not delete the file here; let generation attempt it if this path leads to regeneration.
-        
-        if is_cached_item_acceptable:
-            # print(f"[GetIcon - {mat_name_debug}] Returning valid cached icon_id: {cached_preview_item.icon_id} for HASH {current_material_hash[:8]}.")
-            return cached_preview_item.icon_id
-        # If not acceptable (e.g., zero size from cache), fall through to disk check / generation queue.
-
-    thumbnail_file_path = get_thumbnail_path(current_material_hash)
-
-    # 2. Check if valid file exists on disk & attempt to load (if not acceptably in cache)
-    file_ok_on_disk = False
-    if os.path.isfile(thumbnail_file_path):
-        try:
-            if os.path.getsize(thumbnail_file_path) > 0:
-                file_ok_on_disk = True
-        except OSError: 
-            file_ok_on_disk = False
-
-    if file_ok_on_disk:
-        try:
-            if current_material_hash in custom_icons: # Should have been caught by above if truly valid, but double check or if invalidated.
-                # print(f"    [GetIcon - DiskLoad] Removing existing/invalid entry for HASH {current_material_hash[:8]} before disk load.")
-                del custom_icons[current_material_hash]
-            
-            preview_item_from_disk_load = custom_icons.load(current_material_hash, thumbnail_file_path, 'IMAGE')
-            is_genuinely_valid_from_disk = False
-
-            if preview_item_from_disk_load and hasattr(preview_item_from_disk_load, 'icon_id') and preview_item_from_disk_load.icon_id > 0:
-                actual_w, actual_h = preview_item_from_disk_load.icon_size
-                if actual_w <= 1 or actual_h <= 1:
-                    print(f"    [GetIcon - DiskLoad VERY BAD SIZE] HASH {current_material_hash[:8]} (Mat: {mat_name_debug}): Loaded ID {preview_item_from_disk_load.icon_id} from file, but size {actual_w}x{actual_h}. Invalidating.")
+            if hasattr(cached_preview_item, 'icon_id') and cached_preview_item.icon_id > 0:
+                actual_w, actual_h = cached_preview_item.icon_size
+                if actual_w > 1 and actual_h > 1:
+                    is_cached_item_acceptable = True
+                else:
                     if current_material_hash in custom_icons:
                         del custom_icons[current_material_hash]
-                    # Consider deleting the problematic file from disk too if it's consistently bad
-                    # try: os.remove(thumbnail_file_path); print(f"      Deleted problematic file: {thumbnail_file_path}")
-                    # except Exception as e_del_disk: print(f"      Error deleting file {thumbnail_file_path}: {e_del_disk}")
-                else: # Size is acceptable
-                    is_genuinely_valid_from_disk = True
-            
-            if is_genuinely_valid_from_disk:
-                # print(f"[GetIcon - {mat_name_debug}] Successfully loaded from disk. Returning icon_id: {preview_item_from_disk_load.icon_id} for HASH {current_material_hash[:8]}.")
-                return preview_item_from_disk_load.icon_id
-            # else: Fall through to schedule generation if load from disk wasn't valid
 
-        except RuntimeError as e_runtime_load_geticon:
-            print(f"    [GetIcon - DiskLoad RUNTIME ERROR] HASH {current_material_hash[:8]} for '{thumbnail_file_path}': {e_runtime_load_geticon}. Will schedule generation.", file=sys.stderr, flush=True)
-        except Exception as e_load_from_disk:
-            print(f"    [GetIcon - DiskLoad EXCEPTION] HASH {current_material_hash[:8]} for '{thumbnail_file_path}': {e_load_from_disk}. Will schedule generation.", file=sys.stderr, flush=True)
-            traceback.print_exc(file=sys.stderr)
+            if is_cached_item_acceptable:
+                return cached_preview_item.icon_id
 
-    # 3. If not found/loaded validly, check if already scheduled or being processed
-    if current_material_hash in g_current_run_task_hashes_being_processed or \
-       current_material_hash in thumbnail_pending_on_disk_check:
-        return 0 
-    
-    if thumbnail_generation_scheduled.get(current_material_hash, False) and not collect_mode:
-        return 0
+        thumbnail_file_path = get_thumbnail_path(current_material_hash)
 
-    # 4. Prepare task if not found/loaded validly
-    blend_file_path_for_worker = None
-    if mat.library and mat.library.filepath:
-        blend_file_path_for_worker = bpy.path.abspath(mat.library.filepath)
-    elif not mat.library and bpy.data.filepath: 
-        blend_file_path_for_worker = bpy.path.abspath(bpy.data.filepath)
-    else: 
-        return 0 
+        file_ok_on_disk = False
+        if os.path.isfile(thumbnail_file_path):
+            try:
+                if os.path.getsize(thumbnail_file_path) > 0:
+                    file_ok_on_disk = True
+            except OSError:
+                file_ok_on_disk = False
 
-    if not blend_file_path_for_worker or not os.path.exists(blend_file_path_for_worker):
-        return 0
+        if file_ok_on_disk:
+            try:
+                if current_material_hash in custom_icons:
+                    del custom_icons[current_material_hash]
 
-    mat_uuid_for_task = get_material_uuid(mat) 
-    if not mat_uuid_for_task or len(mat_uuid_for_task) != 36: 
-        print(f"[GetIcon - {mat_name_debug}] CRITICAL: Could not get/ensure valid UUID for material. Ret 0.", file=sys.stderr, flush=True)
-        return 0
+                preview_item_from_disk_load = custom_icons.load(current_material_hash, thumbnail_file_path, 'IMAGE')
+                is_genuinely_valid_from_disk = False
 
-    if not mat.library:
-        try:
-            if mat.users == 0 and not mat.use_fake_user :
-                mat.use_fake_user = True
-        except Exception as e_fake_user:
-            print(f"    [GetIcon - {mat_name_debug}] Warning: Could not set use_fake_user for local material: {e_fake_user}", file=sys.stderr, flush=True)
+                if preview_item_from_disk_load and hasattr(preview_item_from_disk_load, 'icon_id') and preview_item_from_disk_load.icon_id > 0:
+                    actual_w, actual_h = preview_item_from_disk_load.icon_size
+                    if actual_w <= 1 or actual_h <= 1:
+                        if current_material_hash in custom_icons:
+                            del custom_icons[current_material_hash]
+                    else:
+                        is_genuinely_valid_from_disk = True
 
-    task_details = {
-        'blend_file': blend_file_path_for_worker,
-        'mat_uuid': mat_uuid_for_task,
-        'thumb_path': thumbnail_file_path,
-        'hash_value': current_material_hash,
-        'mat_name_debug': mat.name, 
-        'retries': 0 
-    }
+                if is_genuinely_valid_from_disk:
+                    return preview_item_from_disk_load.icon_id
 
-    if collect_mode:
-        return task_details 
-    else:
-        if 'update_material_thumbnails' in globals() and callable(update_material_thumbnails):
-            update_material_thumbnails(specific_tasks_to_process=[task_details])
+            except RuntimeError as e_runtime_load_geticon:
+                print(f"    [GetIcon - DiskLoad RUNTIME ERROR] HASH {current_material_hash[:8]} for '{thumbnail_file_path}': {e_runtime_load_geticon}. Will schedule generation.", file=sys.stderr, flush=True)
+            except Exception as e_load_from_disk:
+                print(f"    [GetIcon - DiskLoad EXCEPTION] HASH {current_material_hash[:8]} for '{thumbnail_file_path}': {e_load_from_disk}. Will schedule generation.", file=sys.stderr, flush=True)
+                traceback.print_exc(file=sys.stderr)
+
+        if current_material_hash in g_current_run_task_hashes_being_processed or \
+           current_material_hash in thumbnail_pending_on_disk_check:
+            return 0
+
+        if thumbnail_generation_scheduled.get(current_material_hash, False) and not collect_mode:
+            return 0
+
+        blend_file_path_for_worker = None
+        if mat.library and mat.library.filepath:
+            blend_file_path_for_worker = bpy.path.abspath(mat.library.filepath)
+        elif not mat.library and bpy.data.filepath:
+            blend_file_path_for_worker = bpy.path.abspath(bpy.data.filepath)
         else:
-            print(f"[GetIcon - {mat_name_debug}] CRITICAL: update_material_thumbnails function not found!", file=sys.stderr, flush=True)
+            return 0
+
+        if not blend_file_path_for_worker or not os.path.exists(blend_file_path_for_worker):
+            return 0
+
+        mat_uuid_for_task = get_material_uuid(mat)
+        if not mat_uuid_for_task or len(mat_uuid_for_task) != 36:
+            print(f"[GetIcon - {mat_name_debug}] CRITICAL: Could not get/ensure valid UUID for material. Ret 0.", file=sys.stderr, flush=True)
+            return 0
+
+        if not mat.library:
+            try:
+                if mat.users == 0 and not mat.use_fake_user:
+                    mat.use_fake_user = True
+            except Exception as e_fake_user:
+                print(f"      [GetIcon - {mat_name_debug}] Warning: Could not set use_fake_user for local material: {e_fake_user}", file=sys.stderr, flush=True)
+
+        task_details = {
+            'blend_file': blend_file_path_for_worker,
+            'mat_uuid': mat_uuid_for_task,
+            'thumb_path': thumbnail_file_path,
+            'hash_value': current_material_hash,
+            'mat_name_debug': mat.name,
+            'retries': 0
+        }
+
+        if collect_mode:
+            return task_details
+        else:
+            if 'update_material_thumbnails' in globals() and callable(update_material_thumbnails):
+                update_material_thumbnails(specific_tasks_to_process=[task_details])
+            else:
+                print(f"[GetIcon - {mat_name_debug}] CRITICAL: update_material_thumbnails function not found!", file=sys.stderr, flush=True)
+            return 0
+
+    except ReferenceError:
+        # This block catches the error from the traceback. It means the 'mat'
+        # object is a dangling pointer to data Blender has already freed.
+        # We return a default value (0) to prevent the script from crashing.
         return 0
 
 def _verify_icon_template() -> bool:
@@ -4782,7 +4916,7 @@ def finalize_thumbnail_run():
     global g_thumbnails_loaded_in_current_UMT_run # Ensure this is global here
 
     print("[Finalize Thumbnail Run] Current run completed.")
-    g_current_run_task_hashes_being_processed.clear() 
+    g_current_run_task_hashes_being_processed.clear()
 
     new_materials_found_since_start = False
     if DATABASE_FILE and os.path.exists(DATABASE_FILE) and g_material_creation_timestamp_at_process_start > 0:
@@ -4801,23 +4935,25 @@ def finalize_thumbnail_run():
 
     if new_materials_found_since_start:
         print("[Finalize Thumbnail Run] Rerunning thumbnail generation due to new materials.")
-        g_thumbnail_process_ongoing = False 
+        g_thumbnail_process_ongoing = False
         # g_thumbnails_loaded_in_current_UMT_run will be reset by the new UMT call.
-        update_material_thumbnails() 
+        update_material_thumbnails()
     else:
         print(f"[Finalize Thumbnail Run] No new materials detected. Thumbnails loaded in this UMT run: {g_thumbnails_loaded_in_current_UMT_run}")
-        g_thumbnail_process_ongoing = False 
-        g_material_creation_timestamp_at_process_start = 0.0 
+        g_thumbnail_process_ongoing = False
+        g_material_creation_timestamp_at_process_start = 0.0
 
         # <<< CONDITIONAL UI REFRESH >>>
         if g_thumbnails_loaded_in_current_UMT_run: # Only refresh if this UMT run actually loaded icons
-            scene = get_first_scene() 
+            scene = get_first_scene()
             if scene and 'populate_material_list' in globals() and callable(populate_material_list):
                 print("[Finalize Thumbnail Run] Refreshing material list UI as new thumbnails were loaded in this UMT run.")
                 try:
-                    # The called_from_finalize_run flag is now less critical for UMT triggering,
-                    # but can be kept for logging or other contextual decisions within populate_material_list.
-                    populate_material_list(scene, called_from_finalize_run=True) 
+                    # --- THIS IS THE FIX ---
+                    # The function call is corrected to match the definition: populate_material_list(scene, context)
+                    populate_material_list(scene, bpy.context)
+                    # --- END OF FIX ---
+                    
                     if 'force_redraw' in globals() and callable(force_redraw):
                         force_redraw()
                 except Exception as e_populate_final:
@@ -4829,7 +4965,7 @@ def finalize_thumbnail_run():
 
         if g_library_update_pending:
             print("[Finalize Thumbnail Run] Processing deferred library update.")
-            g_library_update_pending = False 
+            g_library_update_pending = False
             force_pending_update = getattr(bpy.context.window_manager, 'matlist_pending_lib_update_is_forced', False)
             _perform_library_update(force=force_pending_update)
             if hasattr(bpy.context.window_manager, 'matlist_pending_lib_update_is_forced'):
@@ -4852,33 +4988,28 @@ def process_thumbnail_tasks():
     global custom_icons, _ADDON_DATA_ROOT, THUMBNAIL_SIZE, BACKGROUND_WORKER_PY
     global THUMBNAIL_BATCH_SIZE_PER_WORKER, THUMBNAIL_MAX_RETRIES
     global g_thumbnail_process_ongoing, g_dispatch_lock, MAX_CONCURRENT_THUMBNAIL_WORKERS
-    global g_thumbnails_loaded_in_current_UMT_run # Ensure it's global here
+    global g_thumbnails_loaded_in_current_UMT_run
 
-    # This per-tick flag is not strictly necessary anymore if g_thumbnails_loaded_in_current_UMT_run
-    # correctly gates the populate in finalize_thumbnail_run.
-    # However, it doesn't hurt to keep it if you have other logic that might use it for this specific tick.
     any_successful_load_this_cycle = False 
 
     if not g_thumbnail_process_ongoing and thumbnail_task_queue.empty() and not thumbnail_worker_pool and not g_tasks_for_current_run :
-        if thumbnail_monitor_timer_active: # Only try to unregister if it was active
-            thumbnail_monitor_timer_active = False # Mark as inactive before returning None
-            # print("[ThumbMan Timer] All clear, stopping timer.") # Optional
+        if thumbnail_monitor_timer_active:
+            thumbnail_monitor_timer_active = False
             return None # Stop timer
-        # If not active and all clear, it's already stopped or was never started for this state.
         return None 
     
-    if g_thumbnail_process_ongoing and not thumbnail_monitor_timer_active: # If a run is ongoing, timer should be active
+    if g_thumbnail_process_ongoing and not thumbnail_monitor_timer_active:
         ensure_thumbnail_queue_processor_running()
 
     try:
-        if not _verify_icon_template(): # _verify_icon_template handles its own logs
+        if not _verify_icon_template():
             print("[ThumbMan Timer] Icon template verification failed. Retrying check soon.", file=sys.stderr, flush=True)
-            thumbnail_monitor_timer_active = True # Ensure timer continues
-            return 0.5 # Retry template check shortly
+            thumbnail_monitor_timer_active = True
+            return 0.5
 
         completed_worker_indices_this_cycle = []
 
-        for idx, worker_info in enumerate(list(thumbnail_worker_pool)): # Iterate copy
+        for idx, worker_info in enumerate(list(thumbnail_worker_pool)):
             process = worker_info.get('process')
             original_batch_tasks = worker_info.get('batched_tasks_in_worker', [])
             batch_id_for_log = "UnknownBatch"
@@ -4886,7 +5017,6 @@ def process_thumbnail_tasks():
                 batch_id_for_log = original_batch_tasks[0]['hash_value'][:8]
             
             if not process:
-                # print(f"  [ThumbMan Timer] Worker {idx} (Batch {batch_id_for_log}) had no process. Marking for removal.") # Optional
                 completed_worker_indices_this_cycle.append(idx)
                 continue
 
@@ -4900,15 +5030,14 @@ def process_thumbnail_tasks():
                         try:
                             if os.path.getsize(task.get('thumb_path', '')) > 0 :
                                 existing_thumbs_in_batch_on_disk += 1
-                        except OSError: pass # File might disappear between exists and getsize
+                        except OSError: pass
 
             if exit_code is not None: # Process has finished
-                # print(f"  [ThumbMan Timer] Worker {idx} (Batch {batch_id_for_log}, PID: {getattr(process,'pid','N/A')}) finished with code {exit_code}. Processing results.")
                 completed_worker_indices_this_cycle.append(idx)
-            
+                
                 stdout_str, stderr_str = "", ""
                 try:
-                    stdout_bytes, stderr_bytes = process.communicate(timeout=10) # Increased timeout
+                    stdout_bytes, stderr_bytes = process.communicate(timeout=10)
                     stdout_str = stdout_bytes.decode('utf-8', errors='replace').strip() if stdout_bytes else ""
                     stderr_str = stderr_bytes.decode('utf-8', errors='replace').strip() if stderr_bytes else ""
                 except subprocess.TimeoutExpired:
@@ -4920,8 +5049,6 @@ def process_thumbnail_tasks():
 
                 if stderr_str:
                     print(f"  [WORKER STDERR - FINISHED] W{idx} (Batch:{batch_id_for_log}):\n{stderr_str}", file=sys.stderr, flush=True)
-                # if stdout_str: # Optional: print stdout too
-                #    print(f"  [WORKER STDOUT - FINISHED] W{idx} (Batch:{batch_id_for_log}):\n{stdout_str}", flush=True)
 
                 parsed_worker_json_results = []
                 if exit_code == 0 and stdout_str: 
@@ -4929,7 +5056,7 @@ def process_thumbnail_tasks():
                     try:
                         lines = stdout_str.strip().splitlines()
                         if lines:
-                            for line in reversed(lines): # Try to find the last JSON line
+                            for line in reversed(lines):
                                 line_stripped = line.strip()
                                 if (line_stripped.startswith('{') and line_stripped.endswith('}')) or \
                                    (line_stripped.startswith('[') and line_stripped.endswith(']')):
@@ -4938,8 +5065,6 @@ def process_thumbnail_tasks():
                             json_data = json.loads(json_line_to_parse)
                             if isinstance(json_data, dict) and "results" in json_data and isinstance(json_data["results"], list):
                                 parsed_worker_json_results = json_data["results"]
-                                # print(f"    [Worker {idx} JSON] Successfully parsed {len(parsed_worker_json_results)} results.")
-                        # else: print(f"    [Worker {idx} JSON] No valid JSON line found in stdout.")
                     except json.JSONDecodeError as e_json:
                         print(f"    [Worker {idx} JSON] JSONDecodeError: {e_json}. Stdout was:\n{stdout_str}", file=sys.stderr, flush=True)
                     except Exception as e_json_other:
@@ -4954,12 +5079,10 @@ def process_thumbnail_tasks():
                         if original_task:
                             tasks_to_evaluate_after_worker.append({
                                 "task_data": original_task,
-                                "worker_status": res_item.get("status", "failure"), # Default to failure if status missing
+                                "worker_status": res_item.get("status", "failure"),
                                 "worker_reason": res_item.get("reason", "no_reason_in_json")
                             })
-                        # else: print(f"    [Task Eval] Could not find original task for hash {hash_val_from_res} from JSON result.")
                 else: 
-                    # print(f"    [Task Eval] No parsed JSON results, or worker exit code non-zero ({exit_code}). Evaluating all tasks in batch as potentially failed by worker.")
                     for task_in_batch in original_batch_tasks:
                         tasks_to_evaluate_after_worker.append({
                             "task_data": task_in_batch,
@@ -4970,9 +5093,6 @@ def process_thumbnail_tasks():
                 for eval_item in tasks_to_evaluate_after_worker:
                     task_data = eval_item["task_data"]; hash_val = task_data['hash_value']; thumb_p = task_data['thumb_path']; retries_done = task_data.get('retries', 0)
                     worker_reported_status = eval_item["worker_status"]
-                    # worker_reason = eval_item["worker_reason"] # For logging if needed
-
-                    # print(f"      [Task Eval] Hash: {hash_val[:8]}, Worker Status: {worker_reported_status}, Reason: {worker_reason}, Retries: {retries_done}")
 
                     thumbnail_pending_on_disk_check.pop(hash_val, None) 
                     g_current_run_task_hashes_being_processed.discard(hash_val)
@@ -4983,15 +5103,14 @@ def process_thumbnail_tasks():
                             file_size_on_disk = os.path.getsize(thumb_p)
                             if file_size_on_disk > 0: file_ok_on_disk = True
                         except OSError as e_stat_after_worker:
-                            print(f"        [Task Eval - File Stat Error post-worker] Hash {hash_val[:8]} for '{thumb_p}': {e_stat_after_worker}", flush=True)
+                            print(f"         [Task Eval - File Stat Error post-worker] Hash {hash_val[:8]} for '{thumb_p}': {e_stat_after_worker}", flush=True)
                     
                     loaded_to_blender_properly_this_task = False
-                    if file_ok_on_disk and worker_reported_status == "success": # Trust worker success if file is good
+                    if file_ok_on_disk and worker_reported_status == "success":
                         if custom_icons is not None:
                             try:
-                                time.sleep(0.05) # Small delay, might help with file system race conditions
-                                if hash_val in custom_icons: # Remove if already exists from a previous failed load or other reason
-                                    # print(f"          [Task Eval - Cache Load] Removing pre-existing key {hash_val[:8]} before loading from disk.")
+                                time.sleep(0.05)
+                                if hash_val in custom_icons:
                                     del custom_icons[hash_val]
                                 
                                 custom_icons.load(hash_val, thumb_p, 'IMAGE')
@@ -4999,78 +5118,65 @@ def process_thumbnail_tasks():
 
                                 if final_entry_in_cache and hasattr(final_entry_in_cache, 'icon_id') and final_entry_in_cache.icon_id > 0:
                                     actual_w, actual_h = final_entry_in_cache.icon_size
-                                    if actual_w <= 1 or actual_h <= 1: # Very lenient check for "zero" size
-                                        print(f"        [Task Eval - Cache Load VERY BAD SIZE] Hash {hash_val[:8]}: Loaded ID {final_entry_in_cache.icon_id} but size {actual_w}x{actual_h}. Invalidating & deleting file.", flush=True)
-                                        if hash_val in custom_icons: del custom_icons[hash_val] # Remove bad entry
+                                    if actual_w <= 1 or actual_h <= 1:
+                                        print(f"         [Task Eval - Cache Load VERY BAD SIZE] Hash {hash_val[:8]}: Loaded ID {final_entry_in_cache.icon_id} but size {actual_w}x{actual_h}. Invalidating & deleting file.", flush=True)
+                                        if hash_val in custom_icons: del custom_icons[hash_val]
                                         if os.path.exists(thumb_p):
                                             try: os.remove(thumb_p)
-                                            except Exception as e_del_bad_thumb: print(f"          Error deleting bad thumb file {thumb_p}: {e_del_bad_thumb}", flush=True)
-                                    else: # Size is acceptable (even if smaller than THUMBNAIL_SIZE, as long as not zero)
-                                        # if actual_w < THUMBNAIL_SIZE or actual_h < THUMBNAIL_SIZE:
-                                            # print(f"        [Task Eval - Cache Load SMALLER SIZE] Hash {hash_val[:8]}: Loaded ID {final_entry_in_cache.icon_id}, size {actual_w}x{actual_h}. Accepting.")
+                                            except Exception as e_del_bad_thumb: print(f"             Error deleting bad thumb file {thumb_p}: {e_del_bad_thumb}", flush=True)
+                                    else:
                                         loaded_to_blender_properly_this_task = True
-                                        any_successful_load_this_cycle = True # For per-tick redraw, if re-enabled
-                                        g_thumbnails_loaded_in_current_UMT_run = True # <<< SET GLOBAL FLAG
-                                        list_version +=1 
-                                # else: print(f"        [Task Eval - Cache Load FAIL] Hash {hash_val[:8]}: Load into custom_icons failed or resulted in invalid ID.")
+                                        any_successful_load_this_cycle = True
+                                        g_thumbnails_loaded_in_current_UMT_run = True
+                                        # --- THIS IS THE FIX: The line below is removed ---
+                                        # list_version +=1 
+                                        
                             except RuntimeError as e_runtime_load_after_worker:
-                                print(f"        [Task Eval - Cache Load RUNTIME ERROR] Hash {hash_val[:8]} for '{thumb_p}': {e_runtime_load_after_worker}. Deleting potentially corrupt file.", file=sys.stderr, flush=True)
-                                if os.path.exists(thumb_p): os.remove(thumb_p) # Remove if load failed badly
-                            except Exception as e_load_exc_after_worker:
-                                print(f"        [Task Eval - Cache Load EXCEPTION] Hash {hash_val[:8]} for '{thumb_p}': {e_load_exc_after_worker}. Deleting potentially corrupt file.", file=sys.stderr, flush=True)
+                                print(f"         [Task Eval - Cache Load RUNTIME ERROR] Hash {hash_val[:8]} for '{thumb_p}': {e_runtime_load_after_worker}. Deleting potentially corrupt file.", file=sys.stderr, flush=True)
                                 if os.path.exists(thumb_p): os.remove(thumb_p)
-                        # else: print(f"        [Task Eval] custom_icons is None. Cannot load {hash_val[:8]} to Blender cache.")
-                    # else: print(f"        [Task Eval] File for hash {hash_val[:8]} not OK on disk OR worker reported failure (Status: {worker_reported_status}). Will not attempt Blender load.")
-                    
+                            except Exception as e_load_exc_after_worker:
+                                print(f"         [Task Eval - Cache Load EXCEPTION] Hash {hash_val[:8]} for '{thumb_p}': {e_load_exc_after_worker}. Deleting potentially corrupt file.", file=sys.stderr, flush=True)
+                                if os.path.exists(thumb_p): os.remove(thumb_p)
+
                     if not loaded_to_blender_properly_this_task:
-                        # print(f"      [Task Eval - FAILURE/RETRY] Hash {hash_val[:8]} not loaded properly.")
-                        thumbnail_generation_scheduled.pop(hash_val, None) # Remove from main schedule if it failed
+                        thumbnail_generation_scheduled.pop(hash_val, None)
                         if retries_done < THUMBNAIL_MAX_RETRIES:
-                            # print(f"        Retrying task for hash {hash_val[:8]} (Attempt {retries_done + 1}/{THUMBNAIL_MAX_RETRIES}).")
                             task_for_retry = task_data.copy(); task_for_retry['retries'] = retries_done + 1
-                            with g_dispatch_lock: # Ensure thread-safe append if other parts could modify g_tasks_for_current_run
+                            with g_dispatch_lock:
                                 g_tasks_for_current_run.append(task_for_retry)
-                                thumbnail_generation_scheduled[hash_val] = True # Add back to schedule for this new attempt
+                                thumbnail_generation_scheduled[hash_val] = True
                         else:
-                            print(f"        [Task Eval - MAX RETRIES] Hash {hash_val[:8]} reached max retries ({THUMBNAIL_MAX_RETRIES}). Giving up on this hash for this run.")
-                            if os.path.exists(thumb_p) and file_ok_on_disk : # If a file exists but couldn't be loaded, delete it
-                                print(f"          Deleting problematic thumbnail file '{thumb_p}' after max retries.")
+                            print(f"         [Task Eval - MAX RETRIES] Hash {hash_val[:8]} reached max retries ({THUMBNAIL_MAX_RETRIES}). Giving up on this hash for this run.")
+                            if os.path.exists(thumb_p) and file_ok_on_disk :
+                                print(f"           Deleting problematic thumbnail file '{thumb_p}' after max retries.")
                                 try: os.remove(thumb_p)
-                                except Exception as e_del_max_retry_file: print(f"            Error deleting file {thumb_p}: {e_del_max_retry_file}")
-                    else: # Successfully loaded
-                        # print(f"      [Task Eval - SUCCESS] Hash {hash_val[:8]} loaded into Blender.")
-                        thumbnail_generation_scheduled.pop(hash_val, None) # Successfully processed, remove from schedule
+                                except Exception as e_del_max_retry_file: print(f"             Error deleting file {thumb_p}: {e_del_max_retry_file}")
+                    else: 
+                        thumbnail_generation_scheduled.pop(hash_val, None)
 
             elif exit_code is None: # Worker is still running
                 if existing_thumbs_in_batch_on_disk == total_thumbs_in_batch and total_thumbs_in_batch > 0:
-                    # This case indicates all thumbnails for this worker's batch *already exist on disk and are valid*.
-                    # The worker might be stuck or redundant.
                     print(f"  [ThumbMan Timer] Worker {idx} (Batch {batch_id_for_log}, PID: {getattr(process, 'pid', 'N/A')}): WARNING - All {total_thumbs_in_batch} thumbnails exist on disk, but process still running! Forcing KILL to prevent stale worker.", flush=True)
                     try:
                         process.kill()
                         try: process.wait(timeout=1.0) 
                         except subprocess.TimeoutExpired: pass 
                     except Exception as e_kill_stale: print(f"    Error killing stale worker {idx}: {e_kill_stale}", flush=True)
-                    completed_worker_indices_this_cycle.append(idx) # Mark for removal from pool
-                    # Tasks in this batch are considered "done" as files exist.
-                    # They will be picked up by get_custom_icon if not already in Blender's cache.
+                    completed_worker_indices_this_cycle.append(idx)
                     for task_in_stale_batch in original_batch_tasks:
                         hash_val_stale = task_in_stale_batch['hash_value']
                         thumbnail_pending_on_disk_check.pop(hash_val_stale, None)
                         g_current_run_task_hashes_being_processed.discard(hash_val_stale)
-                        thumbnail_generation_scheduled.pop(hash_val_stale, None) # Remove from schedule too
+                        thumbnail_generation_scheduled.pop(hash_val_stale, None)
 
         if completed_worker_indices_this_cycle:
             for i in sorted(completed_worker_indices_this_cycle, reverse=True):
                 if 0 <= i < len(thumbnail_worker_pool): 
-                    # print(f"  [ThumbMan Timer] Removing completed/killed worker {i} from pool.")
                     thumbnail_worker_pool.pop(i)
-            # After removing workers, try to dispatch more tasks if slots are available
             if g_tasks_for_current_run and len(thumbnail_worker_pool) < MAX_CONCURRENT_THUMBNAIL_WORKERS:
-                 _dispatch_collected_tasks()
+                _dispatch_collected_tasks()
 
 
-        # Try to dispatch tasks from g_tasks_for_current_run first if there are worker slots
         if g_tasks_for_current_run and len(thumbnail_worker_pool) < MAX_CONCURRENT_THUMBNAIL_WORKERS and thumbnail_task_queue.qsize() < (MAX_CONCURRENT_THUMBNAIL_WORKERS - len(thumbnail_worker_pool)):
             _dispatch_collected_tasks()
 
@@ -5079,7 +5185,7 @@ def process_thumbnail_tasks():
         while len(thumbnail_worker_pool) < MAX_CONCURRENT_THUMBNAIL_WORKERS and not thumbnail_task_queue.empty():
             try:
                 queued_item_for_worker = thumbnail_task_queue.get_nowait()
-            except Empty: break # Should not happen due to while condition but good practice
+            except Empty: break
 
             if not isinstance(queued_item_for_worker, dict) or not all(k in queued_item_for_worker for k in ["batch_id", "tasks", "blend_file"]):
                 print(f"  [ThumbMan Timer] Invalid item dequeued: {queued_item_for_worker}. Skipping.", file=sys.stderr, flush=True)
@@ -5089,15 +5195,14 @@ def process_thumbnail_tasks():
             tasks_for_worker_process = queued_item_for_worker['tasks']
             blend_file_for_worker_process = queued_item_for_worker['blend_file']
             
-            # Pre-check: if all tasks in this batch are already validly in custom_icons, skip worker launch
             all_tasks_in_batch_already_valid_in_blender_cache = True 
-            if not tasks_for_worker_process: # Empty batch somehow
+            if not tasks_for_worker_process:
                 all_tasks_in_batch_already_valid_in_blender_cache = False
             else:
                 for task_to_check_cache in tasks_for_worker_process:
                     hash_val_to_check_cache = task_to_check_cache.get('hash_value')
                     thumb_path_to_check_cache = task_to_check_cache.get('thumb_path')
-                    if not hash_val_to_check_cache or not thumb_path_to_check_cache: # Invalid task
+                    if not hash_val_to_check_cache or not thumb_path_to_check_cache:
                         all_tasks_in_batch_already_valid_in_blender_cache = False; break
                     
                     is_task_valid_in_blender_cache_now = False
@@ -5105,8 +5210,7 @@ def process_thumbnail_tasks():
                         preview_item_to_check = custom_icons[hash_val_to_check_cache]
                         if hasattr(preview_item_to_check, 'icon_id') and preview_item_to_check.icon_id > 0:
                             actual_w_chk, actual_h_chk = preview_item_to_check.icon_size
-                            if not (actual_w_chk <= 1 or actual_h_chk <= 1): # Not zero-sized
-                                # Also ensure the file still exists on disk for this cached item
+                            if not (actual_w_chk <= 1 or actual_h_chk <= 1):
                                 if os.path.exists(thumb_path_to_check_cache) and os.path.getsize(thumb_path_to_check_cache) > 0:
                                     is_task_valid_in_blender_cache_now = True
                     
@@ -5114,33 +5218,27 @@ def process_thumbnail_tasks():
                         all_tasks_in_batch_already_valid_in_blender_cache = False; break
             
             if all_tasks_in_batch_already_valid_in_blender_cache:
-                # print(f"  [ThumbMan Timer] Skipping worker for batch {batch_id_from_queue}: All tasks already valid in Blender's icon cache.")
                 for task_skipped_from_queue in tasks_for_worker_process:
                     h_skip = task_skipped_from_queue['hash_value']
                     thumbnail_pending_on_disk_check.pop(h_skip, None)
                     thumbnail_generation_scheduled.pop(h_skip, None) 
                     g_current_run_task_hashes_being_processed.discard(h_skip)
-                # any_successful_load_this_cycle = True # Considered as "available"
-                g_thumbnails_loaded_in_current_UMT_run = True # If they are already valid in cache, it's as if they were loaded.
-                continue # Get next item from queue
+                g_thumbnails_loaded_in_current_UMT_run = True
+                continue
 
-            # Ensure thumbnail output directories exist for the batch
             try:
                 for task_path_data in tasks_for_worker_process:
                     os.makedirs(os.path.dirname(task_path_data['thumb_path']), exist_ok=True)
             except Exception as e_mkdir_batch:
                 print(f"  [ThumbMan Timer] Error creating directories for batch {batch_id_from_queue}: {e_mkdir_batch}. Re-queueing tasks.", file=sys.stderr, flush=True)
-                with g_dispatch_lock: g_tasks_for_current_run.extend(tasks_for_worker_process) # Add back to main list for re-processing
-                continue # Try next item from queue
+                with g_dispatch_lock: g_tasks_for_current_run.extend(tasks_for_worker_process)
+                continue
 
-            # Mark tasks as pending on disk check just before launching worker
             for task_to_mark_pending in tasks_for_worker_process:
                 thumbnail_pending_on_disk_check[task_to_mark_pending['hash_value']] = task_to_mark_pending
 
 
-            # Prepare and launch the worker
             tasks_json_payload_for_worker = json.dumps(tasks_for_worker_process)
-            # Use abspath for worker to avoid issues if Blender's CWD changes
             abs_blend_file_for_worker = os.path.abspath(blend_file_for_worker_process)
             abs_worker_script_path = os.path.abspath(BACKGROUND_WORKER_PY)
             abs_addon_data_root = os.path.abspath(_ADDON_DATA_ROOT)
@@ -5155,58 +5253,49 @@ def process_thumbnail_tasks():
                 "--addon-data-root", abs_addon_data_root, 
                 "--thumbnail-size", str(THUMBNAIL_SIZE)
             ]
-            # print(f"  [ThumbMan Timer] Launching worker for batch {batch_id_from_queue}. Cmd: {' '.join(cmd_for_worker_process)}")
             try:
                 popen_obj_for_pool = subprocess.Popen(cmd_for_worker_process, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                thumbnail_worker_pool.append({'process': popen_obj_for_pool, 'batched_tasks_in_worker': list(tasks_for_worker_process)}) # Store a copy
+                thumbnail_worker_pool.append({'process': popen_obj_for_pool, 'batched_tasks_in_worker': list(tasks_for_worker_process)})
                 workers_started_this_cycle += 1
-                # print(f"    Worker started for batch {batch_id_from_queue}, PID: {popen_obj_for_pool.pid}")
             except Exception as e_popen_launch:
                 print(f"  [ThumbMan Timer] ERROR launching worker for batch {batch_id_from_queue}: {e_popen_launch}", file=sys.stderr, flush=True)
                 traceback.print_exc(file=sys.stderr)
-                # Re-queue tasks if worker launch failed
                 with g_dispatch_lock: g_tasks_for_current_run.extend(tasks_for_worker_process)
-                for task_failed_launch in tasks_for_worker_process: # Clean up pending_on_disk_check for these
+                for task_failed_launch in tasks_for_worker_process:
                     thumbnail_pending_on_disk_check.pop(task_failed_launch['hash_value'], None)
         
-        # REMOVED: if any_successful_load_this_cycle: force_redraw()
-        # This redraw is now handled by finalize_thumbnail_run if g_thumbnails_loaded_in_current_UMT_run is True
+        # --- THIS IS THE FIX: Redraw once if anything was loaded this tick ---
+        if any_successful_load_this_cycle:
+            force_redraw()
+        # --- END OF FIX ---
 
-        # Check if the entire thumbnail generation process (for this UMT "run") is complete
         if not g_tasks_for_current_run and thumbnail_task_queue.empty() and not thumbnail_worker_pool:
-            if g_thumbnail_process_ongoing: # If a "run" was marked as ongoing
-                # print(f"  [ThumbMan Timer] All tasks processed for current run. Finalizing.")
-                finalize_thumbnail_run() # This will set g_thumbnail_process_ongoing to False if no new sub-run
+            if g_thumbnail_process_ongoing:
+                finalize_thumbnail_run()
             
-            # If finalize_thumbnail_run set g_thumbnail_process_ongoing to False (or it was already false)
-            # and there's no other reason for the timer to continue (like monitor_active being true for other reasons)
             if not g_thumbnail_process_ongoing :
-                # print(f"  [ThumbMan Timer] Thumbnail process no longer ongoing. Stopping timer if active.")
-                if thumbnail_monitor_timer_active: # Only return None if it was active
+                if thumbnail_monitor_timer_active:
                     thumbnail_monitor_timer_active = False
-                    return None # Stop timer
-                # If not active, it means it already stopped or will stop naturally.
+                    return None
         
-        # If still ongoing, or tasks pending, or workers active, continue timer
         if g_thumbnail_process_ongoing or not thumbnail_task_queue.empty() or thumbnail_worker_pool or g_tasks_for_current_run :
-            if not thumbnail_monitor_timer_active: # If it became inactive but there's work, reactivate
-                # print(f"  [ThumbMan Timer] Work pending but timer was inactive. Restarting timer.")
-                ensure_thumbnail_queue_processor_running() # This will set it active
-            return 1.0 # Continue timer with 1.0 second interval
-        else: # All clear, and process not ongoing
+            if not thumbnail_monitor_timer_active:
+                ensure_thumbnail_queue_processor_running()
+            return 1.0
+        else:
             if thumbnail_monitor_timer_active:
                 thumbnail_monitor_timer_active = False
-                return None # Stop timer
-            return None # Already stopped or will stop
+                return None
+            return None
 
     except Exception as e_timer_main_loop_critical:
         print(f"[ThumbMan Timer] CRITICAL UNHANDLED ERROR in process_thumbnail_tasks: {e_timer_main_loop_critical}", file=sys.stderr, flush=True)
         traceback.print_exc(file=sys.stderr)
-        g_thumbnail_process_ongoing = False # Attempt to halt ongoing process on critical error
+        g_thumbnail_process_ongoing = False
         if thumbnail_monitor_timer_active:
             thumbnail_monitor_timer_active = False
-            return None # Stop timer
-        return None # Already stopped or will stop
+            return None
+        return None
 
 def update_material_thumbnails(specific_tasks_to_process=None):
     """
@@ -5474,16 +5563,27 @@ def create_reference_snapshot(context: bpy.types.Context) -> bool:
 # --------------------------
 @persistent
 def depsgraph_update_handler(scene, depsgraph):
-    global materials_modified
-    # print(f"--- Depsgraph Handler Triggered (Scene: {getattr(scene, 'name', 'N/A')}) ---") # Verbose
+    global materials_modified, g_dirty_materials_set
+    
     try:
         for update in depsgraph.updates:
             if isinstance(update.id, bpy.types.Material):
                 material = update.id
-                # print(f"     [Depsgraph] Material Update: {getattr(material, 'name', 'Unknown')}") # Verbose
-                try: material["hash_dirty"] = True; materials_modified = True
-                except Exception: pass # Ignore if prop can't be set (e.g. library material)
-    except Exception as e: print(f"[Depsgraph Handler] Error: {e}"); traceback.print_exc()
+                
+                # We only care about tracking local, editable materials
+                if material.library:
+                    continue
+                
+                # Get the material's UUID and add it to our fast 'set'
+                mat_uuid = material.get("uuid")
+                if mat_uuid:
+                    g_dirty_materials_set.add(mat_uuid)
+                
+                # This flag can still be useful for other parts of the addon
+                materials_modified = True
+    except Exception as e:
+        print(f"[Depsgraph Handler] Error: {e}")
+        traceback.print_exc()
 
 # --------------------------
 # Property Update Callbacks and UI Redraw (from old addon)
@@ -5604,128 +5704,90 @@ def ensure_safe_preview(mat):
 # UIList and Panel Classes (from old addon, will use updated helpers)
 # --------------------------
 class MATERIALLIST_UL_materials(UIList):
+    """
+    Optimized UIList for smooth scrolling.
+    - `filter_items` uses a lightweight cache and only handles filtering by name.
+    - `draw_item` performs a non-blocking request for icons. If an icon isn't ready,
+      it displays a placeholder and relies on the background worker to generate it,
+      ensuring the UI thread is never blocked by hashing or rendering.
+    """
     use_filter_show = False
     use_filter_menu = False
     use_filter_sort_alpha = False
-    use_sort_alpha = False # This is used by template_list for default sorting if enabled
+    use_sort_alpha = False 
 
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        global g_uuid_to_mat_map
+        
+        mat_for_icon_lookup = g_uuid_to_mat_map.get(item.material_uuid)
+        
+        if not mat_for_icon_lookup:
+            print(f"[DEBUG DrawItem] FAILED to find material for UUID '{item.material_uuid}' in g_uuid_to_mat_map. List may be out of sync.")
+
         icon_val = 0
-        mat_for_icon_lookup = None 
+        if mat_for_icon_lookup:
+            icon_val = get_custom_icon(mat_for_icon_lookup)
 
-        # 1. Try to get icon_id from _cached_items_for_draw (will be 0 due to filter_items change)
-        if (hasattr(self, "_cached_items_for_draw") and
-                0 <= index < len(self._cached_items_for_draw)):
-            cache_entry = self._cached_items_for_draw[index]
-            icon_val = cache_entry.get("icon_id", 0) 
-
-        # 2. If cache did not yield a valid icon_id (>0), resolve material and get icon_id.
-        # This block will now always be entered for icon resolution.
-        if icon_val <= 0:
-            # Always try to get the material object using the UUID stored in the list item.
-            mat_for_icon_lookup = get_material_by_uuid(item.material_uuid)
-
-            if mat_for_icon_lookup:
-                # print(f"[DrawItem] For item '{item.material_name}' (UUID: {item.material_uuid}), found mat '{mat_for_icon_lookup.name}'. Calling get_custom_icon.")
-                icon_val = get_custom_icon(mat_for_icon_lookup)
-                # if icon_val <= 0:
-                    # print(f"[DrawItem] For item '{item.material_name}' (UUID: {item.material_uuid}), get_custom_icon for mat '{mat_for_icon_lookup.name}' returned 0 or less.")
-            # else:
-                # print(f"[DrawItem] For item '{item.material_name}' (UUID: {item.material_uuid}), mat_for_icon_lookup is None (get_material_by_uuid failed). Cannot call get_custom_icon.")
-                # icon_val remains 0 or negative
-
-        # 3. Draw the row, starting with the icon.
         row = layout.row(align=True)
-        if icon_val > 0: 
+        if icon_val > 0:
             row.label(icon_value=icon_val)
         else:
-            # Fallback icon logic: Check if the material (still) exists.
-            # Re-use mat_for_icon_lookup if it was determined above.
-            # If mat_for_icon_lookup was None, then material_exists_for_fallback will be False.
-            material_exists_for_fallback = False
-            if mat_for_icon_lookup: # Check if it was found
-                 # Verify it's still a valid material in bpy.data (could have been deleted)
-                if hasattr(mat_for_icon_lookup, 'name') and mat_for_icon_lookup.name in bpy.data.materials:
-                    if bpy.data.materials[mat_for_icon_lookup.name] == mat_for_icon_lookup: # Check identity
-                        material_exists_for_fallback = True
-
-            if material_exists_for_fallback:
-                row.label(icon="MATERIAL") 
-                # print(f"[DrawItem Fallback] Item '{item.material_name}' (UUID: {item.material_uuid}), mat found ('{mat_for_icon_lookup.name}'), using default MATERIAL icon because get_custom_icon returned <=0.")
+            if mat_for_icon_lookup:
+                row.label(icon="MATERIAL")
             else:
-                row.label(icon="ERROR")    
-                # print(f"[DrawItem Fallback] Item '{item.material_name}' (UUID: {item.material_uuid}), mat NOT found by get_material_by_uuid OR became invalid, using ERROR icon.")
+                row.label(icon="ERROR")
 
-        # 4. Draw the label text (material display name) and lock icon.
-        # Use mat_for_icon_lookup if available from earlier resolution for efficiency.
-        # If it was None earlier, it will still be None here.
-        if mat_for_icon_lookup: # Material was found (and assumed still valid for name display)
-            row.label(text=item.material_name) 
-            if item.is_protected: 
+        if mat_for_icon_lookup:
+            row.label(text=item.material_name)
+            if item.is_protected:
                 row.label(icon="LOCKED")
         else:
-            # The material datablock could not be found by get_material_by_uuid.
             row.label(text=f"{item.material_name} (Missing)", icon="ERROR")
 
     def filter_items(self, context, data, propname):
-        global material_list_cache, list_version # Ensure these are accessible if they are true globals
+        """
+        CORRECTED & OPTIMIZED: This version fixes the AttributeError crash.
+        It performs a fast search on a cached Python list, then returns the proper
+        flags and ordering information to Blender without trying to modify the
+        UI list, which is forbidden in this context.
+        """
+        global material_list_cache
         items = getattr(data, propname)
-        scene = context.scene
-        rebuild_cache = False
-        current_ui_list_version = getattr(scene.material_list, 'list_version', -1)
-
-        if not hasattr(self, '_last_version') or self._last_version != current_ui_list_version:
-            rebuild_cache = True
-            self._last_version = current_ui_list_version
+    
+        # This check ensures our cache is in sync with the main UI list.
+        # It will rebuild the cache only if the number of items has changed.
         if not hasattr(self, '_last_item_count') or self._last_item_count != len(items):
-            rebuild_cache = True
             self._last_item_count = len(items)
+            # Rebuild the simple Python cache for fast searching
+            material_list_cache = [
+                {'name': item.material_name.lower(), 'original_index': i} 
+                for i, item in enumerate(items)
+            ]
 
-        if rebuild_cache:
-            material_list_cache = []
-            for item_idx, item_prop in enumerate(items):
-                # MODIFICATION START:
-                # We no longer attempt to resolve the material object or call get_custom_icon
-                # within filter_items when rebuilding the cache.
-                # Let draw_item handle all material resolution and icon fetching.
-                # This avoids calling get_custom_icon during this cache rebuild phase,
-                # which was hypothesized to cause issues with the save-to-library logic
-                # by altering material state or hash caches prematurely.
-                material_list_cache.append({
-                    'name': item_prop.material_name,
-                    'uuid': item_prop.material_uuid,
-                    'icon_id': 0,  # Always pass 0; draw_item will resolve the actual icon
-                    'original_index': item_idx
-                })
-                # MODIFICATION END
+        # These will be the final lists we return to Blender.
+        flt_flags = []
+        flt_neworder = []
+    
+        search_term = context.scene.material_search.lower()
 
-        search_term = scene.material_search.lower()
-        filtered_cache_for_draw = []
-        original_indices_for_neworder = []
-
-        if search_term:
+        if search_term and material_list_cache:
+            # Filter the fast Python cache, not the slow CollectionProperty
             for cache_entry in material_list_cache:
-                if search_term in cache_entry['name'].lower():
-                    filtered_cache_for_draw.append(cache_entry)
-                    original_indices_for_neworder.append(cache_entry['original_index'])
-        else:
-            filtered_cache_for_draw = material_list_cache
-            original_indices_for_neworder = [entry['original_index'] for entry in material_list_cache]
+                if search_term in cache_entry['name']:
+                    # If it matches, add its original index to our order list
+                    flt_neworder.append(cache_entry['original_index'])
+    
+        # If there was a search, flt_flags will only show the filtered items.
+        # If there was no search, this part is skipped and Blender shows everything.
+        if flt_neworder:
+            flt_flags = [self.bitflag_filter_item if i in flt_neworder else 0 for i in range(len(items))]
 
-        flt_flags = [0] * len(items)
-        for original_idx in original_indices_for_neworder:
-            if 0 <= original_idx < len(flt_flags):
-                flt_flags[original_idx] = self.bitflag_filter_item
-        flt_neworder = original_indices_for_neworder
-
-        # This cache is used by draw_item to get the icon_id.
-        # Since we now always put 0, draw_item will always do the full lookup.
-        self._cached_items_for_draw = filtered_cache_for_draw
+        # Return the flags and the order to Blender. The list itself is not modified here.
         return flt_flags, flt_neworder
 
-class MATERIALLIST_PT_panel(bpy.types.Panel): # Ensure bpy.types.Panel is inherited
+class MATERIALLIST_PT_panel(bpy.types.Panel):
     bl_idname = "MATERIALLIST_PT_panel"
-    bl_label = "Material List" # Panel label is the same
+    bl_label = "Material List"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "Material List"
@@ -5735,12 +5797,16 @@ class MATERIALLIST_PT_panel(bpy.types.Panel): # Ensure bpy.types.Panel is inheri
         layout = self.layout
         scene = context.scene
 
-        # --- Workspace Mode ---
+        # --- Workspace Mode (FIX: Reverted to original layout) ---
         workspace_box = layout.box()
         row = workspace_box.row(align=True)
         row.label(text="Workspace Mode:", icon='FILE_BLEND')
-        row.label(text=f"{scene.workspace_mode}")
-        workspace_box.operator("materiallist.toggle_workspace_mode", text=f"Switch to {'Editing' if scene.workspace_mode == 'REFERENCE' else 'Reference'}", icon='ARROW_LEFTRIGHT')
+        row.label(text=f"{scene.workspace_mode.title()}") # .title() makes it look cleaner (e.g., "Reference")
+        workspace_box.operator(
+            "materiallist.toggle_workspace_mode",
+            text=f"Switch to {'Editing' if scene.workspace_mode == 'REFERENCE' else 'Reference'}",
+            icon='ARROW_LEFTRIGHT'
+        )
 
         # --- Material Options ---
         options_box = layout.box()
@@ -5751,7 +5817,7 @@ class MATERIALLIST_PT_panel(bpy.types.Panel): # Ensure bpy.types.Panel is inheri
         row.operator("materiallist.duplicate_material", text="Duplicate Selected", icon='DUPLICATE')
 
         row = options_box.row(align=True)
-        row.prop(scene, "hide_mat_materials", toggle=True, text="Hide mat_ Materials")
+        row.prop(scene, "hide_mat_materials", toggle=True)
         row.prop(scene, "material_list_show_only_local", toggle=True)
 
         row = options_box.row(align=True)
@@ -5759,12 +5825,11 @@ class MATERIALLIST_PT_panel(bpy.types.Panel): # Ensure bpy.types.Panel is inheri
         row.operator("materiallist.unassign_mat", icon='PANEL_CLOSE', text="Unassign 'mat_'")
 
         idx = scene.material_list_active_index
-        if 0 <= idx < len(scene.material_list_items):
-            item = scene.material_list_items[idx]
+        if 0 <= idx < len(scene.material_list_view_items):
+            item = scene.material_list_view_items[idx]
             mat_for_make_local_check = get_material_by_uuid(item.material_uuid)
             if mat_for_make_local_check and mat_for_make_local_check.library:
                 options_box.operator("materiallist.make_local", icon='LINKED', text="Make Selected Local")
-
 
         # --- Reference Snapshot ---
         backup_box = layout.box()
@@ -5773,62 +5838,55 @@ class MATERIALLIST_PT_panel(bpy.types.Panel): # Ensure bpy.types.Panel is inheri
 
         # --- Assign to Active Object ---
         assign_box = layout.box()
-        # MODIFICATION START: Moved select_dominant to the top
         assign_box.operator("materiallist.select_dominant", text="Select Dominant Material on Active Object", icon='RESTRICT_SELECT_OFF')
         assign_box.operator("materiallist.add_material_to_slot", icon='PLUS', text="Add Selected to Object Slots")
         assign_box.operator("materiallist.assign_selected_material", icon='BRUSH_DATA', text="Assign Selected to Faces/Object")
-        # MODIFICATION END
 
         # --- Material List Display & Info ---
-        mat_list_box = layout.box() # Assuming this is how you structure it
+        mat_list_box = layout.box()
         row = mat_list_box.row(align=True)
         row.label(text="Materials:", icon='MATERIAL')
         row.prop(scene, "material_list_sort_alpha", text="", toggle=True, icon='SORTALPHA')
         row.operator("materiallist.scroll_to_top", icon='TRIA_UP', text="")
-
+        
         row = mat_list_box.row()
-        row.template_list("MATERIALLIST_UL_materials", "", scene, "material_list_items", scene, "material_list_active_index", rows=10, sort_lock=True)
+        row.template_list("MATERIALLIST_UL_materials", "", scene, "material_list_view_items", scene, "material_list_active_index", rows=10)
 
         sub_row = mat_list_box.row(align=True)
         sub_row.prop(scene, "material_search", text="", icon='VIEWZOOM')
 
-        idx = scene.material_list_active_index # Corrected from active_propname
-        if 0 <= idx < len(scene.material_list_items):
-            item = scene.material_list_items[idx]
-            mat_for_preview = get_material_by_uuid(item.material_uuid) # Use helper
-            info_box_parent = mat_list_box # Default parent for info if no preview
+        idx = scene.material_list_active_index
+        if 0 <= idx < len(scene.material_list_view_items):
+            item = scene.material_list_view_items[idx]
+            mat_for_preview = get_material_by_uuid(item.material_uuid)
+            info_box_parent = mat_list_box
 
             if mat_for_preview:
                 preview_box = mat_list_box.box()
-                if ensure_safe_preview(mat_for_preview): # ensure_safe_preview from your existing code
-                    # This line is key: show_buttons=True (or omitting it, as True is default)
-                    # Blender's template_preview will grey out shape buttons if mat_for_preview.library is set.
-                    preview_box.template_preview(mat_for_preview, show_buttons=True) 
-                else:
-                    preview_box.label(text="Preview not available", icon='ERROR')
-                info_box_parent = preview_box # Info below preview if preview exists
+                preview_box.template_preview(mat_for_preview, show_buttons=True)
+                info_box_parent = preview_box
             else:
-                # Handle case where material for preview isn't found
                 missing_mat_info_box = mat_list_box.box()
                 missing_mat_info_box.label(text=f"Material (Data for '{item.material_name}') not found.", icon='ERROR')
 
-
-            info_box = info_box_parent.box() # Add info box under preview or directly under list
-            info_box.label(text=f"Name: {item.material_name}") 
+            info_box = info_box_parent.box()
+            info_box.label(text=f"Name: {item.material_name}")
             info_box.label(text=f"Source: {'Local' if not item.is_library else 'Library'}")
             info_box.label(text=f"UUID: {item.material_uuid[:8]}...")
-          
-            name_to_check = item.original_name 
-            if name_to_check and not name_to_check.startswith("mat_") and name_to_check != "Material": # Added check for name_to_check
-                count = sum(1 for li in scene.material_list_items if li.original_name == name_to_check)
+            
+            name_to_check = item.original_name
+            if name_to_check and not name_to_check.startswith("mat_") and name_to_check != "Material":
+                count = sum(1 for li in scene.material_list_view_items if li.original_name == name_to_check)
                 if count > 1:
-                    warning_box = info_box.box(); warning_box.alert = True
+                    warning_box = info_box.box()
+                    warning_box.alert = True
                     warning_box.label(text=f"'{name_to_check}' used by {count} materials!", icon='ERROR')
 
         # --- Library Operations ---
         library_ops_box = layout.box()
         library_ops_box.label(text="Library Operations", icon='ASSET_MANAGER')
         library_ops_box.operator("materiallist.integrate_library", text="Integrate External Library", icon='IMPORT')
+        library_ops_box.operator("materiallist.pack_library_textures", text="Pack All Library Data", icon='PACKAGE')
 
         # --- Batch Utilities ---
         project_util_box = layout.box()
@@ -5836,14 +5894,15 @@ class MATERIALLIST_PT_panel(bpy.types.Panel): # Ensure bpy.types.Panel is inheri
         project_util_box.prop(scene, "material_list_external_unpack_dir", text="External Output Folder")
 
         col = project_util_box.column(align=True)
-        col.operator("materiallist.pack_textures_externally", text="Unpack Lib into Folder", icon='EXPORT')
-        col.separator(factor=0.7)
-        col.operator("materiallist.pack_textures_internally", text="Pack into Local Projects", icon='IMPORT')
+        col.operator("materiallist.pack_textures_externally", text="Localise & Unpack to Folder", icon='EXPORT')
+        col.operator("materiallist.pack_textures_internally", text="Localise & Pack Internally", icon='IMPORT')
         project_util_box.operator("materiallist.trim_library", icon='TRASH', text="Trim Library")
+        
+        project_util_box.operator("materiallist.verify_and_fix_textures", icon='TEXTURE_DATA', text="Verify & Repack Textures")
 
         # --- Global Refresh ---
         refresh_box = layout.box()
-        refresh_box.operator("materiallist.refresh_material_list", text="Refresh List", icon='FILE_REFRESH')
+        refresh_box.operator("materiallist.refresh_material_list", text="Refresh List (Full)", icon='FILE_REFRESH')
 
 # --------------------------
 # Registration Data (Ensure all classes and properties are listed)
@@ -5880,30 +5939,33 @@ classes = (
     MATERIALLIST_OT_trim_library,
     MATERIALLIST_OT_select_dominant,
     MATERIALLIST_OT_run_localisation_worker,
-    MATERIALLIST_OT_duplicate_material, # New
-    MATERIALLIST_OT_pack_library_textures, # New
-    MATERIALLIST_OT_scroll_to_top, # New
-    MATERIALLIST_OT_pack_textures_externally,   # New
-    MATERIALLIST_OT_pack_textures_internally, # New
+    MATERIALLIST_OT_duplicate_material,
+    MATERIALLIST_OT_pack_library_textures,
+    MATERIALLIST_OT_scroll_to_top,
+    MATERIALLIST_OT_pack_textures_externally,
+    MATERIALLIST_OT_pack_textures_internally,
+    MATERIALLIST_OT_verify_and_fix_textures, # MODIFICATION: Added the missing operator class
 )
 
 scene_props = [
-    ("material_list_items", bpy.props.CollectionProperty(type=MaterialListItem)),
+    # The full, hidden data store. Populated ONCE on load/refresh.
+    ("material_list_full_items", bpy.props.CollectionProperty(type=MaterialListItem)),
+    
+    # The small, fast list the UI will actually display.
+    ("material_list_view_items", bpy.props.CollectionProperty(type=MaterialListItem)),
+    
+    # The active index now points to the VIEW list.
     ("material_list_active_index", bpy.props.IntProperty(name="Active Index", default=0, min=0, update=update_material_list_active_index)),
-    ("material_search", bpy.props.StringProperty(name="Search Materials", description="Search material names", default="", update=lambda self, context: None)),
-    ("hide_mat_materials", bpy.props.BoolProperty(name="Hide Default Materials", description="Hide materials starting with 'mat_'", default=False, update=lambda self, context: populate_material_list(context.scene))),
+    
+    # All filter properties MUST call our new update function.
+    ("material_search", bpy.props.StringProperty(name="Search Materials", default="", update=update_material_list_view)),
+    ("hide_mat_materials", bpy.props.BoolProperty(name="Hide Default Materials", default=False, update=update_material_list_view)),
+    ("material_list_sort_alpha", bpy.props.BoolProperty(name="Sort Alphabetically", default=False, update=populate_material_list)), # Sort changes the full list
+    ("material_list_show_only_local", bpy.props.BoolProperty(name="Show Only Local/Used", default=False, update=update_material_list_view)),
+
+    # Other properties
     ("workspace_mode", bpy.props.EnumProperty(name="Workspace Mode", items=[('REFERENCE', "Reference", "Reference configuration"), ('EDITING', "Editing", "Editing configuration")], default='REFERENCE', update=update_workspace_mode)),
-    ("mat_materials_unassigned", bpy.props.BoolProperty(name="Unassign mat_ Materials", description="Toggle backup/restore of mat_ assignments", default=False)),
-    ("material_list", bpy.props.PointerProperty(type=MaterialListProperties)),
-    ("library_materials", bpy.props.CollectionProperty(type=LibraryMaterialEntry)),
-    ("material_list_sort_alpha", bpy.props.BoolProperty(name="Sort Alphabetically", description="Sort the material list alphabetically by display name instead of by recency", default=False, update=lambda self, context: populate_material_list(context.scene))),
-    ("material_list_show_only_local", bpy.props.BoolProperty(name="Show Only Local/Used", description="Show only local materials and linked materials currently assigned to objects in the scene", default=False, update=lambda self, context: populate_material_list(context.scene))),
-    ("material_list_external_unpack_dir", bpy.props.StringProperty(
-        name="External Output Folder",  # This name is used as the label by default if text isn't specified in layout.prop
-        description="Directory to save external textures. Use // for paths relative to the .blend file.",
-        subtype='DIR_PATH',          # This makes it use the directory explorer
-        default="//textures_external/" # A sensible default relative path
-    )),
+    ("material_list_external_unpack_dir", bpy.props.StringProperty(name="External Output Folder", description="Directory to save external textures.", subtype='DIR_PATH', default="//textures_external/")),
 ]
 
 handler_pairs = [
@@ -5922,35 +5984,27 @@ def deferred_safe_init():
         if 'load_material_names' in globals() and callable(load_material_names):
             load_material_names()
 
-        # Ensure material library and DB are ready first
-        # This also creates _ADDON_DATA_ROOT and THUMBNAIL_FOLDER if they don't exist.
         if not ensure_material_library():
             print("[DEBUG] ensure_material_library failed in deferred init. Critical paths might be missing.")
-            # Depending on desired behavior, you might want to return or handle this.
-            # For now, we proceed to try ensuring the icon template, but it might fail if paths aren't set.
         else:
             print("[Deferred Init] Material library and database ensured/initialized.")
 
-        # MOVED ensure_icon_template CALL HERE:
-        # This function relies on ICON_TEMPLATE_FILE which is derived from LIBRARY_FOLDER,
-        # which in turn is _ADDON_DATA_ROOT, set up by get_material_manager_addon_data_dir
-        # and ensured by ensure_material_library.
         if 'ensure_icon_template' in globals() and callable(ensure_icon_template):
             print("[Deferred Init] Ensuring icon generation template...")
-            if not ensure_icon_template(): # This function attempts to create the .blend file
+            if not ensure_icon_template():
                 print("[Deferred Init] WARNING: Failed to ensure icon generation template. Thumbnail generation may fail.")
             else:
                 print("[Deferred Init] Icon generation template ensured successfully.")
         else:
             print("[Deferred Init] ensure_icon_template function not found. Cannot create/verify template file.")
 
-        # debug_library_contents() # Optional, for checking material_library.blend
-
-        update_material_library(force_update=True) # Queues library update if necessary
+        update_material_library(force_update=True)
 
         scene = get_first_scene()
         if scene:
-            populate_material_list(scene) # Populates UI list (now excludes "mat_" by default if toggle is on)
+            # --- THIS IS THE CORRECTED LINE ---
+            # We must pass bpy.context along with the scene.
+            populate_material_list(scene, bpy.context) 
 
             # Backup initial state for workspace modes
             reference_backup.clear()
@@ -5964,20 +6018,16 @@ def deferred_safe_init():
                 except Exception as op_error:
                     print(f"Error invoking poll_material_changes: {op_error}")
 
-        # Initialize material properties (UUIDs, datablock names for local non-"mat_" materials)
-        # This is crucial after initial file load and potential linking of library materials.
         if 'initialize_material_properties' in globals() and callable(initialize_material_properties):
             initialize_material_properties()
         else:
             print("[Deferred Init] ERROR: initialize_material_properties function not found!")
 
-        # Initial call to update thumbnails after everything is set up
         if 'update_material_thumbnails' in globals() and callable(update_material_thumbnails):
             print("[Deferred Init] Triggering initial thumbnail update cycle.")
             update_material_thumbnails()
         else:
             print("[Deferred Init] update_material_thumbnails function not found.")
-
 
     except Exception as e:
         print(f"[DEBUG] Exception in deferred_safe_init: {e}")
@@ -6197,6 +6247,8 @@ def unregister():
     global g_thumbnail_process_ongoing, g_material_creation_timestamp_at_process_start
     global g_tasks_for_current_run, g_library_update_pending, g_current_run_task_hashes_being_processed
     global list_version
+    # --- ADD THE NEW GLOBAL TO THE LIST ---
+    global g_uuid_to_mat_map
 
     print("[Unregister] MaterialList Addon Unregistering...")
 
@@ -6235,8 +6287,6 @@ def unregister():
             print(f"  Worker {worker_idx + 1}: Process already terminated with exit code {poll_result}.")
             continue
             
-        # --- MODIFICATION START ---
-        # Per user request: bypass graceful terminate, wait briefly, then kill.
         try:
             pid = getattr(process, 'pid', 'Unknown')
             print(f"  Worker {worker_idx + 1}: Delaying 0.1s before killing process (PID: {pid})...")
@@ -6252,7 +6302,6 @@ def unregister():
             print(f"  Worker {worker_idx + 1}: Process object missing expected attributes for kill: {e_attr}")
         except Exception as e_kill_general:
             print(f"  Worker {worker_idx + 1}: Unexpected error during kill attempt: {e_kill_general}")
-        # --- MODIFICATION END ---
 
     thumbnail_worker_pool.clear()
     print(f"[Unregister] Worker pool cleared. Processing task queue...")
@@ -6348,6 +6397,7 @@ def unregister():
     thumbnail_generation_scheduled.clear()
     g_tasks_for_current_run.clear()
     g_current_run_task_hashes_being_processed.clear()
+    g_uuid_to_mat_map.clear()
 
     if 'reference_backup' in globals() and isinstance(reference_backup, dict): reference_backup.clear()
     if 'editing_backup' in globals() and isinstance(editing_backup, dict): editing_backup.clear()
