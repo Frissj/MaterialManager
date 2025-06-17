@@ -271,11 +271,11 @@ def save_material_names():
 
 def load_material_hashes(blend_filepath):
     """
-    --- MODIFIED: Now loads hashes only for a specific .blend file. ---
-    This populates the global `material_hashes` dictionary for the current session.
+    --- MODIFIED: Now loads/updates hashes for a specific .blend file. ---
+    This ADDS to or UPDATES the global `material_hashes` dictionary.
+    It no longer clears the cache itself.
     """
-    global material_hashes
-    material_hashes = {}  # Clear the global cache for the new file context
+    global material_hashes # We are modifying the global dictionary
 
     if not blend_filepath:
         return
@@ -285,10 +285,14 @@ def load_material_hashes(blend_filepath):
             c = conn.cursor()
             # Query the new, file-specific table
             c.execute("SELECT material_uuid, hash FROM material_hash_cache WHERE blend_filepath = ?", (blend_filepath,))
-            material_hashes = {row[0]: row[1] for row in c.fetchall()}
+            
+            # Update the existing dictionary with the loaded data.
+            # This allows us to accumulate hashes from multiple files.
+            loaded_data = {row[0]: row[1] for row in c.fetchall()}
+            material_hashes.update(loaded_data)
+            
     except Exception as e:
         print(f"[MaterialList] Error loading material hashes for {os.path.basename(blend_filepath)}: {e}")
-        material_hashes = {}
 
 def save_material_hashes(blend_filepath, hashes_to_save):
     """
@@ -2174,24 +2178,28 @@ def delayed_load_post():
         print("[DEBUG] delayed_load_post: No scene found, aborting.")
         return None
 
-    # --- FIX: Reset the active index on file load ---
-    # This prevents the UI from re-selecting the material that was active when the file was last saved.
+    # Reset the active index on file load
     scene.material_list_active_index = 0
     print("[DEBUG delayed_load_post] Active index reset to 0 to prevent re-selection on load.")
-    # --- END FIX ---
 
     print("[DEBUG delayed_load_post] Loading names and hashes for current file...")
     load_material_names()
     
-    # --- MODIFICATION: Use new file-specific hash loader ---
+    # --- FIX: Preload hashes for BOTH project and library ---
+    # 1. Explicitly clear the in-memory hash cache at the start of the load process.
+    material_hashes.clear()
+    
+    # 2. Load hashes for the current project file.
     if bpy.data.filepath:
+        print("[Delayed Load] Loading hashes for current project file...")
         load_material_hashes(bpy.data.filepath)
-    else:
-        # Clear hashes if the file is unsaved and we are starting fresh
-        material_hashes.clear()
-    # --- END MODIFICATION ---
+    
+    # 3. Now, ALSO load the hashes from the central library, adding them to the same cache.
+    if LIBRARY_FILE and os.path.exists(LIBRARY_FILE):
+        print("[Delayed Load] Pre-loading hashes from central library file...")
+        load_material_hashes(LIBRARY_FILE)
+    # --- END FIX ---
 
-    # --- FIX START ---
     # Populate the in-memory timestamp cache from the database on file load.
     print("[Delayed Load] Populating in-memory timestamp cache from DB...")
     try:
@@ -2209,7 +2217,6 @@ def delayed_load_post():
     except Exception as e_ts_load:
         print(f"[Delayed Load] CRITICAL Error loading timestamps into memory cache: {e_ts_load}")
         g_material_timestamps = {} # Ensure it's a dict on failure
-    # --- FIX END ---
 
     with hash_lock:
         global_hash_cache.clear()
@@ -2219,7 +2226,7 @@ def delayed_load_post():
         if not mat.library:
             try: mat["hash_dirty"] = False
             except Exception: pass
-    print(f"[DEBUG delayed_load_post] Loaded {len(material_names)} names, {len(material_hashes)} hashes for this file.")
+    print(f"[DEBUG delayed_load_post] Loaded {len(material_names)} names, {len(material_hashes)} total hashes into memory.")
 
     print("[Delayed Load] Managing preview icon cache...")
     if custom_icons is None:
@@ -5816,9 +5823,19 @@ class MATERIALLIST_UL_materials(UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         global g_uuid_to_mat_map
         
+        # --- FIX: Ensure the map is populated before drawing ---
+        # This prevents errors during the brief race condition on file load where the UI
+        # tries to draw before the main populate_material_list function has run.
+        if not g_uuid_to_mat_map or item.material_uuid not in g_uuid_to_mat_map:
+            # A quick rebuild of the map if it's empty or the item is missing.
+            g_uuid_to_mat_map = {get_material_uuid(mat): mat for mat in bpy.data.materials if mat}
+        # --- END FIX ---
+        
         mat_for_icon_lookup = g_uuid_to_mat_map.get(item.material_uuid)
         
         if not mat_for_icon_lookup:
+            # This print will now only happen if a material is truly missing/corrupt,
+            # not because of a timing issue.
             print(f"[DEBUG DrawItem] FAILED to find material for UUID '{item.material_uuid}' in g_uuid_to_mat_map. List may be out of sync.")
 
         icon_val = 0
