@@ -6002,7 +6002,7 @@ class MATERIALLIST_PT_panel(bpy.types.Panel):
         library_ops_box = layout.box()
         library_ops_box.label(text="Library Operations", icon='ASSET_MANAGER')
         library_ops_box.operator("materiallist.integrate_library", text="Integrate External Library", icon='IMPORT')
-        library_ops_box.operator("materiallist.pack_library_textures", text="Pack All Library Data", icon='PACKAGE')
+        # library_ops_box.operator("materiallist.pack_library_textures", text="Pack All Library Data", icon='PACKAGE')
 
         # --- Batch Utilities ---
         project_util_box = layout.box()
@@ -6014,18 +6014,18 @@ class MATERIALLIST_PT_panel(bpy.types.Panel):
         col.operator("materiallist.pack_textures_internally", text="Localise & Pack Internally", icon='IMPORT')
         project_util_box.operator("materiallist.trim_library", icon='TRASH', text="Trim Library")
         
-        project_util_box.operator("materiallist.verify_and_fix_textures", icon='TEXTURE_DATA', text="Verify & Repack Textures")
+        # project_util_box.operator("materiallist.verify_and_fix_textures", icon='TEXTURE_DATA', text="Verify & Repack Textures")
 
         # --- Global Refresh ---
         refresh_box = layout.box()
         refresh_box.operator("materiallist.refresh_material_list", text="Refresh List (Full)", icon='FILE_REFRESH')
 
-        debug_box = layout.box()
-        debug_box.label(text="Debug Tools", icon='SCRIPTPLUGINS')
+        # debug_box = layout.box()
+        # debug_box.label(text="Debug Tools", icon='SCRIPTPLUGINS')
         
-        # Add the button for our new operator
-        debug_box.operator("materiallist.debug_check_selection", icon='GHOST_ENABLED')
-        # --- MODIFICATION END ---
+        # # Add the button for our new operator
+        # debug_box.operator("materiallist.debug_check_selection", icon='GHOST_ENABLED')
+        # # --- MODIFICATION END ---
 
 # --------------------------
 # Registration Data (Ensure all classes and properties are listed)
