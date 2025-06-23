@@ -90,6 +90,7 @@ g_thumbnails_loaded_in_current_UMT_run = False # Add this new global
 g_matlist_transient_tasks_for_post_save = []
 g_used_uuids_cache = set()
 g_used_uuids_dirty = True
+g_save_handler_start_time = 0.0
 
 THUMBNAIL_SIZE = 128
 VISIBLE_ITEMS = 30
@@ -1790,6 +1791,10 @@ def initialize_db_connection_pool():
 def save_handler(dummy):
     global materials_modified, material_names, material_hashes
     global g_matlist_transient_tasks_for_post_save
+    global g_save_handler_start_time # <<< MODIFICATION: Access global
+
+    # <<< MODIFICATION: Start the timer >>>
+    g_save_handler_start_time = time.time()
 
     if getattr(bpy.context.window_manager, 'matlist_save_handler_processed', False):
         return
@@ -1802,7 +1807,7 @@ def save_handler(dummy):
 
     needs_metadata_update = False
     needs_name_db_save = False
-    timestamp_updated_for_recency = False # Flag is now a misnomer, but signals a sort change
+    timestamp_updated_for_recency = False # This flag signals a sort change
     actual_material_modifications_this_run = False 
 
     if not material_names and bpy.data.filepath:
@@ -1857,6 +1862,7 @@ def save_handler(dummy):
 
     phase2_start_time = time.time()
     hashes_to_save_to_db = {}
+    uuids_to_promote_for_recency = [] 
     hashes_actually_changed_in_db = False
     deleted_old_thumb_count = 0
     recalculated_hash_count = 0
@@ -1893,9 +1899,8 @@ def save_handler(dummy):
             actual_material_modifications_this_run = True 
             hashes_to_save_to_db[actual_uuid_for_hash_storage] = current_hash_to_compare_with_db
             
-            promote_material_by_recency_counter(actual_uuid_for_hash_storage)
+            uuids_to_promote_for_recency.append(actual_uuid_for_hash_storage)
             
-            timestamp_updated_for_recency = True
             if db_stored_hash_for_this_uuid is not None:
                 hashes_actually_changed_in_db = True 
                 if not mat.library:
@@ -1932,7 +1937,29 @@ def save_handler(dummy):
             try: mat["hash_dirty"] = False
             except Exception: pass
 
-    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] Phase 2 (Hashes/Sorting) took {time.time() - phase2_start_time:.4f}s. Recalculated: {recalculated_hash_count} hashes. Deleted: {deleted_old_thumb_count} old thumbs.")
+    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] Phase 2 (Hashes) took {time.time() - phase2_start_time:.4f}s. Recalculated: {recalculated_hash_count} hashes. Deleted: {deleted_old_thumb_count} old thumbs.")
+    
+    if uuids_to_promote_for_recency:
+        db_write_sort_order_start_time = time.time()
+        try:
+            with get_db_connection() as conn:
+                c = conn.cursor()
+                c.execute("SELECT COALESCE(MAX(sort_index), 0) FROM material_order")
+                max_index = c.fetchone()[0]
+                
+                unique_uuids_to_promote = list(dict.fromkeys(uuids_to_promote_for_recency))
+                
+                update_data = []
+                for i, uuid_str in enumerate(unique_uuids_to_promote):
+                    update_data.append((uuid_str, max_index + 1 + i))
+                
+                c.executemany("INSERT OR REPLACE INTO material_order (uuid, sort_index) VALUES (?, ?)", update_data)
+                conn.commit()
+                print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] Batched sort order update for {len(unique_uuids_to_promote)} materials took {time.time() - db_write_sort_order_start_time:.4f}s.")
+                timestamp_updated_for_recency = True
+        except Exception as e:
+            print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] BATCHED sort order update FAILED: {e}")
+            traceback.print_exc()
 
     db_write_start_time = time.time()
     saved_names_this_run = False
@@ -2079,12 +2106,9 @@ def load_post_handler(dummy):
             process = worker_info.get('process')
             if process and hasattr(process, 'poll') and process.poll() is None:
                 try:
-                    # print(f"  Terminating worker PID: {process.pid} for batch: {worker_info.get('hash_value', 'N/A_BATCH')[:8]}")
-                    process.terminate()
-                    process.wait(timeout=0.5) 
-                    if process.poll() is None:
-                        process.kill()
-                        process.wait(timeout=0.2)
+                    # <<< MODIFICATION: Replace terminate/kill logic >>>
+                    time.sleep(0.1)
+                    process.kill()
                 except Exception as e_term:
                     print(f"  Error terminating worker (PID: {process.pid if hasattr(process,'pid') else 'N/A'}): {e_term}")
         thumbnail_worker_pool.clear()
@@ -2119,7 +2143,7 @@ def load_post_handler(dummy):
 
 
     if not bpy.app.timers.is_registered(delayed_load_post):
-        bpy.app.timers.register(delayed_load_post, first_interval=0.3) 
+        bpy.app.timers.register(delayed_load_post, first_interval=0.3)
 
 def file_changed_handler(scene): # Unchanged
     try:
@@ -2541,11 +2565,9 @@ class MATERIALLIST_OT_pack_library_textures(Operator):
                 context.window_manager.event_timer_remove(self._timer)
                 self._timer = None
             if self._proc and self._proc.poll() is None:
-                self._proc.terminate()
-                try:
-                    self._proc.wait(timeout=1.0) # Give it a moment to terminate
-                except subprocess.TimeoutExpired:
-                    self._proc.kill() # Force kill if necessary
+                # <<< MODIFICATION: Replace terminate/kill logic >>>
+                time.sleep(0.1)
+                self._proc.kill()
                 self._proc = None
                 self.report({'INFO'}, "Library packing cancelled by user.")
             self._cleanup_temp_dir()
@@ -4672,31 +4694,34 @@ def _dispatch_collected_tasks():
 
       
       
+      
 def finalize_thumbnail_run():
     global g_thumbnail_process_ongoing, g_material_creation_timestamp_at_process_start
     global g_library_update_pending, g_tasks_for_current_run, g_current_run_task_hashes_being_processed
     global g_thumbnails_loaded_in_current_UMT_run
+    global g_save_handler_start_time # <<< MODIFICATION: Access global
 
     print("[Finalize Thumbnail Run] Thumbnail generation/loading run completed.")
     g_current_run_task_hashes_being_processed.clear()
     g_thumbnail_process_ongoing = False 
     g_material_creation_timestamp_at_process_start = 0.0
 
-    # If the background process successfully loaded any new thumbnails into Blender's
-    # preview cache, we need to force a final redraw to make them appear in the UI.
+    # <<< MODIFICATION: Add timing log >>>
+    if g_save_handler_start_time > 0:
+        duration = time.time() - g_save_handler_start_time
+        print(f"[THUMBNAIL PROCESS COMPLETE] Total time from save to thumbnail completion: {duration:.2f} seconds.")
+        # Reset the timer for the next run
+        g_save_handler_start_time = 0.0
+
     if g_thumbnails_loaded_in_current_UMT_run:
         print("[Finalize Thumbnail Run] New thumbnails were loaded. Forcing UI redraw.")
         force_redraw()
         
-        # We also increment the list_version to ensure that if the user searches,
-        # the filter_items function knows it might need to re-evaluate against the now-populated cache.
-        # This is a lightweight way to signal a change without a full, slow repopulation.
         global list_version
         list_version += 1
     else:
         print("[Finalize Thumbnail Run] No new thumbnails were loaded in this run.")
     
-    # Process any deferred library updates.
     if g_library_update_pending:
         print("[Finalize Thumbnail Run] Processing deferred library update.")
         g_library_update_pending = False 
@@ -4716,39 +4741,35 @@ def ensure_thumbnail_queue_processor_running():
             thumbnail_monitor_timer_active = True
             # print("[ThumbMan] Thumbnail queue processor timer already registered but flag was false.")
 
+      
 def process_thumbnail_tasks():
     global thumbnail_worker_pool, g_tasks_for_current_run, thumbnail_task_queue
     global list_version, thumbnail_generation_scheduled, thumbnail_monitor_timer_active
     global custom_icons, _ADDON_DATA_ROOT, THUMBNAIL_SIZE, BACKGROUND_WORKER_PY
     global THUMBNAIL_BATCH_SIZE_PER_WORKER, THUMBNAIL_MAX_RETRIES
     global g_thumbnail_process_ongoing, g_dispatch_lock, MAX_CONCURRENT_THUMBNAIL_WORKERS
-    global g_thumbnails_loaded_in_current_UMT_run # Ensure it's global here
+    global g_thumbnails_loaded_in_current_UMT_run 
 
-    # This per-tick flag is not strictly necessary anymore if g_thumbnails_loaded_in_current_UMT_run
-    # correctly gates the populate in finalize_thumbnail_run.
-    # However, it doesn't hurt to keep it if you have other logic that might use it for this specific tick.
     any_successful_load_this_cycle = False 
 
     if not g_thumbnail_process_ongoing and thumbnail_task_queue.empty() and not thumbnail_worker_pool and not g_tasks_for_current_run :
-        if thumbnail_monitor_timer_active: # Only try to unregister if it was active
-            thumbnail_monitor_timer_active = False # Mark as inactive before returning None
-            # print("[ThumbMan Timer] All clear, stopping timer.") # Optional
-            return None # Stop timer
-        # If not active and all clear, it's already stopped or was never started for this state.
+        if thumbnail_monitor_timer_active: 
+            thumbnail_monitor_timer_active = False 
+            return None 
         return None 
     
-    if g_thumbnail_process_ongoing and not thumbnail_monitor_timer_active: # If a run is ongoing, timer should be active
+    if g_thumbnail_process_ongoing and not thumbnail_monitor_timer_active:
         ensure_thumbnail_queue_processor_running()
 
     try:
-        if not _verify_icon_template(): # _verify_icon_template handles its own logs
+        if not _verify_icon_template(): 
             print("[ThumbMan Timer] Icon template verification failed. Retrying check soon.", file=sys.stderr, flush=True)
-            thumbnail_monitor_timer_active = True # Ensure timer continues
-            return 0.5 # Retry template check shortly
+            thumbnail_monitor_timer_active = True 
+            return 0.5 
 
         completed_worker_indices_this_cycle = []
 
-        for idx, worker_info in enumerate(list(thumbnail_worker_pool)): # Iterate copy
+        for idx, worker_info in enumerate(list(thumbnail_worker_pool)): 
             process = worker_info.get('process')
             original_batch_tasks = worker_info.get('batched_tasks_in_worker', [])
             batch_id_for_log = "UnknownBatch"
@@ -4756,7 +4777,6 @@ def process_thumbnail_tasks():
                 batch_id_for_log = original_batch_tasks[0]['hash_value'][:8]
             
             if not process:
-                # print(f"  [ThumbMan Timer] Worker {idx} (Batch {batch_id_for_log}) had no process. Marking for removal.") # Optional
                 completed_worker_indices_this_cycle.append(idx)
                 continue
 
@@ -4770,15 +4790,14 @@ def process_thumbnail_tasks():
                         try:
                             if os.path.getsize(task.get('thumb_path', '')) > 0 :
                                 existing_thumbs_in_batch_on_disk += 1
-                        except OSError: pass # File might disappear between exists and getsize
+                        except OSError: pass 
 
-            if exit_code is not None: # Process has finished
-                # print(f"  [ThumbMan Timer] Worker {idx} (Batch {batch_id_for_log}, PID: {getattr(process,'pid','N/A')}) finished with code {exit_code}. Processing results.")
+            if exit_code is not None: 
                 completed_worker_indices_this_cycle.append(idx)
             
                 stdout_str, stderr_str = "", ""
                 try:
-                    stdout_bytes, stderr_bytes = process.communicate(timeout=10) # Increased timeout
+                    stdout_bytes, stderr_bytes = process.communicate(timeout=10) 
                     stdout_str = stdout_bytes.decode('utf-8', errors='replace').strip() if stdout_bytes else ""
                     stderr_str = stderr_bytes.decode('utf-8', errors='replace').strip() if stderr_bytes else ""
                 except subprocess.TimeoutExpired:
@@ -4790,8 +4809,6 @@ def process_thumbnail_tasks():
 
                 if stderr_str:
                     print(f"  [WORKER STDERR - FINISHED] W{idx} (Batch:{batch_id_for_log}):\n{stderr_str}", file=sys.stderr, flush=True)
-                # if stdout_str: # Optional: print stdout too
-                #    print(f"  [WORKER STDOUT - FINISHED] W{idx} (Batch:{batch_id_for_log}):\n{stdout_str}", flush=True)
 
                 parsed_worker_json_results = []
                 if exit_code == 0 and stdout_str: 
@@ -4799,7 +4816,7 @@ def process_thumbnail_tasks():
                     try:
                         lines = stdout_str.strip().splitlines()
                         if lines:
-                            for line in reversed(lines): # Try to find the last JSON line
+                            for line in reversed(lines): 
                                 line_stripped = line.strip()
                                 if (line_stripped.startswith('{') and line_stripped.endswith('}')) or \
                                    (line_stripped.startswith('[') and line_stripped.endswith(']')):
@@ -4808,8 +4825,7 @@ def process_thumbnail_tasks():
                             json_data = json.loads(json_line_to_parse)
                             if isinstance(json_data, dict) and "results" in json_data and isinstance(json_data["results"], list):
                                 parsed_worker_json_results = json_data["results"]
-                                # print(f"    [Worker {idx} JSON] Successfully parsed {len(parsed_worker_json_results)} results.")
-                        # else: print(f"    [Worker {idx} JSON] No valid JSON line found in stdout.")
+                        
                     except json.JSONDecodeError as e_json:
                         print(f"    [Worker {idx} JSON] JSONDecodeError: {e_json}. Stdout was:\n{stdout_str}", file=sys.stderr, flush=True)
                     except Exception as e_json_other:
@@ -4824,12 +4840,10 @@ def process_thumbnail_tasks():
                         if original_task:
                             tasks_to_evaluate_after_worker.append({
                                 "task_data": original_task,
-                                "worker_status": res_item.get("status", "failure"), # Default to failure if status missing
+                                "worker_status": res_item.get("status", "failure"), 
                                 "worker_reason": res_item.get("reason", "no_reason_in_json")
                             })
-                        # else: print(f"    [Task Eval] Could not find original task for hash {hash_val_from_res} from JSON result.")
                 else: 
-                    # print(f"    [Task Eval] No parsed JSON results, or worker exit code non-zero ({exit_code}). Evaluating all tasks in batch as potentially failed by worker.")
                     for task_in_batch in original_batch_tasks:
                         tasks_to_evaluate_after_worker.append({
                             "task_data": task_in_batch,
@@ -4840,10 +4854,7 @@ def process_thumbnail_tasks():
                 for eval_item in tasks_to_evaluate_after_worker:
                     task_data = eval_item["task_data"]; hash_val = task_data['hash_value']; thumb_p = task_data['thumb_path']; retries_done = task_data.get('retries', 0)
                     worker_reported_status = eval_item["worker_status"]
-                    # worker_reason = eval_item["worker_reason"] # For logging if needed
-
-                    # print(f"      [Task Eval] Hash: {hash_val[:8]}, Worker Status: {worker_reported_status}, Reason: {worker_reason}, Retries: {retries_done}")
-
+                    
                     thumbnail_pending_on_disk_check.pop(hash_val, None) 
                     g_current_run_task_hashes_being_processed.discard(hash_val)
 
@@ -4856,12 +4867,11 @@ def process_thumbnail_tasks():
                             print(f"        [Task Eval - File Stat Error post-worker] Hash {hash_val[:8]} for '{thumb_p}': {e_stat_after_worker}", flush=True)
                     
                     loaded_to_blender_properly_this_task = False
-                    if file_ok_on_disk and worker_reported_status == "success": # Trust worker success if file is good
+                    if file_ok_on_disk and worker_reported_status == "success": 
                         if custom_icons is not None:
                             try:
-                                time.sleep(0.05) # Small delay, might help with file system race conditions
-                                if hash_val in custom_icons: # Remove if already exists from a previous failed load or other reason
-                                    # print(f"          [Task Eval - Cache Load] Removing pre-existing key {hash_val[:8]} before loading from disk.")
+                                time.sleep(0.05) 
+                                if hash_val in custom_icons: 
                                     del custom_icons[hash_val]
                                 
                                 custom_icons.load(hash_val, thumb_p, 'IMAGE')
@@ -4869,78 +4879,63 @@ def process_thumbnail_tasks():
 
                                 if final_entry_in_cache and hasattr(final_entry_in_cache, 'icon_id') and final_entry_in_cache.icon_id > 0:
                                     actual_w, actual_h = final_entry_in_cache.icon_size
-                                    if actual_w <= 1 or actual_h <= 1: # Very lenient check for "zero" size
+                                    if actual_w <= 1 or actual_h <= 1: 
                                         print(f"        [Task Eval - Cache Load VERY BAD SIZE] Hash {hash_val[:8]}: Loaded ID {final_entry_in_cache.icon_id} but size {actual_w}x{actual_h}. Invalidating & deleting file.", flush=True)
-                                        if hash_val in custom_icons: del custom_icons[hash_val] # Remove bad entry
+                                        if hash_val in custom_icons: del custom_icons[hash_val] 
                                         if os.path.exists(thumb_p):
                                             try: os.remove(thumb_p)
                                             except Exception as e_del_bad_thumb: print(f"          Error deleting bad thumb file {thumb_p}: {e_del_bad_thumb}", flush=True)
-                                    else: # Size is acceptable (even if smaller than THUMBNAIL_SIZE, as long as not zero)
-                                        # if actual_w < THUMBNAIL_SIZE or actual_h < THUMBNAIL_SIZE:
-                                            # print(f"        [Task Eval - Cache Load SMALLER SIZE] Hash {hash_val[:8]}: Loaded ID {final_entry_in_cache.icon_id}, size {actual_w}x{actual_h}. Accepting.")
+                                    else: 
                                         loaded_to_blender_properly_this_task = True
-                                        any_successful_load_this_cycle = True # For per-tick redraw, if re-enabled
-                                        g_thumbnails_loaded_in_current_UMT_run = True # <<< SET GLOBAL FLAG
+                                        any_successful_load_this_cycle = True 
+                                        g_thumbnails_loaded_in_current_UMT_run = True 
                                         list_version +=1 
-                                # else: print(f"        [Task Eval - Cache Load FAIL] Hash {hash_val[:8]}: Load into custom_icons failed or resulted in invalid ID.")
                             except RuntimeError as e_runtime_load_after_worker:
                                 print(f"        [Task Eval - Cache Load RUNTIME ERROR] Hash {hash_val[:8]} for '{thumb_p}': {e_runtime_load_after_worker}. Deleting potentially corrupt file.", file=sys.stderr, flush=True)
-                                if os.path.exists(thumb_p): os.remove(thumb_p) # Remove if load failed badly
+                                if os.path.exists(thumb_p): os.remove(thumb_p) 
                             except Exception as e_load_exc_after_worker:
                                 print(f"        [Task Eval - Cache Load EXCEPTION] Hash {hash_val[:8]} for '{thumb_p}': {e_load_exc_after_worker}. Deleting potentially corrupt file.", file=sys.stderr, flush=True)
                                 if os.path.exists(thumb_p): os.remove(thumb_p)
-                        # else: print(f"        [Task Eval] custom_icons is None. Cannot load {hash_val[:8]} to Blender cache.")
-                    # else: print(f"        [Task Eval] File for hash {hash_val[:8]} not OK on disk OR worker reported failure (Status: {worker_reported_status}). Will not attempt Blender load.")
                     
                     if not loaded_to_blender_properly_this_task:
-                        # print(f"      [Task Eval - FAILURE/RETRY] Hash {hash_val[:8]} not loaded properly.")
-                        thumbnail_generation_scheduled.pop(hash_val, None) # Remove from main schedule if it failed
+                        thumbnail_generation_scheduled.pop(hash_val, None) 
                         if retries_done < THUMBNAIL_MAX_RETRIES:
-                            # print(f"        Retrying task for hash {hash_val[:8]} (Attempt {retries_done + 1}/{THUMBNAIL_MAX_RETRIES}).")
                             task_for_retry = task_data.copy(); task_for_retry['retries'] = retries_done + 1
-                            with g_dispatch_lock: # Ensure thread-safe append if other parts could modify g_tasks_for_current_run
+                            with g_dispatch_lock: 
                                 g_tasks_for_current_run.append(task_for_retry)
-                                thumbnail_generation_scheduled[hash_val] = True # Add back to schedule for this new attempt
+                                thumbnail_generation_scheduled[hash_val] = True 
                         else:
                             print(f"        [Task Eval - MAX RETRIES] Hash {hash_val[:8]} reached max retries ({THUMBNAIL_MAX_RETRIES}). Giving up on this hash for this run.")
-                            if os.path.exists(thumb_p) and file_ok_on_disk : # If a file exists but couldn't be loaded, delete it
+                            if os.path.exists(thumb_p) and file_ok_on_disk : 
                                 print(f"          Deleting problematic thumbnail file '{thumb_p}' after max retries.")
                                 try: os.remove(thumb_p)
                                 except Exception as e_del_max_retry_file: print(f"            Error deleting file {thumb_p}: {e_del_max_retry_file}")
-                    else: # Successfully loaded
-                        # print(f"      [Task Eval - SUCCESS] Hash {hash_val[:8]} loaded into Blender.")
-                        thumbnail_generation_scheduled.pop(hash_val, None) # Successfully processed, remove from schedule
+                    else: 
+                        thumbnail_generation_scheduled.pop(hash_val, None) 
 
             elif exit_code is None: # Worker is still running
                 if existing_thumbs_in_batch_on_disk == total_thumbs_in_batch and total_thumbs_in_batch > 0:
-                    # This case indicates all thumbnails for this worker's batch *already exist on disk and are valid*.
-                    # The worker might be stuck or redundant.
                     print(f"  [ThumbMan Timer] Worker {idx} (Batch {batch_id_for_log}, PID: {getattr(process, 'pid', 'N/A')}): WARNING - All {total_thumbs_in_batch} thumbnails exist on disk, but process still running! Forcing KILL to prevent stale worker.", flush=True)
                     try:
+                        # <<< MODIFICATION: Replace terminate/kill logic >>>
+                        time.sleep(0.1)
                         process.kill()
-                        try: process.wait(timeout=1.0) 
-                        except subprocess.TimeoutExpired: pass 
                     except Exception as e_kill_stale: print(f"    Error killing stale worker {idx}: {e_kill_stale}", flush=True)
-                    completed_worker_indices_this_cycle.append(idx) # Mark for removal from pool
-                    # Tasks in this batch are considered "done" as files exist.
-                    # They will be picked up by get_custom_icon if not already in Blender's cache.
+                    completed_worker_indices_this_cycle.append(idx) 
                     for task_in_stale_batch in original_batch_tasks:
                         hash_val_stale = task_in_stale_batch['hash_value']
                         thumbnail_pending_on_disk_check.pop(hash_val_stale, None)
                         g_current_run_task_hashes_being_processed.discard(hash_val_stale)
-                        thumbnail_generation_scheduled.pop(hash_val_stale, None) # Remove from schedule too
+                        thumbnail_generation_scheduled.pop(hash_val_stale, None)
 
         if completed_worker_indices_this_cycle:
             for i in sorted(completed_worker_indices_this_cycle, reverse=True):
                 if 0 <= i < len(thumbnail_worker_pool): 
-                    # print(f"  [ThumbMan Timer] Removing completed/killed worker {i} from pool.")
                     thumbnail_worker_pool.pop(i)
-            # After removing workers, try to dispatch more tasks if slots are available
             if g_tasks_for_current_run and len(thumbnail_worker_pool) < MAX_CONCURRENT_THUMBNAIL_WORKERS:
                  _dispatch_collected_tasks()
 
 
-        # Try to dispatch tasks from g_tasks_for_current_run first if there are worker slots
         if g_tasks_for_current_run and len(thumbnail_worker_pool) < MAX_CONCURRENT_THUMBNAIL_WORKERS and thumbnail_task_queue.qsize() < (MAX_CONCURRENT_THUMBNAIL_WORKERS - len(thumbnail_worker_pool)):
             _dispatch_collected_tasks()
 
@@ -4949,7 +4944,7 @@ def process_thumbnail_tasks():
         while len(thumbnail_worker_pool) < MAX_CONCURRENT_THUMBNAIL_WORKERS and not thumbnail_task_queue.empty():
             try:
                 queued_item_for_worker = thumbnail_task_queue.get_nowait()
-            except Empty: break # Should not happen due to while condition but good practice
+            except Empty: break 
 
             if not isinstance(queued_item_for_worker, dict) or not all(k in queued_item_for_worker for k in ["batch_id", "tasks", "blend_file"]):
                 print(f"  [ThumbMan Timer] Invalid item dequeued: {queued_item_for_worker}. Skipping.", file=sys.stderr, flush=True)
@@ -4959,15 +4954,14 @@ def process_thumbnail_tasks():
             tasks_for_worker_process = queued_item_for_worker['tasks']
             blend_file_for_worker_process = queued_item_for_worker['blend_file']
             
-            # Pre-check: if all tasks in this batch are already validly in custom_icons, skip worker launch
             all_tasks_in_batch_already_valid_in_blender_cache = True 
-            if not tasks_for_worker_process: # Empty batch somehow
+            if not tasks_for_worker_process: 
                 all_tasks_in_batch_already_valid_in_blender_cache = False
             else:
                 for task_to_check_cache in tasks_for_worker_process:
                     hash_val_to_check_cache = task_to_check_cache.get('hash_value')
                     thumb_path_to_check_cache = task_to_check_cache.get('thumb_path')
-                    if not hash_val_to_check_cache or not thumb_path_to_check_cache: # Invalid task
+                    if not hash_val_to_check_cache or not thumb_path_to_check_cache: 
                         all_tasks_in_batch_already_valid_in_blender_cache = False; break
                     
                     is_task_valid_in_blender_cache_now = False
@@ -4975,8 +4969,7 @@ def process_thumbnail_tasks():
                         preview_item_to_check = custom_icons[hash_val_to_check_cache]
                         if hasattr(preview_item_to_check, 'icon_id') and preview_item_to_check.icon_id > 0:
                             actual_w_chk, actual_h_chk = preview_item_to_check.icon_size
-                            if not (actual_w_chk <= 1 or actual_h_chk <= 1): # Not zero-sized
-                                # Also ensure the file still exists on disk for this cached item
+                            if not (actual_w_chk <= 1 or actual_h_chk <= 1): 
                                 if os.path.exists(thumb_path_to_check_cache) and os.path.getsize(thumb_path_to_check_cache) > 0:
                                     is_task_valid_in_blender_cache_now = True
                     
@@ -4984,33 +4977,26 @@ def process_thumbnail_tasks():
                         all_tasks_in_batch_already_valid_in_blender_cache = False; break
             
             if all_tasks_in_batch_already_valid_in_blender_cache:
-                # print(f"  [ThumbMan Timer] Skipping worker for batch {batch_id_from_queue}: All tasks already valid in Blender's icon cache.")
                 for task_skipped_from_queue in tasks_for_worker_process:
                     h_skip = task_skipped_from_queue['hash_value']
                     thumbnail_pending_on_disk_check.pop(h_skip, None)
                     thumbnail_generation_scheduled.pop(h_skip, None) 
                     g_current_run_task_hashes_being_processed.discard(h_skip)
-                # any_successful_load_this_cycle = True # Considered as "available"
-                g_thumbnails_loaded_in_current_UMT_run = True # If they are already valid in cache, it's as if they were loaded.
-                continue # Get next item from queue
+                g_thumbnails_loaded_in_current_UMT_run = True 
+                continue 
 
-            # Ensure thumbnail output directories exist for the batch
             try:
                 for task_path_data in tasks_for_worker_process:
                     os.makedirs(os.path.dirname(task_path_data['thumb_path']), exist_ok=True)
             except Exception as e_mkdir_batch:
                 print(f"  [ThumbMan Timer] Error creating directories for batch {batch_id_from_queue}: {e_mkdir_batch}. Re-queueing tasks.", file=sys.stderr, flush=True)
-                with g_dispatch_lock: g_tasks_for_current_run.extend(tasks_for_worker_process) # Add back to main list for re-processing
-                continue # Try next item from queue
+                with g_dispatch_lock: g_tasks_for_current_run.extend(tasks_for_worker_process) 
+                continue 
 
-            # Mark tasks as pending on disk check just before launching worker
             for task_to_mark_pending in tasks_for_worker_process:
                 thumbnail_pending_on_disk_check[task_to_mark_pending['hash_value']] = task_to_mark_pending
 
-
-            # Prepare and launch the worker
             tasks_json_payload_for_worker = json.dumps(tasks_for_worker_process)
-            # Use abspath for worker to avoid issues if Blender's CWD changes
             abs_blend_file_for_worker = os.path.abspath(blend_file_for_worker_process)
             abs_worker_script_path = os.path.abspath(BACKGROUND_WORKER_PY)
             abs_addon_data_root = os.path.abspath(_ADDON_DATA_ROOT)
@@ -5025,58 +5011,44 @@ def process_thumbnail_tasks():
                 "--addon-data-root", abs_addon_data_root, 
                 "--thumbnail-size", str(THUMBNAIL_SIZE)
             ]
-            # print(f"  [ThumbMan Timer] Launching worker for batch {batch_id_from_queue}. Cmd: {' '.join(cmd_for_worker_process)}")
             try:
                 popen_obj_for_pool = subprocess.Popen(cmd_for_worker_process, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                thumbnail_worker_pool.append({'process': popen_obj_for_pool, 'batched_tasks_in_worker': list(tasks_for_worker_process)}) # Store a copy
+                thumbnail_worker_pool.append({'process': popen_obj_for_pool, 'batched_tasks_in_worker': list(tasks_for_worker_process)}) 
                 workers_started_this_cycle += 1
-                # print(f"    Worker started for batch {batch_id_from_queue}, PID: {popen_obj_for_pool.pid}")
             except Exception as e_popen_launch:
                 print(f"  [ThumbMan Timer] ERROR launching worker for batch {batch_id_from_queue}: {e_popen_launch}", file=sys.stderr, flush=True)
                 traceback.print_exc(file=sys.stderr)
-                # Re-queue tasks if worker launch failed
                 with g_dispatch_lock: g_tasks_for_current_run.extend(tasks_for_worker_process)
-                for task_failed_launch in tasks_for_worker_process: # Clean up pending_on_disk_check for these
+                for task_failed_launch in tasks_for_worker_process: 
                     thumbnail_pending_on_disk_check.pop(task_failed_launch['hash_value'], None)
         
-        # REMOVED: if any_successful_load_this_cycle: force_redraw()
-        # This redraw is now handled by finalize_thumbnail_run if g_thumbnails_loaded_in_current_UMT_run is True
-
-        # Check if the entire thumbnail generation process (for this UMT "run") is complete
         if not g_tasks_for_current_run and thumbnail_task_queue.empty() and not thumbnail_worker_pool:
-            if g_thumbnail_process_ongoing: # If a "run" was marked as ongoing
-                # print(f"  [ThumbMan Timer] All tasks processed for current run. Finalizing.")
-                finalize_thumbnail_run() # This will set g_thumbnail_process_ongoing to False if no new sub-run
+            if g_thumbnail_process_ongoing: 
+                finalize_thumbnail_run() 
             
-            # If finalize_thumbnail_run set g_thumbnail_process_ongoing to False (or it was already false)
-            # and there's no other reason for the timer to continue (like monitor_active being true for other reasons)
             if not g_thumbnail_process_ongoing :
-                # print(f"  [ThumbMan Timer] Thumbnail process no longer ongoing. Stopping timer if active.")
-                if thumbnail_monitor_timer_active: # Only return None if it was active
+                if thumbnail_monitor_timer_active: 
                     thumbnail_monitor_timer_active = False
-                    return None # Stop timer
-                # If not active, it means it already stopped or will stop naturally.
+                    return None 
         
-        # If still ongoing, or tasks pending, or workers active, continue timer
         if g_thumbnail_process_ongoing or not thumbnail_task_queue.empty() or thumbnail_worker_pool or g_tasks_for_current_run :
-            if not thumbnail_monitor_timer_active: # If it became inactive but there's work, reactivate
-                # print(f"  [ThumbMan Timer] Work pending but timer was inactive. Restarting timer.")
-                ensure_thumbnail_queue_processor_running() # This will set it active
-            return 1.0 # Continue timer with 1.0 second interval
-        else: # All clear, and process not ongoing
+            if not thumbnail_monitor_timer_active: 
+                ensure_thumbnail_queue_processor_running() 
+            return 1.0 
+        else: 
             if thumbnail_monitor_timer_active:
                 thumbnail_monitor_timer_active = False
-                return None # Stop timer
-            return None # Already stopped or will stop
+                return None 
+            return None 
 
     except Exception as e_timer_main_loop_critical:
         print(f"[ThumbMan Timer] CRITICAL UNHANDLED ERROR in process_thumbnail_tasks: {e_timer_main_loop_critical}", file=sys.stderr, flush=True)
         traceback.print_exc(file=sys.stderr)
-        g_thumbnail_process_ongoing = False # Attempt to halt ongoing process on critical error
+        g_thumbnail_process_ongoing = False 
         if thumbnail_monitor_timer_active:
             thumbnail_monitor_timer_active = False
-            return None # Stop timer
-        return None # Already stopped or will stop
+            return None 
+        return None
 
 def update_material_thumbnails(specific_tasks_to_process=None):
     """
@@ -5745,6 +5717,7 @@ class LibraryMaterialEntry(PropertyGroup): # Unchanged
 classes = (
     MaterialListItem,
     MaterialListProperties,
+    LibraryMaterialEntry, # <<< ADD THIS LINE
     MATERIALLIST_UL_materials,
     MATERIALLIST_PT_panel,
     MATERIALLIST_OT_duplicate_or_localise_material,
@@ -5766,10 +5739,10 @@ classes = (
     MATERIALLIST_OT_trim_library,
     MATERIALLIST_OT_select_dominant,
     MATERIALLIST_OT_run_localisation_worker,
-    MATERIALLIST_OT_pack_library_textures, # New
-    MATERIALLIST_OT_scroll_to_top, # New
-    MATERIALLIST_OT_pack_textures_externally,   # New
-    MATERIALLIST_OT_pack_textures_internally, # New
+    MATERIALLIST_OT_pack_library_textures, 
+    MATERIALLIST_OT_scroll_to_top, 
+    MATERIALLIST_OT_pack_textures_externally,
+    MATERIALLIST_OT_pack_textures_internally,
 )
 
 scene_props = [
@@ -6129,55 +6102,19 @@ def unregister():
     print(f"[Unregister] Found {len(thumbnail_worker_pool)} thumbnail worker processes to terminate...")
     for worker_idx, worker_info in enumerate(list(thumbnail_worker_pool)):
         process = worker_info.get('process')
-        batch_info = worker_info.get('batched_tasks_in_worker', [])
-        batch_id = "N/A"
-        if batch_info and len(batch_info) > 0 and batch_info[0].get('hash_value'):
-            batch_id = batch_info[0]['hash_value'][:8]
-
-        print(f"[Unregister] Processing worker {worker_idx + 1}/{len(thumbnail_worker_pool)} (Batch ID: {batch_id})")
-
         if not process:
-            print(f"  Worker {worker_idx + 1}: No process object found, skipping.")
             continue
-
-        if not hasattr(process, 'poll'):
-            print(f"  Worker {worker_idx + 1}: Process object has no poll method, skipping.")
-            continue
-
-        # Check if process is still running
-        poll_result = process.poll()
-        if poll_result is not None:
-            print(f"  Worker {worker_idx + 1}: Process already terminated with exit code {poll_result}.")
-            continue
-
-        # Process is still running, attempt to kill directly.
-        try:
-            pid = getattr(process, 'pid', 'Unknown')
-            print(f"  Worker {worker_idx + 1}: Attempting to instantly kill running process (PID: {pid})...")
-            process.kill()
-            print(f"  Worker {worker_idx + 1}: Kill signal sent for PID: {pid}.")
-            # Optionally, a very brief wait can be added if immediate confirmation is needed,
-            # but the request was for an instant kill.
-            # For example, a non-blocking poll to log the outcome:
-            final_exit_code = process.poll()
-            if final_exit_code is not None:
-                print(f"  Worker {worker_idx + 1}: Process (PID: {pid}) confirmed killed with exit code {final_exit_code} shortly after signal.")
-            else:
-                print(f"  Worker {worker_idx + 1}: Process (PID: {pid}) status after instant kill signal is still running or unknown. OS will handle cleanup.")
-                # You might still want to try a very short wait if the OS takes a moment.
-                # try:
-                #     process.wait(timeout=0.05) # Extremely short, non-blocking wait
-                # except subprocess.TimeoutExpired:
-                #     pass # It's fine if it doesn't exit this quickly
-                # final_exit_code_after_brief_wait = process.poll()
-                # if final_exit_code_after_brief_wait is not None:
-                #     print(f"  Worker {worker_idx + 1}: Process (PID: {pid}) confirmed killed with exit code {final_exit_code_after_brief_wait} after brief wait.")
-
-
-        except AttributeError as e_attr:
-            print(f"  Worker {worker_idx + 1}: Process object missing expected attributes for kill: {e_attr}")
-        except Exception as e_kill_general:
-            print(f"  Worker {worker_idx + 1}: Unexpected error during kill attempt: {e_kill_general}")
+        if hasattr(process, 'poll') and process.poll() is None:
+            # Process is still running, apply the new kill logic
+            try:
+                pid = getattr(process, 'pid', 'Unknown')
+                print(f"  Worker {worker_idx + 1}: Pausing 0.1s before killing running process (PID: {pid})...")
+                # <<< MODIFICATION: Replace instant kill >>>
+                time.sleep(0.1)
+                process.kill()
+                print(f"  Worker {worker_idx + 1}: Kill signal sent for PID: {pid}.")
+            except Exception as e_kill_general:
+                print(f"  Worker {worker_idx + 1}: Unexpected error during kill attempt: {e_kill_general}")
 
     thumbnail_worker_pool.clear()
     print(f"[Unregister] Worker pool cleared. Processing task queue...")
