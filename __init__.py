@@ -88,6 +88,8 @@ _ICON_TEMPLATE_VALIDATED = False
 _LEGACY_THUMBNAIL_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+_([a-f0-9]{32})\.png$", re.IGNORECASE) # ADD THIS LINE
 g_thumbnails_loaded_in_current_UMT_run = False # Add this new global
 g_matlist_transient_tasks_for_post_save = []
+g_used_uuids_cache = set()
+g_used_uuids_dirty = True
 
 THUMBNAIL_SIZE = 128
 VISIBLE_ITEMS = 30
@@ -1689,6 +1691,8 @@ def populate_material_list(scene, *, called_from_finalize_run=False):
             sorted_list = sorted(items_to_process_for_ui, key=lambda item: -item['sort_key'])
 
         # Step 5: Populate Blender's list and our fast UI cache
+        current_list_version_for_pop = list_version # Capture version before populating
+
         for item_data in sorted_list:
             list_item = scene.material_list_items.add()
             list_item.material_name = item_data['display_name']
@@ -1699,14 +1703,15 @@ def populate_material_list(scene, *, called_from_finalize_run=False):
             
             material_list_cache.append({
                 'uuid': item_data['uuid'],
-                'icon_id': 0, # Default to 0, signals "not loaded" by background task
+                'icon_id': 0, # Default to 0, signals "not loaded"
+                'version': current_list_version_for_pop, # MODIFICATION: Store the current version
                 'is_missing': not bool(item_data.get('mat_obj')),
                 'display_name': item_data['display_name'],
                 'is_protected': item_data.get('is_protected', False)
             })
 
         print(f"[Populate List] Master list rebuild complete with {len(scene.material_list_items)} items.")
-        list_version += 1
+        list_version += 1 # MODIFICATION: Increment AFTER population is done
         
         # Step 6: Trigger the asynchronous icon loading process
         if not called_from_finalize_run and 'update_material_thumbnails' in globals():
@@ -1939,46 +1944,45 @@ def save_handler(dummy):
 def save_post_handler(dummy=None):
     """
     Post-save callback.
-    MODIFIED: To use a global list for specific thumbnail tasks from save_handler.
+    CORRECTED: Intelligently calls the UI refresh function only when materials
+    have actually been modified, fixing both the save-time lag for unchanged files
+    and ensuring the UI updates for new materials.
     """
-    global materials_modified, g_thumbnails_loaded_in_current_UMT_run # Existing globals
-    global g_matlist_transient_tasks_for_post_save # Use the addon's global list
+    global materials_modified, g_matlist_transient_tasks_for_post_save
 
     t0 = time.time()
-    scene = bpy.context.scene or get_first_scene()
 
-    ui_list_needs_refresh_and_redraw = materials_modified or g_thumbnails_loaded_in_current_UMT_run
-
-    if ui_list_needs_refresh_and_redraw and scene:
-        if callable(populate_material_list):
-            populate_material_list(scene)
-        if callable(force_redraw):
-            force_redraw()
-
-    trigger_thumbnail_update_due_to_save = materials_modified 
-
-    if trigger_thumbnail_update_due_to_save:
-        # MODIFIED: Retrieve tasks from the global list.
-        # Pass a copy of the list to update_material_thumbnails, as it might be cleared later.
-        specific_tasks = list(g_matlist_transient_tasks_for_post_save) 
-
-        if callable(update_material_thumbnails):
-            if specific_tasks: # Check if the list from save_handler is not empty
-                # print(f"[POST-SAVE] Using {len(specific_tasks)} specific tasks from save_handler for thumbnails.")
+    # --- CORE FIX ---
+    # Only if materials were actually changed during the pre-save handler,
+    # do we need to trigger a full UI refresh and thumbnail check.
+    if materials_modified:
+        print("[POST-SAVE] Material modifications detected. Refreshing UI and checking thumbnails.")
+        
+        # 1. Refresh the UI list and reset the selection.
+        #    This is now correctly placed here, so it only runs when needed.
+        if 'populate_and_reset_selection' in globals():
+            populate_and_reset_selection(bpy.context)
+        
+        # 2. Trigger thumbnail generation for specifically changed materials.
+        specific_tasks = list(g_matlist_transient_tasks_for_post_save)
+        if 'update_material_thumbnails' in globals() and callable(update_material_thumbnails):
+            if specific_tasks:
                 update_material_thumbnails(specific_tasks_to_process=specific_tasks)
             else:
-                # print("[POST-SAVE] materials_modified is True but no specific tasks from save_handler. Full thumbnail update scan.")
-                update_material_thumbnails() # Fallback to full scan
+                update_material_thumbnails()
     
-    g_matlist_transient_tasks_for_post_save.clear() # Clear the global list after use for this save cycle
+    # --- END CORE FIX ---
+
+    # Cleanup and logging logic remains the same.
+    g_matlist_transient_tasks_for_post_save.clear()
 
     try:
         _log_blend_material_usage()
     except Exception as e:
         print(f"[POST-SAVE] usage-log error: {e}")
-        traceback.print_exc()
 
-    materials_modified = False 
+    # Reset the flag for the next depsgraph update.
+    materials_modified = False
     
     if hasattr(bpy.context.window_manager, 'matlist_save_handler_processed'):
         bpy.context.window_manager.matlist_save_handler_processed = False
@@ -5314,16 +5318,35 @@ def create_reference_snapshot(context: bpy.types.Context) -> bool:
 # --------------------------
 @persistent
 def depsgraph_update_handler(scene, depsgraph):
-    global materials_modified
-    # print(f"--- Depsgraph Handler Triggered (Scene: {getattr(scene, 'name', 'N/A')}) ---") # Verbose
+    """
+    Detects changes to materials or objects to dirty the relevant caches.
+    CORRECTED: No longer uses the obsolete 'is_updated_data' attribute.
+    """
+    global materials_modified, g_used_uuids_dirty
     try:
         for update in depsgraph.updates:
+            # Check for changes to Material datablocks (for hashing)
             if isinstance(update.id, bpy.types.Material):
                 material = update.id
-                # print(f"     [Depsgraph] Material Update: {getattr(material, 'name', 'Unknown')}") # Verbose
-                try: material["hash_dirty"] = True; materials_modified = True
-                except Exception: pass # Ignore if prop can't be set (e.g. library material)
-    except Exception as e: print(f"[Depsgraph Handler] Error: {e}"); traceback.print_exc()
+                try:
+                    material["hash_dirty"] = True
+                    materials_modified = True
+                except Exception:
+                    pass  # Ignore for library materials
+            
+            # Check for changes to Object datablocks (for material slots)
+            # In Blender 4.x, we no longer have `is_updated_data`.
+            # A general check for an updated Object ID is the safest and
+            # simplest way to catch potential material slot changes.
+            elif isinstance(update.id, bpy.types.Object):
+                # Any update to an object could be a material slot change.
+                # Setting a boolean flag is extremely cheap, so we do it here
+                # to be safe. The expensive part (rescan) only happens later
+                # and only if the user actually has the filter active.
+                g_used_uuids_dirty = True
+
+    except Exception as e:
+        print(f"[Depsgraph Handler] Error: {e}")
 
 # --------------------------
 # Property Update Callbacks and UI Redraw (from old addon)
@@ -5342,8 +5365,7 @@ def update_list_and_reset_selection(self, context):
 
 def populate_and_reset_selection(context):
     """
-    Populates the material list and then resets the active index to 0.
-    This is the core logic for any UI action that should result in a fresh list.
+    Populates the material list based on current filters and then resets the active index to 0.
     """
     scene = context.scene
     if not scene:
@@ -5479,18 +5501,28 @@ class MATERIALLIST_UL_materials(UIList):
 
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         # This function must remain extremely fast.
+        global list_version, material_list_cache # Ensure globals are available
         
         if index < len(material_list_cache):
             cache_entry = material_list_cache[index]
             
-            # If the icon_id in our fast cache is 0, it means it hasn't been loaded yet
-            # by the background task, OR it failed to load previously. We try to get it.
-            # get_custom_icon is optimized to be very fast if the icon is already
-            # in Blender's preview system. If not, it returns 0 and does nothing expensive.
-            if cache_entry['icon_id'] <= 0:
+            # --- START OF FIX ---
+            # If the global list_version has been incremented (e.g., by a background thumbnail load),
+            # the version stored in our cache entry will be outdated. This signals that
+            # our cached icon_id might be stale and we need to re-fetch it.
+            if cache_entry.get('version', -1) < list_version:
+                cache_entry['icon_id'] = 0  # Force a re-fetch by resetting the cached ID
+                cache_entry['version'] = list_version  # Update the entry's version to the current one
+            # --- END OF FIX ---
+
+            # If the icon_id in our fast cache is 0 (either initially or because it was just invalidated),
+            # try to get the icon. get_custom_icon is optimized to be fast for already-loaded icons.
+            if cache_entry.get('icon_id', 0) <= 0:
                 mat_obj = get_material_by_uuid(item.material_uuid)
                 if mat_obj:
                     # Update our cache with the result for the next redraw.
+                    # This will return a valid ID if the icon is already in Blender's preview system,
+                    # or it will return 0 and queue a generation if it's missing.
                     cache_entry['icon_id'] = get_custom_icon(mat_obj)
 
             icon_val = cache_entry.get("icon_id", 0)
@@ -5498,6 +5530,8 @@ class MATERIALLIST_UL_materials(UIList):
             
             row = layout.row(align=True)
             if icon_val > 0:
+                # The BKE_icon_get error happens here if icon_val is stale.
+                # The invalidation logic above prevents a stale ID from being used.
                 row.label(icon_value=icon_val)
             else:
                 row.label(icon="ERROR" if is_missing else "MATERIAL")
@@ -5515,59 +5549,48 @@ class MATERIALLIST_UL_materials(UIList):
     def filter_items(self, context, data, propname):
         """
         UIList run-time filtering.
-        CORRECTED to check the correct properties on the list items themselves,
-        preserving performance and fixing the filtering bugs.
+        OPTIMIZED: Caches the set of used UUIDs and only recalculates it
+        when the g_used_uuids_dirty flag is set by the depsgraph handler.
         """
+        global g_used_uuids_cache, g_used_uuids_dirty
+
         items            = getattr(data, propname)
         search_term      = context.scene.material_search.strip().lower()
         hide_mat_prefix  = context.scene.hide_mat_materials
         show_only_used   = context.scene.material_list_show_only_local
 
-        # Fast exit – if no filters are active, show everything.
         if not (search_term or hide_mat_prefix or show_only_used):
             return [], []
 
-        # Pre-compute the set of UUIDs actually used in the scene.
-        # This only runs when the "Show Only Local/Used" filter is active.
-        used_uuids = set()
-        if show_only_used:
-            # This loop is efficient and necessary to know which linked materials are in use.
+        # --- OPTIMIZATION ---
+        # Only recalculate the expensive 'used_uuids' set if the depsgraph
+        # has told us that something has changed.
+        if show_only_used and g_used_uuids_dirty:
+            print("[Filter Items] Recalculating used materials cache...")
+            g_used_uuids_cache.clear()
             for obj in bpy.data.objects:
                 if obj.type == 'MESH':
                     for slot in obj.material_slots:
                         if slot.material:
-                            # Use get_material_uuid to handle both local and linked materials
                             uid = get_material_uuid(slot.material)
                             if uid:
-                                used_uuids.add(uid)
+                                g_used_uuids_cache.add(uid)
+            g_used_uuids_dirty = False # Reset the flag until the next change
 
-        # This list will hold a 1 for every visible item and a 0 for every hidden one.
         filter_flags = []
-
         for item in items:
             visible = True
-
-            # 1. Search text filter
             if search_term and search_term not in item.material_name.lower():
                 visible = False
-
-            # 2. Hide "mat_" materials filter
-            ### FIX ###
-            # This now correctly checks the DISPLAY NAME from the list item, not the datablock name.
             if visible and hide_mat_prefix and item.material_name.startswith("mat_"):
                 visible = False
-
-            # 3. Show-Only-Local/Used filter
-            ### FIX ###
-            # This now correctly uses the `is_library` property directly from the item.
             if visible and show_only_used:
-                # If the item is from a library AND its UUID is not in the set of used materials, hide it.
-                if item.is_library and item.material_uuid not in used_uuids:
+                # Filter using the (now up-to-date) cache
+                if item.is_library and item.material_uuid not in g_used_uuids_cache:
                     visible = False
-
+                
             filter_flags.append(self.bitflag_filter_item if visible else 0)
 
-        # The second list (new order) is empty, meaning we keep the original sort order.
         return filter_flags, []
 
 class MATERIALLIST_PT_panel(bpy.types.Panel): # Ensure bpy.types.Panel is inherited
