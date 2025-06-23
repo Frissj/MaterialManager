@@ -1605,8 +1605,8 @@ def _parse_material_suffix(name: str) -> tuple[str, int]:
 # MATERIAL LIST ITEM CLASS
 def populate_material_list(scene, *, called_from_finalize_run=False):
     """
-    Rebuilds the Blender material list items and a single, rich in-memory cache
-    that the UI will read from. This is the only place where heavy lifting occurs.
+    Builds the complete, unfiltered master material list.
+    All filtering is now handled by the much faster UIList.filter_items method.
     """
     global material_list_cache, list_version
     
@@ -1614,118 +1614,107 @@ def populate_material_list(scene, *, called_from_finalize_run=False):
         print("[Populate List] Error: Scene object is None.")
         return
 
-    print("[Populate List] Starting full list and UI cache rebuild...")
+    print("[Populate List] Rebuilding master material list (unfiltered)...")
 
     try:
-        # 1. Clear old data from Blender's list and our global cache
+        # Step 1: Clear old data from Blender's list and our global UI cache
         if hasattr(scene, "material_list_items"):
             scene.material_list_items.clear()
         else:
-            print("[Populate List] Error: Scene missing 'material_list_items'.")
+            print("[Populate List] Error: Scene missing 'material_list_items'. Cannot populate.")
             return
         
         material_list_cache.clear()
 
-        # 2. Gather, filter, and sort all material data in one pass
-        items_to_process_for_ui = []
-        # (This combines the multiple loops from before into one for clarity)
-        # ... [Filtering logic from your existing populate_material_list goes here] ...
-        # For brevity, I'll use a simplified version, the key part is step #3 below.
-        
-        # --- Start of Combined Gathering & Filtering (from your code) ---
-        all_mats_data = [] 
+        # Step 2: Gather all raw material data
+        all_mats_data = []
         for mat in bpy.data.materials:
-            if not mat or not hasattr(mat, 'name'): continue
+            if not mat or not hasattr(mat, 'name'):
+                continue
             try:
-                mat_uuid = get_material_uuid(mat)
-                if not mat_uuid: continue
+                # This try-except block ensures that if one material is problematic, the whole process doesn't fail.
                 all_mats_data.append({
-                    'mat_obj': mat, 'uuid': mat_uuid,
+                    'mat_obj': mat,
+                    'uuid': get_material_uuid(mat),
                     'display_name': mat_get_display_name(mat),
                     'is_library': bool(mat.library),
                     'is_protected': mat.get('is_protected', False),
                     'original_name': mat.get("orig_name", mat_get_display_name(mat)),
                 })
-            except (ReferenceError, Exception): continue
+            except (ReferenceError, Exception):
+                continue
 
-        material_info_map = {} 
-        mat_prefix_candidates = {} 
-        hide_mat_prefix_materials = scene.hide_mat_materials
-
+        # Step 3: De-duplicate the list to get a single, canonical entry per material concept
+        material_info_map = {}
+        mat_prefix_candidates = {}
+        
         for item_info_dict in all_mats_data:
             display_name = item_info_dict['display_name']
             if display_name.startswith("mat_"):
-                if hide_mat_prefix_materials: continue
+                # Find the "base" material (e.g., mat_Plastic from mat_Plastic.001, .002)
                 base_name, suffix_num = _parse_material_suffix(display_name)
-                item_info_dict['suffix_num'] = suffix_num 
-                existing_candidate = mat_prefix_candidates.get(base_name)
-                if not existing_candidate or suffix_num < existing_candidate['suffix_num']:
+                item_info_dict['suffix_num'] = suffix_num
+                existing = mat_prefix_candidates.get(base_name)
+                if not existing or suffix_num < existing['suffix_num']:
                     mat_prefix_candidates[base_name] = item_info_dict
             else:
-                uuid_for_map = item_info_dict['uuid']
-                existing_entry = material_info_map.get(uuid_for_map)
-                if not existing_entry or (not item_info_dict['is_library'] and existing_entry['is_library']):
-                    material_info_map[uuid_for_map] = item_info_dict
-
-        if not hide_mat_prefix_materials:
-            for base_name, chosen_mat_info in mat_prefix_candidates.items():
-                if chosen_mat_info['uuid'] not in material_info_map:
-                    material_info_map[chosen_mat_info['uuid']] = chosen_mat_info
-
+                # Ensure only one entry per UUID (preferring local over library versions)
+                uuid = item_info_dict['uuid']
+                existing = material_info_map.get(uuid)
+                if not existing or (not item_info_dict['is_library'] and existing['is_library']):
+                    material_info_map[uuid] = item_info_dict
+        
+        # Add the de-duplicated mat_ items to the main map
+        for base_name, chosen_info in mat_prefix_candidates.items():
+            if chosen_info['uuid'] not in material_info_map:
+                material_info_map[chosen_info['uuid']] = chosen_info
+        
         items_to_process_for_ui = list(material_info_map.values())
+        
+        # Step 4: Sort the de-duplicated list based on the scene property
+        if scene.material_list_sort_alpha:
+            sorted_list = sorted(items_to_process_for_ui, key=lambda item: item['display_name'].lower())
+        else:  # Default sort by recency from database
+            material_sort_indices = {}
+            try:
+                with get_db_connection() as conn:
+                    c = conn.cursor()
+                    c.execute("SELECT uuid, sort_index FROM material_order")
+                    material_sort_indices = {row[0]: row[1] for row in c.fetchall()}
+            except Exception as e:
+                print(f"[Populate List] Error loading sort indices: {e}")
+            
+            for info in items_to_process_for_ui:
+                info['sort_key'] = material_sort_indices.get(info['uuid'], -1)
+            sorted_list = sorted(items_to_process_for_ui, key=lambda item: -item['sort_key'])
 
-        if scene.material_list_show_only_local:
-            used_uuids = {get_material_uuid(s.material) for o in bpy.data.objects for s in o.material_slots if s.material}
-            items_to_process_for_ui = [info for info in items_to_process_for_ui if not info['is_library'] or info['uuid'] in used_uuids]
-        # --- End of Gathering & Filtering ---
-
-        # 3. Get sorting data and sort the final list
-        material_sort_indices = {}
-        try:
-            with get_db_connection() as conn:
-                c = conn.cursor()
-                c.execute("SELECT uuid, sort_index FROM material_order")
-                material_sort_indices = {row[0]: row[1] for row in c.fetchall()}
-        except Exception as e: print(f"[Populate List] Error loading sort indices: {e}")
-
-        for info in items_to_process_for_ui:
-            info['sort_key'] = material_sort_indices.get(info['uuid'], -1)
-
-        sorted_list = sorted(items_to_process_for_ui, key=lambda item: -item['sort_key'])
-
-        # 4. Populate Blender's list AND the rich cache simultaneously
-        items_added_count = 0
+        # Step 5: Populate Blender's list and our fast UI cache
         for item_data in sorted_list:
-            # A. Populate the simple PropertyGroup for Blender's internal use
             list_item = scene.material_list_items.add()
             list_item.material_name = item_data['display_name']
             list_item.material_uuid = item_data['uuid']
-            # ... (and other simple properties)
-
-            # B. CRITICAL: Build the rich cache that the UI will ACTUALLY use for drawing
-            mat_obj_for_cache = item_data.get('mat_obj')
-            icon_id = get_custom_icon(mat_obj_for_cache) if mat_obj_for_cache else 0
+            list_item.is_library = item_data['is_library']
+            list_item.original_name = item_data['original_name']
+            list_item.is_protected = item_data['is_protected']
             
             material_list_cache.append({
-                'uuid': item_data['uuid'], # Store UUID for linking back
-                'icon_id': icon_id,
-                'is_missing': not bool(mat_obj_for_cache),
+                'uuid': item_data['uuid'],
+                'icon_id': 0, # Default to 0, signals "not loaded" by background task
+                'is_missing': not bool(item_data.get('mat_obj')),
                 'display_name': item_data['display_name'],
-                'is_protected': item_data['is_protected']
+                'is_protected': item_data.get('is_protected', False)
             })
-            items_added_count += 1
 
-        print(f"[Populate List] Rebuild complete. Populated {items_added_count} items.")
+        print(f"[Populate List] Master list rebuild complete with {len(scene.material_list_items)} items.")
         list_version += 1
+        
+        # Step 6: Trigger the asynchronous icon loading process
+        if not called_from_finalize_run and 'update_material_thumbnails' in globals():
+            print("[Populate List] Triggering background thumbnail update for the new list.")
+            update_material_thumbnails()
 
-        # Adjust active index safely
-        if items_added_count > 0 and scene.material_list_active_index >= items_added_count:
-            scene.material_list_active_index = items_added_count - 1
-        elif items_added_count == 0:
-            scene.material_list_active_index = -1
-            
     except Exception as e:
-        print(f"[Populate List] CRITICAL error: {e}")
+        print(f"[Populate List] CRITICAL error during list population: {e}")
         traceback.print_exc()
 
 def get_material_by_unique_id(unique_id): # Unchanged
@@ -2372,105 +2361,109 @@ class MATERIALLIST_OT_rename_material(Operator):
         wm = context.window_manager
         return wm.invoke_props_dialog(self)
 
-class MATERIALLIST_OT_duplicate_material(Operator):
-    """Duplicate selected material as a new local material.
-If original is from library, it's made local in the current file.
-Textures use original file paths, not duplicated image files."""
-    bl_idname = "materiallist.duplicate_material"
-    bl_label = "Duplicate Selected Material (as Local)"
+class MATERIALLIST_OT_duplicate_or_localise_material(Operator):
+    """Duplicates a local material, or creates a local, editable copy of a library material"""
+    bl_idname = "materiallist.duplicate_or_localise"
+    bl_label = "Create Local Copy"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):
         scene = context.scene
-        # Check if an item is selected in the list
-        return scene and hasattr(scene, 'material_list_items') and \
-               0 <= scene.material_list_active_index < len(scene.material_list_items)
+        if not (scene and hasattr(scene, 'material_list_items')):
+            return False
+        
+        # Enable the button as long as there is a valid selection.
+        # The execute method will handle the different behaviors.
+        idx = scene.material_list_active_index
+        return 0 <= idx < len(scene.material_list_items)
 
     def execute(self, context):
         global material_names, _display_name_cache
         scene = context.scene
         idx = scene.material_list_active_index
-        
-        if not (0 <= idx < len(scene.material_list_items)):
-            self.report({'WARNING'}, "No material selected in the list.")
-            return {'CANCELLED'}
-            
-        selected_list_item = scene.material_list_items[idx]
-        original_mat_uuid_in_list = selected_list_item.material_uuid
-        
-        original_mat_datablock = get_material_by_uuid(original_mat_uuid_in_list)
+        original_item = scene.material_list_items[idx]
+        original_mat = get_material_by_uuid(original_item.material_uuid)
 
-        if not original_mat_datablock:
-            self.report({'WARNING'}, f"Original material (UUID: {original_mat_uuid_in_list}) not found in current Blender data. List might be outdated.")
-            populate_material_list(scene)
+        if not original_mat:
+            self.report({'WARNING'}, "Selected material data not found.")
             return {'CANCELLED'}
 
-        try:
-            original_display_name = mat_get_display_name(original_mat_datablock)
-            is_original_from_library_file = original_mat_datablock.library is not None
+        original_display_name = mat_get_display_name(original_mat)
 
-            new_mat = original_mat_datablock.copy()
-            
-            new_local_uuid = str(uuid.uuid4())
-            new_mat["uuid"] = new_local_uuid
+        # --- BRANCH 1: The selected material is from the LIBRARY ---
+        if original_mat.library:
+            try:
+                # This block contains the logic from the old "Make Local" operator
+                local_mat = original_mat.copy()
+                local_mat.library = None # Make it a local datablock
+                
+                new_local_uuid = str(uuid.uuid4())
+                local_mat["uuid"] = new_local_uuid
+                local_mat.name = new_local_uuid # Name the datablock by its new UUID
+                
+                # Keep the original display name for the new local copy
+                material_names[new_local_uuid] = original_display_name
+                save_material_names()
+                
+                local_mat["from_library_uuid"] = get_material_uuid(original_mat)
+                local_mat.use_fake_user = True
+                
+                # Promote to the top of the recency list
+                promote_material_by_recency_counter(new_local_uuid)
+                
+                # Replace all instances of the library material with the new local one
+                for obj in bpy.data.objects:
+                    if obj.material_slots:
+                        for slot in obj.material_slots:
+                            if slot.material == original_mat:
+                                slot.material = local_mat
+                                
+                _display_name_cache.clear()
+                populate_and_reset_selection(context)
+                
+                if hasattr(local_mat, "preview"):
+                    force_update_preview(local_mat)
+                    
+                self.report({'INFO'}, f"Created local copy of library material '{original_display_name}'")
 
-            new_display_name_base = original_display_name
-            if is_original_from_library_file:
-                suggested_suffix = "_local_copy"
-            else:
-                suggested_suffix = ".copy"
-            
-            if new_display_name_base.endswith(suggested_suffix):
-                 new_display_name_base = new_display_name_base[:-len(suggested_suffix)]
-            if new_display_name_base.endswith(".copy"):
-                 new_display_name_base = new_display_name_base[:-5]
+            except Exception as e:
+                self.report({'ERROR'}, f"Failed to create local copy: {e}")
+                traceback.print_exc()
+                return {'CANCELLED'}
 
-            new_display_name = get_unique_display_name(f"{new_display_name_base}{suggested_suffix}")
-            
-            prospective_datablock_name = new_local_uuid
-            if bpy.data.materials.get(prospective_datablock_name) and \
-               bpy.data.materials[prospective_datablock_name] != new_mat:
-                prospective_datablock_name = get_unique_display_name(new_display_name.replace(".", "_"))
-                print(f"[Duplicate Mat] Warning: New UUID '{new_local_uuid}' was taken as a datablock name, using fallback '{prospective_datablock_name}'")
-            new_mat.name = prospective_datablock_name
+        # --- BRANCH 2: The selected material is already LOCAL ---
+        else:
+            try:
+                # This block contains the logic from the old "Duplicate" operator
+                new_mat = original_mat.copy()
+                
+                new_local_uuid = str(uuid.uuid4())
+                new_mat["uuid"] = new_local_uuid
+                new_mat.name = new_local_uuid
+                
+                # Create a new, unique display name for the duplicate
+                base_name = original_display_name.rsplit('.', 1)[0] if '.' in original_display_name else original_display_name
+                new_display_name = get_unique_display_name(f"{base_name}.copy")
+                
+                material_names[new_local_uuid] = new_display_name
+                save_material_names()
+                
+                new_mat.use_fake_user = True
+                
+                # Promote the new duplicate to the top of the recency list
+                promote_material_by_recency_counter(new_local_uuid)
+                
+                _display_name_cache.clear()
+                populate_and_reset_selection(context)
 
-            material_names[new_local_uuid] = new_display_name
-            save_material_names()
-            _display_name_cache.clear()
+                self.report({'INFO'}, f"Duplicated local material '{original_display_name}' as '{new_display_name}'")
 
-            new_mat.use_fake_user = True
-            
-            # --- The only change is this line ---
-            promote_material_by_recency_counter(new_local_uuid)
+            except Exception as e:
+                self.report({'ERROR'}, f"Failed to duplicate material: {e}")
+                traceback.print_exc()
+                return {'CANCELLED'}
 
-            populate_material_list(scene)
-
-            new_list_idx = -1
-            for i, item_in_list in enumerate(scene.material_list_items):
-                if item_in_list.material_uuid == new_local_uuid:
-                    new_list_idx = i
-                    break
-            
-            if new_list_idx != -1:
-                scene.material_list_active_index = new_list_idx
-            else:
-                scene.material_list_active_index = 0 if scene.material_list_items else -1
-            
-            self.report({'INFO'}, f"Duplicated '{original_display_name}' as local material '{new_display_name}'")
-
-        except Exception as e:
-            self.report({'ERROR'}, f"Failed to duplicate material: {str(e)}")
-            traceback.print_exc()
-            if 'new_mat' in locals() and new_mat and new_mat.name in bpy.data.materials:
-                if bpy.data.materials[new_mat.name] == new_mat and new_mat.users <= (1 if new_mat.use_fake_user else 0):
-                    try:
-                        bpy.data.materials.remove(new_mat)
-                        print(f"[Duplicate Mat] Cleaned up partially created material '{new_mat.name_full}' due to error.")
-                    except Exception as e_clean:
-                        print(f"[Duplicate Mat] Error during cleanup of partially created material: {e_clean}")
-            return {'CANCELLED'}
-        
         return {'FINISHED'}
 
 class MATERIALLIST_OT_pack_library_textures(Operator):
@@ -3045,85 +3038,38 @@ class MATERIALLIST_OT_make_local(Operator):
         idx = getattr(scene, "material_list_active_index", -1)
         if idx < 0 or idx >= len(scene.material_list_items): return False
         item = scene.material_list_items[idx]
-        mat = bpy.data.materials.get(item.material_uuid)
+        mat = get_material_by_uuid(item.material_uuid)
         return mat is not None and mat.library is not None
 
     def execute(self, context):
         global material_names, _display_name_cache
         scene = context.scene
         idx = scene.material_list_active_index
-        if not (0 <= idx < len(scene.material_list_items)):
-            self.report({'WARNING'}, "Selected list index is invalid.")
-            return {'CANCELLED'}
         item = scene.material_list_items[idx]
-        lib_mat_uuid = item.material_uuid
-        lib_mat = bpy.data.materials.get(lib_mat_uuid)
+        lib_mat = get_material_by_uuid(item.material_uuid)
         if lib_mat is None or not lib_mat.library:
-            self.report({'ERROR'}, "Selected material is already local, missing, or changed since selection.")
-            populate_material_list(scene)
-            return {'CANCELLED'}
+            self.report({'ERROR'}, "Selected material is not a library material."); return {'CANCELLED'}
         try:
             display_name_from_lib = mat_get_display_name(lib_mat)
-            print(f"[Make Local DB] Copying library material: {lib_mat.name} (UUID: {lib_mat_uuid})")
-            local_mat = lib_mat.copy()
-            local_mat.library = None
-            new_local_uuid = str(uuid.uuid4())
-            local_mat["uuid"] = new_local_uuid
-            try:
-                local_mat.name = new_local_uuid
-            except Exception:
-                local_mat.name = f"{new_local_uuid}_local"
-                print(f"[Make Local DB] Warning: Renamed datablock with fallback name: {local_mat.name}")
-            print(f"[Make Local DB] Adding display name '{display_name_from_lib}' for new local UUID {new_local_uuid} to database (in memory).")
+            local_mat = lib_mat.copy(); local_mat.library = None
+            new_local_uuid = str(uuid.uuid4()); local_mat["uuid"] = new_local_uuid
+            local_mat.name = new_local_uuid
             material_names[new_local_uuid] = display_name_from_lib
-            local_mat["from_library_uuid"] = lib_mat_uuid
+            local_mat["from_library_uuid"] = get_material_uuid(lib_mat)
             local_mat.use_fake_user = True
-            print(f"[Make Local DB] Created local material '{local_mat.name}' (UUID: {new_local_uuid}) from library '{lib_mat.name}'.")
-        except Exception as e:
-            self.report({'ERROR'}, f"Failed to create local copy: {e}")
-            traceback.print_exc()
-            return {'CANCELLED'}
-        
-        # --- The only change is this line ---
-        promote_material_by_recency_counter(new_local_uuid)
-        
-        print("[Make Local DB] Replacing instances on objects...")
-        replaced_count = 0
-        for obj in bpy.data.objects:
-            if obj.material_slots:
-                for slot in obj.material_slots:
-                    if slot.link == 'OBJECT' and slot.material == lib_mat:
-                        slot.material = local_mat
-                        replaced_count += 1
-            if hasattr(obj.data, "materials") and obj.data.materials:
-                for idx_slot, slot_mat in enumerate(obj.data.materials):
-                    if slot_mat == lib_mat:
-                        try:
-                            obj.data.materials[idx_slot] = local_mat
-                            replaced_count += 1
-                        except Exception as e_assign:
-                            print(f"[Make Local DB] Error assigning to data slot {idx_slot} on {obj.data.name}: {e_assign}")
-        print(f"[Make Local DB] Replaced library material on approx {replaced_count} slots.")
-        
-        _display_name_cache.clear()
-        populate_material_list(scene)
-        
-        new_idx = -1
-        for i, current_item in enumerate(scene.material_list_items):
-            if current_item.material_uuid == new_local_uuid:
-                new_idx = i
-                break
-        if new_idx != -1:
-            scene.material_list_active_index = new_idx
-            print(f"[Make Local DB] Selected newly created local material in list at index {new_idx}.")
-        else:
-            print("[Make Local DB] Warning: Could not find newly created local material in list after populate.")
-            scene.material_list_active_index = 0 if len(scene.material_list_items) > 0 else -1
-        
-        if hasattr(local_mat, "preview"):
-            force_update_preview(local_mat)
+            promote_material_by_recency_counter(new_local_uuid)
+            for obj in bpy.data.objects:
+                if obj.material_slots:
+                    for slot in obj.material_slots:
+                        if slot.material == lib_mat: slot.material = slot.material
+            _display_name_cache.clear()
             
-        self.report({'INFO'}, f"Converted '{mat_get_display_name(local_mat)}' to a local material.")
+            populate_and_reset_selection(context)
+
+            if hasattr(local_mat, "preview"): force_update_preview(local_mat)
+            self.report({'INFO'}, f"Converted '{display_name_from_lib}' to a local material.")
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to create local copy: {e}"); traceback.print_exc(); return {'CANCELLED'}
         return {'FINISHED'}
 
 class MATERIALLIST_OT_sort_alphabetically(Operator):
@@ -3212,22 +3158,22 @@ class MATERIALLIST_OT_PollMaterialChanges(Operator):
         if timer_was_active: print("[MaterialList] Stopped modal polling timer.")
         return None
 
-class MATERIALLIST_OT_refresh_material_list(Operator): # Uses updated populate_material_list and update_material_thumbnails
+class MATERIALLIST_OT_refresh_material_list(Operator):
     bl_idname = "materiallist.refresh_material_list"
     bl_label = "Refresh List & Check Thumbs"
-    bl_description = "Refresh the material list UI and initiate checks for missing thumbnails"
+    bl_description = "Refresh the material list UI, reset selection to the top, and initiate checks for missing thumbnails"
 
     def execute(self, context):
-        scene = context.scene
-        print("[Refresh Op] Refreshing UI List and triggering thumbnail check.")
         try:
-            populate_material_list(scene) # This now excludes "mat_"
+            populate_and_reset_selection(context)
+
             if 'update_material_thumbnails' in globals() and callable(update_material_thumbnails):
-                update_material_thumbnails() # This now includes orphan cleanup scheduling
-            else: print("[Refresh Op] ERROR: update_material_thumbnails not found.")
-            self.report({'INFO'}, "Material list refreshed & thumbnail check started.")
+                update_material_thumbnails()
+
+            self.report({'INFO'}, "Material list refreshed & selection reset.")
         except Exception as e:
-            self.report({'ERROR'}, f"Error during refresh: {e}"); traceback.print_exc()
+            self.report({'ERROR'}, f"Error during refresh: {e}")
+            traceback.print_exc()
             return {'CANCELLED'}
         return {'FINISHED'}
 
@@ -4694,64 +4640,40 @@ def _dispatch_collected_tasks():
             # Make sure this function is defined and does what's expected (e.g., starts the bpy.app.timers.register)
             ensure_thumbnail_queue_processor_running()
 
+      
+      
 def finalize_thumbnail_run():
     global g_thumbnail_process_ongoing, g_material_creation_timestamp_at_process_start
     global g_library_update_pending, g_tasks_for_current_run, g_current_run_task_hashes_being_processed
-    global g_thumbnails_loaded_in_current_UMT_run # Ensure this is global here
+    global g_thumbnails_loaded_in_current_UMT_run
 
-    print("[Finalize Thumbnail Run] Current run completed.")
-    g_current_run_task_hashes_being_processed.clear() 
+    print("[Finalize Thumbnail Run] Thumbnail generation/loading run completed.")
+    g_current_run_task_hashes_being_processed.clear()
+    g_thumbnail_process_ongoing = False 
+    g_material_creation_timestamp_at_process_start = 0.0
 
-    new_materials_found_since_start = False
-    if DATABASE_FILE and os.path.exists(DATABASE_FILE) and g_material_creation_timestamp_at_process_start > 0:
-        try:
-            with get_db_connection() as conn:
-                c = conn.cursor()
-                c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='mat_time'")
-                if c.fetchone():
-                    c.execute("SELECT COUNT(*) FROM mat_time WHERE ts > ?", (int(g_material_creation_timestamp_at_process_start),))
-                    if c.fetchone()[0] > 0:
-                        new_materials_found_since_start = True
-                        print("[Finalize Thumbnail Run] New materials detected in DB since run start.")
-                # else: (mat_time table not found, new_materials_found_since_start remains False)
-        except Exception as e_db_check:
-            print(f"[Finalize Thumbnail Run] Error checking database for new materials: {e_db_check}")
-
-    if new_materials_found_since_start:
-        print("[Finalize Thumbnail Run] Rerunning thumbnail generation due to new materials.")
-        g_thumbnail_process_ongoing = False 
-        # g_thumbnails_loaded_in_current_UMT_run will be reset by the new UMT call.
-        update_material_thumbnails() 
+    # If the background process successfully loaded any new thumbnails into Blender's
+    # preview cache, we need to force a final redraw to make them appear in the UI.
+    if g_thumbnails_loaded_in_current_UMT_run:
+        print("[Finalize Thumbnail Run] New thumbnails were loaded. Forcing UI redraw.")
+        force_redraw()
+        
+        # We also increment the list_version to ensure that if the user searches,
+        # the filter_items function knows it might need to re-evaluate against the now-populated cache.
+        # This is a lightweight way to signal a change without a full, slow repopulation.
+        global list_version
+        list_version += 1
     else:
-        print(f"[Finalize Thumbnail Run] No new materials detected. Thumbnails loaded in this UMT run: {g_thumbnails_loaded_in_current_UMT_run}")
-        g_thumbnail_process_ongoing = False 
-        g_material_creation_timestamp_at_process_start = 0.0 
-
-        # <<< CONDITIONAL UI REFRESH >>>
-        if g_thumbnails_loaded_in_current_UMT_run: # Only refresh if this UMT run actually loaded icons
-            scene = get_first_scene() 
-            if scene and 'populate_material_list' in globals() and callable(populate_material_list):
-                print("[Finalize Thumbnail Run] Refreshing material list UI as new thumbnails were loaded in this UMT run.")
-                try:
-                    # The called_from_finalize_run flag is now less critical for UMT triggering,
-                    # but can be kept for logging or other contextual decisions within populate_material_list.
-                    populate_material_list(scene, called_from_finalize_run=True) 
-                    if 'force_redraw' in globals() and callable(force_redraw):
-                        force_redraw()
-                except Exception as e_populate_final:
-                    print(f"[Finalize Thumbnail Run] Error during conditional populate_material_list: {e_populate_final}")
-                    traceback.print_exc()
-            # The flag g_thumbnails_loaded_in_current_UMT_run will be reset by the *next* call to update_material_thumbnails
-        else:
-            print("[Finalize Thumbnail Run] Skipping UI refresh from finalize_thumbnail_run as no new thumbnails were loaded in this UMT run.")
-
-        if g_library_update_pending:
-            print("[Finalize Thumbnail Run] Processing deferred library update.")
-            g_library_update_pending = False 
-            force_pending_update = getattr(bpy.context.window_manager, 'matlist_pending_lib_update_is_forced', False)
-            _perform_library_update(force=force_pending_update)
-            if hasattr(bpy.context.window_manager, 'matlist_pending_lib_update_is_forced'):
-                bpy.context.window_manager.matlist_pending_lib_update_is_forced = False
+        print("[Finalize Thumbnail Run] No new thumbnails were loaded in this run.")
+    
+    # Process any deferred library updates.
+    if g_library_update_pending:
+        print("[Finalize Thumbnail Run] Processing deferred library update.")
+        g_library_update_pending = False 
+        force_pending_update = getattr(bpy.context.window_manager, 'matlist_pending_lib_update_is_forced', False)
+        _perform_library_update(force=force_pending_update)
+        if hasattr(bpy.context.window_manager, 'matlist_pending_lib_update_is_forced'):
+            bpy.context.window_manager.matlist_pending_lib_update_is_forced = False
 
 def ensure_thumbnail_queue_processor_running():
     global thumbnail_monitor_timer_active
@@ -5409,6 +5331,34 @@ def depsgraph_update_handler(scene, depsgraph):
 def update_material_list_active_index(self, context):
     print(f"[MaterialList] Active material index updated to: {context.scene.material_list_active_index}")
 
+      
+def update_list_and_reset_selection(self, context):
+    """
+    Update callback for UI properties that trigger a list rebuild.
+    It calls populate_and_reset_selection to handle the logic.
+    """
+    populate_and_reset_selection(context)
+    return None
+
+def populate_and_reset_selection(context):
+    """
+    Populates the material list and then resets the active index to 0.
+    This is the core logic for any UI action that should result in a fresh list.
+    """
+    scene = context.scene
+    if not scene:
+        return
+
+    # 1. Repopulate the list based on the current filter settings.
+    populate_material_list(scene)
+
+    # 2. If the newly populated list has items, set the active index to the top.
+    if scene.material_list_items:
+        scene.material_list_active_index = 0
+
+    # 3. Force a redraw to ensure the UI updates immediately.
+    force_redraw()
+
 # update_search removed as search handled by UIList.filter_items & lambda update for prop
 
 prev_workspace_mode = "REFERENCE" # Keep this global for update_workspace_mode
@@ -5525,15 +5475,24 @@ class MATERIALLIST_UL_materials(UIList):
     use_filter_show = False
     use_filter_menu = False
     use_filter_sort_alpha = False
+    use_sort_alpha = False
 
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
-        # This is now the ONLY thing draw_item does. It's incredibly fast.
+        # This function must remain extremely fast.
         
-        # 'item' is the PropertyGroup from scene.material_list_items.
-        # We find the corresponding rich data from our global cache using the index.
-        # This assumes the global cache is always in the same order as the UI list.
         if index < len(material_list_cache):
             cache_entry = material_list_cache[index]
+            
+            # If the icon_id in our fast cache is 0, it means it hasn't been loaded yet
+            # by the background task, OR it failed to load previously. We try to get it.
+            # get_custom_icon is optimized to be very fast if the icon is already
+            # in Blender's preview system. If not, it returns 0 and does nothing expensive.
+            if cache_entry['icon_id'] <= 0:
+                mat_obj = get_material_by_uuid(item.material_uuid)
+                if mat_obj:
+                    # Update our cache with the result for the next redraw.
+                    cache_entry['icon_id'] = get_custom_icon(mat_obj)
+
             icon_val = cache_entry.get("icon_id", 0)
             is_missing = cache_entry.get("is_missing", True)
             
@@ -5550,26 +5509,66 @@ class MATERIALLIST_UL_materials(UIList):
                 if cache_entry.get("is_protected"):
                     row.label(icon="LOCKED")
         else:
-            # Fallback for safety, should not happen in normal operation
+            # Fallback for safety if cache and list go out of sync.
             layout.label(text=item.material_name, icon='QUESTION')
 
     def filter_items(self, context, data, propname):
-        # This function is now also extremely fast. It does NOT do any heavy lifting.
-        # It just tells Blender which items to show based on the search string.
-        items = getattr(data, propname)
-        search_term = context.scene.material_search.lower()
+        """
+        UIList run-time filtering.
+        CORRECTED to check the correct properties on the list items themselves,
+        preserving performance and fixing the filtering bugs.
+        """
+        items            = getattr(data, propname)
+        search_term      = context.scene.material_search.strip().lower()
+        hide_mat_prefix  = context.scene.hide_mat_materials
+        show_only_used   = context.scene.material_list_show_only_local
 
-        if not search_term:
-            # If no search, show everything
+        # Fast exit – if no filters are active, show everything.
+        if not (search_term or hide_mat_prefix or show_only_used):
             return [], []
 
-        # If searching, create a simple list of indices to show
-        filtered_indices = []
-        for i, item in enumerate(items):
-            if search_term in item.material_name.lower():
-                filtered_indices.append(i)
-        
-        return filtered_indices, []
+        # Pre-compute the set of UUIDs actually used in the scene.
+        # This only runs when the "Show Only Local/Used" filter is active.
+        used_uuids = set()
+        if show_only_used:
+            # This loop is efficient and necessary to know which linked materials are in use.
+            for obj in bpy.data.objects:
+                if obj.type == 'MESH':
+                    for slot in obj.material_slots:
+                        if slot.material:
+                            # Use get_material_uuid to handle both local and linked materials
+                            uid = get_material_uuid(slot.material)
+                            if uid:
+                                used_uuids.add(uid)
+
+        # This list will hold a 1 for every visible item and a 0 for every hidden one.
+        filter_flags = []
+
+        for item in items:
+            visible = True
+
+            # 1. Search text filter
+            if search_term and search_term not in item.material_name.lower():
+                visible = False
+
+            # 2. Hide "mat_" materials filter
+            ### FIX ###
+            # This now correctly checks the DISPLAY NAME from the list item, not the datablock name.
+            if visible and hide_mat_prefix and item.material_name.startswith("mat_"):
+                visible = False
+
+            # 3. Show-Only-Local/Used filter
+            ### FIX ###
+            # This now correctly uses the `is_library` property directly from the item.
+            if visible and show_only_used:
+                # If the item is from a library AND its UUID is not in the set of used materials, hide it.
+                if item.is_library and item.material_uuid not in used_uuids:
+                    visible = False
+
+            filter_flags.append(self.bitflag_filter_item if visible else 0)
+
+        # The second list (new order) is empty, meaning we keep the original sort order.
+        return filter_flags, []
 
 class MATERIALLIST_PT_panel(bpy.types.Panel): # Ensure bpy.types.Panel is inherited
     bl_idname = "MATERIALLIST_PT_panel"
@@ -5581,14 +5580,18 @@ class MATERIALLIST_PT_panel(bpy.types.Panel): # Ensure bpy.types.Panel is inheri
 
     def draw(self, context):
         layout = self.layout
-        scene = context.scene
+        scene  = context.scene
 
         # --- Workspace Mode ---
         workspace_box = layout.box()
         row = workspace_box.row(align=True)
         row.label(text="Workspace Mode:", icon='FILE_BLEND')
         row.label(text=f"{scene.workspace_mode}")
-        workspace_box.operator("materiallist.toggle_workspace_mode", text=f"Switch to {'Editing' if scene.workspace_mode == 'REFERENCE' else 'Reference'}", icon='ARROW_LEFTRIGHT')
+        workspace_box.operator(
+            "materiallist.toggle_workspace_mode",
+            text=f"Switch to {'Editing' if scene.workspace_mode == 'REFERENCE' else 'Reference'}",
+            icon='ARROW_LEFTRIGHT'
+        )
 
         # --- Material Options ---
         options_box = layout.box()
@@ -5596,23 +5599,15 @@ class MATERIALLIST_PT_panel(bpy.types.Panel): # Ensure bpy.types.Panel is inheri
 
         row = options_box.row(align=True)
         row.operator("materiallist.rename_to_albedo", text="Rename All to Albedo", icon='FILE_REFRESH')
-        row.operator("materiallist.duplicate_material", text="Duplicate Selected", icon='DUPLICATE')
+        row.operator("materiallist.duplicate_or_localise", text="Create Local Copy", icon='COPYDOWN')
 
         row = options_box.row(align=True)
-        row.prop(scene, "hide_mat_materials", toggle=True, text="Hide mat_ Materials")
-        row.prop(scene, "material_list_show_only_local", toggle=True)
+        row.prop(scene, "hide_mat_materials",           toggle=True, text="Hide mat_ Materials")
+        row.prop(scene, "material_list_show_only_local", toggle=True, text="Show Only Local/Used")
 
         row = options_box.row(align=True)
-        row.operator("materiallist.rename_material", icon='FONT_DATA', text="Rename Display Name")
-        row.operator("materiallist.unassign_mat", icon='PANEL_CLOSE', text="Unassign 'mat_'")
-
-        idx = scene.material_list_active_index
-        if 0 <= idx < len(scene.material_list_items):
-            item = scene.material_list_items[idx]
-            mat_for_make_local_check = get_material_by_uuid(item.material_uuid)
-            if mat_for_make_local_check and mat_for_make_local_check.library:
-                options_box.operator("materiallist.make_local", icon='LINKED', text="Make Selected Local")
-
+        row.operator("materiallist.rename_material", icon='FONT_DATA',   text="Rename Display Name")
+        row.operator("materiallist.unassign_mat",     icon='PANEL_CLOSE', text="Unassign 'mat_'")
 
         # --- Reference Snapshot ---
         backup_box = layout.box()
@@ -5621,57 +5616,52 @@ class MATERIALLIST_PT_panel(bpy.types.Panel): # Ensure bpy.types.Panel is inheri
 
         # --- Assign to Active Object ---
         assign_box = layout.box()
-        # MODIFICATION START: Moved select_dominant to the top
         assign_box.operator("materiallist.select_dominant", text="Select Dominant Material on Active Object", icon='RESTRICT_SELECT_OFF')
         assign_box.operator("materiallist.add_material_to_slot", icon='PLUS', text="Add Selected to Object Slots")
         assign_box.operator("materiallist.assign_selected_material", icon='BRUSH_DATA', text="Assign Selected to Faces/Object")
-        # MODIFICATION END
 
         # --- Material List Display & Info ---
-        mat_list_box = layout.box() # Assuming this is how you structure it
+        mat_list_box = layout.box()
         row = mat_list_box.row(align=True)
         row.label(text="Materials:", icon='MATERIAL')
         row.prop(scene, "material_list_sort_alpha", text="", toggle=True, icon='SORTALPHA')
         row.operator("materiallist.scroll_to_top", icon='TRIA_UP', text="")
 
         row = mat_list_box.row()
-        row.template_list("MATERIALLIST_UL_materials", "", scene, "material_list_items", scene, "material_list_active_index", rows=10, sort_lock=True)
+        row.template_list(
+            "MATERIALLIST_UL_materials", "",
+            scene, "material_list_items",
+            scene, "material_list_active_index",
+            rows=10, sort_lock=True
+        )
 
         sub_row = mat_list_box.row(align=True)
         sub_row.prop(scene, "material_search", text="", icon='VIEWZOOM')
 
-        idx = scene.material_list_active_index # Corrected from active_propname
+        idx = scene.material_list_active_index
         if 0 <= idx < len(scene.material_list_items):
             item = scene.material_list_items[idx]
-            mat_for_preview = get_material_by_uuid(item.material_uuid) # Use helper
-            info_box_parent = mat_list_box # Default parent for info if no preview
+            mat_for_preview = get_material_by_uuid(item.material_uuid)
+            info_parent = mat_list_box
 
             if mat_for_preview:
                 preview_box = mat_list_box.box()
-                if ensure_safe_preview(mat_for_preview): # ensure_safe_preview from your existing code
-                    # This line is key: show_buttons=True (or omitting it, as True is default)
-                    # Blender's template_preview will grey out shape buttons if mat_for_preview.library is set.
-                    preview_box.template_preview(mat_for_preview, show_buttons=True) 
+                if ensure_safe_preview(mat_for_preview):
+                    preview_box.template_preview(mat_for_preview, show_buttons=True)
                 else:
                     preview_box.label(text="Preview not available", icon='ERROR')
-                info_box_parent = preview_box # Info below preview if preview exists
+                info_parent = preview_box
             else:
-                # Handle case where material for preview isn't found
-                missing_mat_info_box = mat_list_box.box()
-                missing_mat_info_box.label(text=f"Material (Data for '{item.material_name}') not found.", icon='ERROR')
+                missing_box = mat_list_box.box()
+                missing_box.label(text="Material data missing", icon='ERROR')
 
-
-            info_box = info_box_parent.box() # Add info box under preview or directly under list
-            info_box.label(text=f"Name: {item.material_name}") 
-            info_box.label(text=f"Source: {'Local' if not item.is_library else 'Library'}")
-            info_box.label(text=f"UUID: {item.material_uuid[:8]}...")
-          
-            name_to_check = item.original_name 
-            if name_to_check and not name_to_check.startswith("mat_") and name_to_check != "Material": # Added check for name_to_check
+            # Duplicate‐name warning
+            name_to_check = item.original_name
+            if name_to_check and not name_to_check.startswith("mat_") and name_to_check != "Material":
                 count = sum(1 for li in scene.material_list_items if li.original_name == name_to_check)
                 if count > 1:
-                    warning_box = info_box.box(); warning_box.alert = True
-                    warning_box.label(text=f"'{name_to_check}' used by {count} materials!", icon='ERROR')
+                    warn_box = info_parent.box(); warn_box.alert = True
+                    warn_box.label(text=f"'{name_to_check}' used by {count} materials!", icon='ERROR')
 
         # --- Library Operations ---
         library_ops_box = layout.box()
@@ -5706,9 +5696,9 @@ class LibraryMaterialEntry(PropertyGroup): # Unchanged
 classes = (
     MaterialListItem,
     MaterialListProperties,
-    LibraryMaterialEntry,
     MATERIALLIST_UL_materials,
     MATERIALLIST_PT_panel,
+    MATERIALLIST_OT_duplicate_or_localise_material,
     MATERIALLIST_OT_toggle_workspace_mode,
     MATERIALLIST_OT_rename_to_albedo,
     MATERIALLIST_OT_unassign_mat,
@@ -5721,14 +5711,12 @@ classes = (
     MATERIALLIST_OT_prepare_material,
     MATERIALLIST_OT_assign_to_object,
     MATERIALLIST_OT_assign_to_faces,
-    MATERIALLIST_OT_make_local,
     MATERIALLIST_OT_sort_alphabetically,
     MATERIALLIST_OT_PollMaterialChanges,
     MATERIALLIST_OT_integrate_library,
     MATERIALLIST_OT_trim_library,
     MATERIALLIST_OT_select_dominant,
     MATERIALLIST_OT_run_localisation_worker,
-    MATERIALLIST_OT_duplicate_material, # New
     MATERIALLIST_OT_pack_library_textures, # New
     MATERIALLIST_OT_scroll_to_top, # New
     MATERIALLIST_OT_pack_textures_externally,   # New
@@ -5737,20 +5725,49 @@ classes = (
 
 scene_props = [
     ("material_list_items", bpy.props.CollectionProperty(type=MaterialListItem)),
-    ("material_list_active_index", bpy.props.IntProperty(name="Active Index", default=0, min=0, update=update_material_list_active_index)),
-    ("material_search", bpy.props.StringProperty(name="Search Materials", description="Search material names", default="", update=lambda self, context: None)),
-    ("hide_mat_materials", bpy.props.BoolProperty(name="Hide Default Materials", description="Hide materials starting with 'mat_'", default=False, update=lambda self, context: populate_material_list(context.scene))),
-    ("workspace_mode", bpy.props.EnumProperty(name="Workspace Mode", items=[('REFERENCE', "Reference", "Reference configuration"), ('EDITING', "Editing", "Editing configuration")], default='REFERENCE', update=update_workspace_mode)),
-    ("mat_materials_unassigned", bpy.props.BoolProperty(name="Unassign mat_ Materials", description="Toggle backup/restore of mat_ assignments", default=False)),
+    ("material_list_active_index", bpy.props.IntProperty(name="Active Index", default=-1, update=update_material_list_active_index)),
+    ("material_search", bpy.props.StringProperty(
+        name="Search Materials", 
+        description="Filter material list by name", 
+        default="", 
+        update=lambda self, context: force_redraw() # A simple redraw is enough for search
+    )),
+    ("hide_mat_materials", bpy.props.BoolProperty(
+        name="Hide Default Materials", 
+        description="Hide materials starting with 'mat_'", 
+        default=False, 
+        update=lambda self, context: force_redraw() # CHANGED: No longer rebuilds the list
+    )),
+    ("workspace_mode", bpy.props.EnumProperty(
+        name="Workspace Mode", 
+        items=[('REFERENCE', "Reference", "Reference configuration"), ('EDITING', "Editing", "Editing configuration")], 
+        default='REFERENCE', 
+        update=update_workspace_mode
+    )),
+    ("mat_materials_unassigned", bpy.props.BoolProperty(
+        name="Unassign mat_ Materials", 
+        description="Toggle backup/restore of mat_ assignments", 
+        default=False
+    )),
     ("material_list", bpy.props.PointerProperty(type=MaterialListProperties)),
     ("library_materials", bpy.props.CollectionProperty(type=LibraryMaterialEntry)),
-    ("material_list_sort_alpha", bpy.props.BoolProperty(name="Sort Alphabetically", description="Sort the material list alphabetically by display name instead of by recency", default=False, update=lambda self, context: populate_material_list(context.scene))),
-    ("material_list_show_only_local", bpy.props.BoolProperty(name="Show Only Local/Used", description="Show only local materials and linked materials currently assigned to objects in the scene", default=False, update=lambda self, context: populate_material_list(context.scene))),
+    ("material_list_sort_alpha", bpy.props.BoolProperty(
+        name="Sort Alphabetically", 
+        description="Sort the material list alphabetically by display name instead of by recency", 
+        default=False, 
+        update=update_list_and_reset_selection # KEPT: Changing sort order requires a full list rebuild
+    )),
+    ("material_list_show_only_local", bpy.props.BoolProperty(
+        name="Show Only Local/Used", 
+        description="Show only local materials and linked materials currently assigned to objects in the scene", 
+        default=False, 
+        update=lambda self, context: force_redraw() # CHANGED: No longer rebuilds the list
+    )),
     ("material_list_external_unpack_dir", bpy.props.StringProperty(
-        name="External Output Folder",  # This name is used as the label by default if text isn't specified in layout.prop
+        name="External Output Folder",
         description="Directory to save external textures. Use // for paths relative to the .blend file.",
-        subtype='DIR_PATH',          # This makes it use the directory explorer
-        default="//textures_external/" # A sensible default relative path
+        subtype='DIR_PATH',
+        default="//textures_external/"
     )),
 ]
 
