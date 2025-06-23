@@ -1561,6 +1561,32 @@ def get_material_by_uuid(uuid_str: str): # Unchanged
     # print(f"[DEBUG get_material_by_uuid]   Material with UUID '{uuid_str}' NOT FOUND after all checks. Returning None.") # Keep final failure log
     return None
 
+def set_active_index_to_top(context):
+    """
+    Deferred function to set the active index to 0.
+    This runs after the UI has had a chance to update and filter.
+    """
+    scene = context.scene
+    if scene and hasattr(scene, 'material_list_items') and scene.material_list_items:
+        # Check if the current index is still valid in the filtered view.
+        # This is a bit tricky, but a simple reset to 0 is the main goal.
+        scene.material_list_active_index = 0
+    return None # Timer stops itself
+
+def update_filter_and_select_top(self, context):
+    """
+    Update callback for filter toggles.
+    It forces a redraw and schedules the active index to be set to 0.
+    """
+    force_redraw()
+    
+    # Schedule the selection to happen in the near future, after the UI has updated.
+    # We check if a timer is already scheduled to avoid stacking them.
+    if not bpy.app.timers.is_registered(lambda: set_active_index_to_top(context)):
+        bpy.app.timers.register(lambda: set_active_index_to_top(context), first_interval=0.02)
+        
+    return None
+
 def ensure_material_library(): # Unchanged
     try:
         os.makedirs(LIBRARY_FOLDER, exist_ok=True); os.makedirs(THUMBNAIL_FOLDER, exist_ok=True)
@@ -5753,13 +5779,13 @@ scene_props = [
         name="Search Materials", 
         description="Filter material list by name", 
         default="", 
-        update=lambda self, context: force_redraw() # A simple redraw is enough for search
+        update=update_filter_and_select_top # <--- CHANGED to the new smart function
     )),
     ("hide_mat_materials", bpy.props.BoolProperty(
         name="Hide Default Materials", 
         description="Hide materials starting with 'mat_'", 
         default=False, 
-        update=lambda self, context: force_redraw() # CHANGED: No longer rebuilds the list
+        update=update_filter_and_select_top # <--- CHANGED to the new smart function
     )),
     ("workspace_mode", bpy.props.EnumProperty(
         name="Workspace Mode", 
@@ -5778,13 +5804,13 @@ scene_props = [
         name="Sort Alphabetically", 
         description="Sort the material list alphabetically by display name instead of by recency", 
         default=False, 
-        update=update_list_and_reset_selection # KEPT: Changing sort order requires a full list rebuild
+        update=update_list_and_reset_selection # Correct: This one DOES need a full rebuild
     )),
     ("material_list_show_only_local", bpy.props.BoolProperty(
         name="Show Only Local/Used", 
         description="Show only local materials and linked materials currently assigned to objects in the scene", 
         default=False, 
-        update=lambda self, context: force_redraw() # CHANGED: No longer rebuilds the list
+        update=update_filter_and_select_top # <--- CHANGED to the new smart function
     )),
     ("material_list_external_unpack_dir", bpy.props.StringProperty(
         name="External Output Folder",
