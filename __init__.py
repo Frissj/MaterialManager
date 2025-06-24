@@ -22,6 +22,7 @@ from contextlib import contextmanager
 from queue import Queue, PriorityQueue, Empty # Keep PriorityQueue for now, even if thumbnail_queue is removed
 from threading import Thread, Event, Lock
 from datetime import datetime
+from collections import deque
 
 # --------------------------
 # Helper function to get user-specific data directory
@@ -91,6 +92,10 @@ g_matlist_transient_tasks_for_post_save = []
 g_used_uuids_cache = set()
 g_used_uuids_dirty = True
 g_save_handler_start_time = 0.0
+g_hashing_scene_bundle = None
+g_materials_are_dirty = False
+g_material_processing_timer_active = False
+materials_modified = False
 
 THUMBNAIL_SIZE = 128
 VISIBLE_ITEMS = 30
@@ -292,136 +297,190 @@ def save_material_hashes():
 
 # --- START OF HASHING FUNCTIONS ---
 # (Using versions from background_writer.py for helpers, and __init__.py for main logic)
+def _get_all_nodes_recursive(node_tree):
+    """
+    Recursively yields all nodes from a node tree and any nested groups.
+    This function fulfills Point 2 of the description.
+    """
+    if not node_tree:
+        return
+    for node in node_tree.nodes:
+        yield node
+        if node.type == 'GROUP' and node.node_tree:
+            yield from _get_all_nodes_recursive(node.node_tree)
+
+def _get_node_recipe_string(node, image_hash_cache):
+    """
+    Builds the detailed "recipe" string for a single node, including special
+    handling for content nodes AND a robust loop for all input default values.
+    """
+    # Basic node identification
+    node_parts = [f"NODE:{node.name}", f"TYPE:{node.bl_idname}"]
+
+    # --- Generic Property Loop ---
+    # This reads standard node settings (like dropdown menus, checkboxes, etc.)
+    for prop in node.bl_rna.properties:
+        if prop.is_readonly or prop.identifier in [
+            'rna_type', 'name', 'label', 'inputs', 'outputs', 'parent', 'internal_links',
+            'color_ramp', 'image', 'node_tree'
+        ]:
+            continue
+        try:
+            value = getattr(node, prop.identifier)
+            node_parts.append(f"PROP:{prop.identifier}={_stable_repr(value)}")
+        except AttributeError:
+            continue
+
+    # --- *** THE CRITICAL FIX IS HERE *** ---
+    # This loop explicitly reads the default value of every input socket.
+    # This is how we "see" the sliders on custom node groups.
+    for inp in node.inputs:
+        # We only care about the default_value if nothing is plugged into the socket.
+        if not inp.is_linked and hasattr(inp, 'default_value'):
+            # This captures the state of UI sliders, color fields, and value boxes.
+            node_parts.append(f"INPUT_DEFAULT:{inp.identifier}={_stable_repr(inp.default_value)}")
+
+    # --- Special Content Node Handlers (These remain the same) ---
+    if node.type == 'TEX_IMAGE' and node.image:
+        image_content_hash = _hash_image(node.image, image_hash_cache)
+        node_parts.append(f"SPECIAL_CONTENT_HASH:{image_content_hash}")
+
+    elif node.type == 'ShaderNodeValToRGB':  # ColorRamp
+        cr = node.color_ramp
+        if cr:
+            elements_str = [f"STOP({_stable_repr(s.position)}, {_stable_repr(s.color)})" for s in cr.elements]
+            node_parts.append(f"SPECIAL_CONTENT_STOPS:[{','.join(elements_str)}]")
+
+    # Sort all parts for perfect repeatability
+    return "||".join(sorted(node_parts))
 
 # Helper function for consistent float formatting (Identical to background_writer.py)
-def _float_repr(f):
-    """ Ensure consistent float representation for hashing. """
+def _get_all_image_nodes_recursive(node_tree):
+    """
+    A generator function that recursively yields all TEX_IMAGE nodes
+    from a node tree and any nested groups.
+    """
+    if not node_tree: return
+    for node in node_tree.nodes:
+        if node.type == 'TEX_IMAGE':
+            yield node
+        elif node.type == 'GROUP' and node.node_tree:
+            # Recurse into the group's node tree
+            yield from _get_all_image_nodes_recursive(node.node_tree)
+
+def _validate_and_recover_image_source_main(image_datablock, temp_dir_for_recovery):
+    """
+    Ensures an image datablock has a valid, on-disk source file.
+    If the path is invalid but pixel data exists, it saves the data to a
+    temporary directory and reloads it. This is crucial for the hashing
+    process to render packed or generated textures.
+    Returns True on success, False on critical failure.
+    """
+    if not image_datablock:
+        return True
+
+    filepath = ""
     try:
-        return f"{float(f):.8f}" # Use consistent precision
+        # Use filepath_from_user() to respect user-set paths
+        if image_datablock.filepath_from_user():
+             filepath = bpy.path.abspath(image_datablock.filepath_from_user())
+    except Exception:
+        filepath = ""
+
+    if filepath and os.path.exists(filepath):
+        return True # Path is valid, nothing to do.
+
+    if not os.path.exists(filepath) and image_datablock.has_data:
+        try:
+            safe_name = "".join(c for c in image_datablock.name if c.isalnum() or c in ('_', '.', '-')).strip()
+            ext = ".png"
+            base_name, _ = os.path.splitext(safe_name)
+            recovery_path = os.path.join(temp_dir_for_recovery, f"{base_name}{ext}")
+
+            image_copy = image_datablock.copy()
+            image_copy.filepath_raw = recovery_path
+            image_copy.file_format = 'PNG'
+            image_copy.save()
+            
+            image_datablock.filepath = recovery_path
+            image_datablock.source = 'FILE'
+            image_datablock.reload()
+            
+            return True
+
+        except Exception as e:
+            print(f"[Hash Texture Recovery] Failed to recover source image data for '{image_datablock.name}': {e}", file=sys.stderr)
+            return False
+    
+    return True
+
+def _float_repr(f):
+    """Consistent, standardized string representation for float values."""
+    try:
+        return f"{float(f):.8f}"
     except (ValueError, TypeError):
-        print(f"[_float_repr Warning] Could not convert {f} to float.")
         return "CONV_ERROR"
 
-# Stable Representation (Version from background_writer.py)
 def _stable_repr(value):
-    """ Create a stable string representation for common Blender property types. """
+    """Creates a stable, repeatable string representation for various data types."""
     if isinstance(value, (int, str, bool)):
         return str(value)
     elif isinstance(value, float):
         return f"{value:.8f}"
     elif isinstance(value, (bpy.types.bpy_prop_array, tuple, list)):
         if not value: return '[]'
-        try: # Attempt to treat as numeric list
+        try:
             if all(isinstance(x, (int, float)) for x in value):
-                 return '[' + ','.join([_float_repr(item) for item in value]) + ']'
-        except TypeError: # If 'in' fails on an item that's not iterable, or other type issues
-            pass # Fall through to general repr
-        return repr(value) # Fallback for mixed types or non-numeric lists
+                return '[' + ','.join([_float_repr(item) for item in value]) + ']'
+        except TypeError:
+            pass
+        return repr(value)
     elif hasattr(value, 'to_list'):
         list_val = value.to_list()
-        if not list_val: return '[]' # Handle empty to_list() result
-        if '_float_repr' in globals() and callable(_float_repr):
-            return '[' + ','.join([_float_repr(item) for item in list_val]) + ']'
-        else:
-            print("[_stable_repr CRITICAL] _float_repr helper not found for to_list()!")
-            return str(list_val) # Fallback to string of list if helper missing
+        if not list_val: return '[]'
+        return '[' + ','.join([_float_repr(item) for item in list_val]) + ']'
     elif value is None:
         return 'None'
     else:
-        # Fallback to standard repr for any other types
         return repr(value)
 
 # _hash_image (Version from background_writer.py, modified for image_hash_cache)
-def _hash_image(img, image_hash_cache=None): # Added image_hash_cache parameter
-    if not img: 
+def _hash_image(img, image_hash_cache):
+    """Calculates a hash based on the image's file content."""
+    if not img:
         return "NO_IMAGE_DATABLOCK"
 
-    # --- Cache Key Generation ---
-    # Try to create a reasonably unique key for the image datablock for caching purposes.
-    # id(img.original) would be ideal if always reliable for content source.
-    # For now, using a combination of available attributes.
-    cache_key = None
-    if hasattr(img, 'name_full') and img.name_full: # Includes library path
-        cache_key = img.name_full 
-    elif hasattr(img, 'name') and img.name:
-        cache_key = img.name # Fallback if name_full is not good
-    
-    # If it's a packed file, its content is self-contained. The name should be unique enough within bpy.data.images.
-    # If it's external, the filepath_raw (resolved) is critical.
-    if img.packed_file:
-        if cache_key:
-            cache_key += "|PACKED"
-        else: # Should not happen if img.name exists
-            cache_key = f"PACKED_IMG_ID_{id(img)}" 
-    elif hasattr(img, 'filepath_raw') and img.filepath_raw:
-        # For external files, the raw path (which might be relative) is part of its identity.
-        # The actual content hash will depend on the resolved absolute path.
-        # For caching, we can use the raw path plus library info if any.
-        if cache_key:
-            cache_key += f"|EXT_RAW:{img.filepath_raw}"
-        else:
-            cache_key = f"EXT_RAW:{img.filepath_raw}_ID_{id(img)}"
+    cache_key = img.name_full if hasattr(img, 'name_full') else str(id(img))
 
-    if image_hash_cache is not None and cache_key is not None and cache_key in image_hash_cache:
-        # print(f"[_hash_image CACHE HIT] For key: {cache_key} -> {image_hash_cache[cache_key][:8]}") # DEBUG
+    if image_hash_cache is not None and cache_key in image_hash_cache:
         return image_hash_cache[cache_key]
-    # --- End Cache Key Generation & Check ---
 
-    calculated_digest = None # This will store the final hash for this image
-
-    # 1. Handle PACKED images first
+    calculated_digest = None
     if hasattr(img, 'packed_file') and img.packed_file and hasattr(img.packed_file, 'data') and img.packed_file.data:
         try:
             data_to_hash = bytes(img.packed_file.data[:131072])
             calculated_digest = hashlib.md5(data_to_hash).hexdigest()
-        except Exception as e_pack_hash:
-            print(f"[_hash_image Warning] Could not hash packed_file.data for image '{getattr(img, 'name', 'N/A')}': {e_pack_hash}", file=sys.stderr)
-            # Fall through to metadata-based fallback if direct data hashing fails
+        except Exception as e_pack:
+            print(f"[_hash_image Warning] Hash failed on packed data for '{img.name}': {e_pack}", file=sys.stderr)
 
-    # 2. Handle EXTERNAL images (if not packed or packed hashing failed)
-    if calculated_digest is None: # Only if not already hashed from packed data
-        raw_path = img.filepath_raw if hasattr(img, 'filepath_raw') and img.filepath_raw else ""
-        resolved_abs_path = ""
+    if calculated_digest is None and hasattr(img, 'filepath_raw') and img.filepath_raw:
         try:
-            if hasattr(img, 'library') and img.library and hasattr(img.library, 'filepath') and img.library.filepath and raw_path.startswith('//'):
-                library_blend_abs_path = bpy.path.abspath(img.library.filepath)
-                library_dir = os.path.dirname(library_blend_abs_path)
-                path_relative_to_lib_root = raw_path[2:]
-                path_relative_to_lib_root = path_relative_to_lib_root.replace('\\', os.sep).replace('/', os.sep)
-                resolved_abs_path = os.path.join(library_dir, path_relative_to_lib_root)
-            elif raw_path:
-                resolved_abs_path = bpy.path.abspath(raw_path)
-            
-            if resolved_abs_path and os.path.exists(resolved_abs_path) and os.path.isfile(resolved_abs_path):
-                try:
-                    with open(resolved_abs_path, "rb") as f: 
-                        data_from_file = f.read(131072)
-                    calculated_digest = hashlib.md5(data_from_file).hexdigest()
-                except Exception as read_err:
-                    print(f"[_hash_image Warning] Could not read external file '{resolved_abs_path}' (from raw '{raw_path}', image '{getattr(img, 'name', 'N/A')}'): {read_err}", file=sys.stderr)
-                    # Fall through to fallback
-            # else: (file not found by resolved_abs_path, fall through to fallback)
-        except Exception as path_err: 
-            print(f"[_hash_image Warning] Error during path resolution/check for external file '{raw_path}' (image '{getattr(img, 'name', 'N/A')}'): {path_err}", file=sys.stderr)
-            # Fall through to fallback
-        
-    # 3. Fallback if neither packed data nor external file content could be successfully hashed
+            resolved_abs_path = bpy.path.abspath(img.filepath_raw)
+            if os.path.isfile(resolved_abs_path):
+                with open(resolved_abs_path, "rb") as f:
+                    data_from_file = f.read(131072)
+                calculated_digest = hashlib.md5(data_from_file).hexdigest()
+        except Exception as e_file:
+            print(f"[_hash_image Warning] Hash failed on file '{img.filepath_raw}': {e_file}", file=sys.stderr)
+
     if calculated_digest is None:
-        img_name_for_fallback = getattr(img, 'name_full', getattr(img, 'name', 'UnknownImage'))
-        is_packed_for_fallback = hasattr(img, 'packed_file') and (img.packed_file is not None)
-        source_for_fallback = getattr(img, 'source', 'UNKNOWN_SOURCE')
-        raw_path_for_fallback = img.filepath_raw if hasattr(img, 'filepath_raw') and img.filepath_raw else "" # Add raw path to fallback
-        
-        fallback_data = f"FALLBACK_HASH_FOR_IMG|NAME:{img_name_for_fallback}|RAW_PATH:{raw_path_for_fallback}|IS_PACKED_STATE:{is_packed_for_fallback}|SOURCE:{source_for_fallback}"
+        fallback_data = f"FALLBACK|{getattr(img, 'name_full', 'N/A')}|{getattr(img, 'source', 'N/A')}"
         calculated_digest = hashlib.md5(fallback_data.encode('utf-8')).hexdigest()
 
-    # --- Cache Storing ---
-    if image_hash_cache is not None and cache_key is not None and calculated_digest is not None:
+    if image_hash_cache is not None:
         image_hash_cache[cache_key] = calculated_digest
-        # print(f"[_hash_image CACHE SET] For key: {cache_key} -> {calculated_digest[:8]}") # DEBUG
-    # --- End Cache Storing ---
 
-    return calculated_digest if calculated_digest is not None else "IMAGE_HASHING_ERROR_FALLBACK"
+    return calculated_digest
 
 # find_principled_bsdf (Kept from your __init__.py)
 def find_principled_bsdf(mat):
@@ -438,207 +497,322 @@ def find_principled_bsdf(mat):
 
         current_node = surface_input.links[0].from_node
         visited_nodes = set()
-        for _ in range(20): # Limit search depth (increased to match BG worker)
+        for _ in range(20): # Limit search depth
             if not current_node or current_node in visited_nodes: break
             visited_nodes.add(current_node)
             if current_node.bl_idname == 'ShaderNodeBsdfPrincipled': return current_node
-            
+
             potential_shader_inputs = []
             if hasattr(current_node, 'inputs'):
-                # Check common specific names first
                 shader_input_names = ["Shader", "Shader1", "Shader2"]
                 for name in shader_input_names:
                     if name in current_node.inputs:
                         potential_shader_inputs.append(current_node.inputs[name])
-                
-                # Generic check for any other input of type SHADER
                 for inp in current_node.inputs:
                     if inp.type == 'SHADER' and inp not in potential_shader_inputs:
                         potential_shader_inputs.append(inp)
-            
+
             found_next_shader_link = False
             for inp_socket in potential_shader_inputs:
                 if inp_socket.is_linked and inp_socket.links and inp_socket.links[0].from_socket.type == 'SHADER':
                     current_node = inp_socket.links[0].from_node
                     found_next_shader_link = True
-                    break 
+                    break
             if not found_next_shader_link: break
-        
-        # If traversal fails, fall back to a direct search (like BG worker's implied fallback)
         return next((n for n in mat.node_tree.nodes if n.bl_idname == 'ShaderNodeBsdfPrincipled'), None)
     except Exception as e:
-        print(f"[Hash Helper Main Addon] Error finding Principled BSDF for {getattr(mat, 'name', 'N/A')}: {e}")
-        # Fallback to direct search on any error during traversal
+        print(f"[find_principled_bsdf BG Error] For {getattr(mat, 'name', 'N/A')}: {e}", file=sys.stderr)
         return next((n for n in mat.node_tree.nodes if n.bl_idname == 'ShaderNodeBsdfPrincipled'), None)
 
 # get_material_hash (Structure from __init__.py, using updated helpers)
-def get_material_hash(mat, force=True, image_hash_cache=None): # Added image_hash_cache parameter
-    HASH_VERSION = "v_RTX_REMIX_PBR_COMPREHENSIVE_2_CONTENT_ONLY" 
+      
+def get_material_hash(mat, force=True, image_hash_cache=None):
+    """
+    [PRODUCTION VERSION] Calculates a highly detailed, content-based structural hash for a material.
+    This version uses a robust, queue-based traversal to correctly handle nested node
+    groups and their exposed slider values, including a specific fix for uniform
+    parameter nodes (ShaderNodeValue).
+    """
+    # Incrementing the version ensures that any materials hashed with older,
+    # incorrect logic will be re-hashed and their thumbnails updated correctly.
+    HASH_VERSION = "v_STRUCTURAL_ROBUST_TRAVERSAL_2"
 
-    if not mat: 
+    if not mat:
         return None
-    
-    mat_name_for_debug = getattr(mat, 'name_full', getattr(mat, 'name', 'UnknownMaterial'))
+
     mat_uuid = mat.get("uuid")
+    if not force and mat_uuid and mat_uuid in global_hash_cache:
+        return global_hash_cache[mat_uuid]
 
-    if not force and mat_uuid:
-        if mat_uuid in material_hashes:
-            return material_hashes[mat_uuid]
-        if mat_uuid in global_hash_cache:
-            return global_hash_cache[mat_uuid]
-
-    hash_inputs = []
-    pbr_image_hashes = set() 
+    mat_name_for_debug = getattr(mat, 'name_full', getattr(mat, 'name', 'UnknownMaterial'))
 
     try:
-        principled_node = None
-        material_output_node = None
+        recipe_parts = [f"VERSION:{HASH_VERSION}"]
 
-        if mat.use_nodes and mat.node_tree:
-            principled_node = find_principled_bsdf(mat) 
-            for node_out_check in mat.node_tree.nodes:
-                if node_out_check.bl_idname == 'ShaderNodeOutputMaterial' and node_out_check.is_active_output:
-                    material_output_node = node_out_check
-                    break
-            if not material_output_node:
-                for node_out_check in mat.node_tree.nodes:
-                    if node_out_check.bl_idname == 'ShaderNodeOutputMaterial':
-                        material_output_node = node_out_check
-                        break
-        else: # Non-node material
-            hash_inputs.append("NON_NODE_MATERIAL")
-            hash_inputs.append(f"DiffuseColor:{_stable_repr(mat.diffuse_color)}")
-            hash_inputs.append(f"Metallic:{_stable_repr(mat.metallic)}")
-            hash_inputs.append(f"Roughness:{_stable_repr(mat.roughness)}")
+        if not mat.use_nodes or not mat.node_tree:
+            recipe_parts.append("NON_NODE_MATERIAL")
+            recipe_parts.append(f"DiffuseColor:{_stable_repr(mat.diffuse_color)}")
+            recipe_parts.append(f"Metallic:{_stable_repr(mat.metallic)}")
+            recipe_parts.append(f"Roughness:{_stable_repr(mat.roughness)}")
+        else:
+            if image_hash_cache is None:
+                image_hash_cache = {}
 
-        if principled_node:
-            hash_inputs.append(f"SHADER_TYPE:{principled_node.bl_idname}")
-            inputs_to_process = [
-                ("Base Color", "color_texture"), ("Metallic", "value_texture"), ("Roughness", "value_texture"),
-                ("IOR", "value_only"), ("Alpha", "value_texture"), ("Normal", "normal_texture_special"),
-                ("Emission Color", "color_texture"), ("Emission Strength", "value_only"),
-                ("Subsurface Weight", "value_texture"), ("Subsurface Color", "color_texture"),
-                ("Subsurface Radius", "vector_value_only"), ("Subsurface Scale", "value_only"),
-                ("Subsurface IOR", "value_only"), ("Subsurface Anisotropy", "value_only"),
-                ("Clearcoat Weight", "value_texture"), ("Clearcoat Tint", "color_texture"), 
-                ("Clearcoat Roughness", "value_texture"),
-                ("Clearcoat Normal", "normal_texture_special"),
-                ("Specular IOR Level", "value_texture"), ("Specular Tint", "color_texture"),
-                ("Sheen Weight", "value_texture"), ("Sheen Tint", "color_texture"),
-                ("Sheen Roughness", "value_texture"),
-                ("Transmission Weight", "value_texture"), ("Transmission Roughness", "value_texture"),
-                ("Anisotropic", "value_texture"),("Anisotropic Rotation", "value_texture"),
-            ]
-            coat_inputs_to_check = [
-                ("Coat Weight", "value_texture"), ("Coat Roughness", "value_texture"),
-                ("Coat IOR", "value_only"), ("Coat Tint", "color_texture"),
-                ("Coat Normal", "normal_texture_special")
-            ]
-            for coat_input_name, coat_processing_type in coat_inputs_to_check:
-                if coat_input_name in principled_node.inputs:
-                    inputs_to_process.append((coat_input_name, coat_processing_type))
+            all_node_recipes = []
+            all_link_recipes = []
 
-            for input_name, processing_type in inputs_to_process:
-                inp = principled_node.inputs.get(input_name)
-                if not inp: continue
+            trees_to_process = deque([mat.node_tree])
+            processed_trees = {mat.node_tree}
 
-                input_key_str = f"INPUT:{input_name}"
-                if inp.is_linked:
-                    link = inp.links[0]; source_node = link.from_node; source_socket_name = link.from_socket.name
-                    if processing_type == "normal_texture_special":
-                        if source_node.bl_idname == 'ShaderNodeNormalMap':
-                            nm_strength_input = source_node.inputs.get("Strength")
-                            nm_strength = nm_strength_input.default_value if nm_strength_input and hasattr(nm_strength_input, 'default_value') else 1.0
-                            nm_color_input = source_node.inputs.get("Color")
-                            tex_hash = "NO_TEX_IN_NORMALMAP"
-                            if nm_color_input and nm_color_input.is_linked and nm_color_input.links[0].from_node.bl_idname == 'ShaderNodeTexImage':
-                                tex_node = nm_color_input.links[0].from_node
-                                if tex_node.image:
-                                    img_hash = _hash_image(tex_node.image, image_hash_cache=image_hash_cache) # Pass cache
-                                    if img_hash: pbr_image_hashes.add(img_hash)
-                                    tex_hash = img_hash if img_hash else f"TEX_NORMALMAP_IMG_NO_HASH_{getattr(tex_node.image, 'name', 'Unnamed')}"
-                            hash_inputs.append(f"{input_key_str}=NORMALMAP(Strength:{_stable_repr(nm_strength)},Tex:{tex_hash})")
-                        elif source_node.bl_idname == 'ShaderNodeBump':
-                            bump_strength_input = source_node.inputs.get("Strength")
-                            bump_distance_input = source_node.inputs.get("Distance")
-                            bump_strength = bump_strength_input.default_value if bump_strength_input and hasattr(bump_strength_input, 'default_value') else 1.0
-                            bump_distance = bump_distance_input.default_value if bump_distance_input and hasattr(bump_distance_input, 'default_value') else 0.1
-                            bump_height_input = source_node.inputs.get("Height")
-                            tex_hash = "NO_TEX_IN_BUMPMAP"
-                            if bump_height_input and bump_height_input.is_linked and bump_height_input.links[0].from_node.bl_idname == 'ShaderNodeTexImage':
-                                tex_node = bump_height_input.links[0].from_node
-                                if tex_node.image:
-                                    img_hash = _hash_image(tex_node.image, image_hash_cache=image_hash_cache) # Pass cache
-                                    if img_hash: pbr_image_hashes.add(img_hash)
-                                    tex_hash = img_hash if img_hash else f"TEX_BUMP_IMG_NO_HASH_{getattr(tex_node.image, 'name', 'Unnamed')}"
-                            hash_inputs.append(f"{input_key_str}=BUMPMAP(Strength:{_stable_repr(bump_strength)},Distance:{_stable_repr(bump_distance)},Tex:{tex_hash})")
-                        elif source_node.bl_idname == 'ShaderNodeTexImage' and source_node.image:
-                            img_hash = _hash_image(source_node.image, image_hash_cache=image_hash_cache) # Pass cache
-                            if img_hash: pbr_image_hashes.add(img_hash)
-                            tex_hash = img_hash if img_hash else f"TEX_NORMAL_IMG_NO_HASH_{getattr(source_node.image, 'name', 'Unnamed')}"
-                            hash_inputs.append(f"{input_key_str}=TEX:{tex_hash}")
-                        else:
-                            hash_inputs.append(f"{input_key_str}=LINKED_NODE:{source_node.bl_idname}_SOCKET:{source_socket_name}")
-                    elif source_node.bl_idname == 'ShaderNodeTexImage' and source_node.image:
-                        img_hash = _hash_image(source_node.image, image_hash_cache=image_hash_cache) # Pass cache
-                        if img_hash: pbr_image_hashes.add(img_hash)
-                        tex_hash = img_hash if img_hash else f"TEX_{input_name.replace(' ','')}_IMG_NO_HASH_{getattr(source_node.image, 'name', 'Unnamed')}"
-                        hash_inputs.append(f"{input_key_str}=TEX:{tex_hash}")
-                    else:
-                        hash_inputs.append(f"{input_key_str}=LINKED_NODE:{source_node.bl_idname}_SOCKET:{source_socket_name}")
-                else: # Input not linked
-                    hash_inputs.append(f"{input_key_str}=VALUE:{_stable_repr(inp.default_value)}")
+            while trees_to_process:
+                current_tree = trees_to_process.popleft()
 
-        if material_output_node:
-            disp_input = material_output_node.inputs.get("Displacement")
-            if disp_input and disp_input.is_linked:
-                link = disp_input.links[0]; source_node = link.from_node; source_socket_name = link.from_socket.name
-                if source_node.bl_idname == 'ShaderNodeDisplacement':
-                    disp_height_input = source_node.inputs.get("Height")
-                    disp_midlevel_input = source_node.inputs.get("Midlevel")
-                    disp_scale_input = source_node.inputs.get("Scale")
-                    disp_midlevel = disp_midlevel_input.default_value if disp_midlevel_input and hasattr(disp_midlevel_input, 'default_value') else 0.5
-                    disp_scale = disp_scale_input.default_value if disp_scale_input and hasattr(disp_scale_input, 'default_value') else 1.0
-                    tex_hash = "NO_TEX_IN_DISPLACEMENT_NODE"
-                    if disp_height_input and disp_height_input.is_linked and disp_height_input.links[0].from_node.bl_idname == 'ShaderNodeTexImage':
-                        tex_node = disp_height_input.links[0].from_node
-                        if tex_node.image:
-                            img_hash = _hash_image(tex_node.image, image_hash_cache=image_hash_cache) # Pass cache
-                            if img_hash: pbr_image_hashes.add(img_hash)
-                            tex_hash = img_hash if img_hash else f"TEX_DISP_IMG_NO_HASH_{getattr(tex_node.image, 'name', 'Unnamed')}"
-                    hash_inputs.append(f"MAT_OUTPUT_DISPLACEMENT=DISP_NODE(Mid:{_stable_repr(disp_midlevel)},Scale:{_stable_repr(disp_scale)},Tex:{tex_hash})")
-                elif source_node.bl_idname == 'ShaderNodeTexImage' and source_node.image:
-                    img_hash = _hash_image(source_node.image, image_hash_cache=image_hash_cache) # Pass cache
-                    if img_hash: pbr_image_hashes.add(img_hash)
-                    tex_hash = img_hash if img_hash else f"TEX_DISP_DIRECT_IMG_NO_HASH_{getattr(source_node.image, 'name', 'Unnamed')}"
-                    hash_inputs.append(f"MAT_OUTPUT_DISPLACEMENT=TEX:{tex_hash}")
-                else: 
-                    hash_inputs.append(f"MAT_OUTPUT_DISPLACEMENT=LINKED_NODE:{source_node.bl_idname}_SOCKET:{source_socket_name}")
+                for node in current_tree.nodes:
+                    node_parts = [f"NODE:{node.name}", f"TYPE:{node.bl_idname}"]
 
-        if mat.use_nodes and mat.node_tree:
-            for node in mat.node_tree.nodes:
-                if node.bl_idname == 'ShaderNodeTexImage' and node.image:
-                    img_hash_general = _hash_image(node.image, image_hash_cache=image_hash_cache) # Pass cache
-                    if img_hash_general:
-                        pbr_image_hashes.add(img_hash_general)
+                    # Generic Properties
+                    for prop in node.bl_rna.properties:
+                        if prop.is_readonly or prop.identifier in [
+                            'rna_type', 'name', 'label', 'inputs', 'outputs', 'parent', 'internal_links',
+                            'color_ramp', 'image', 'node_tree', 'outputs'
+                        ]:
+                            continue
+                        try:
+                            value = getattr(node, prop.identifier)
+                            node_parts.append(f"PROP:{prop.identifier}={_stable_repr(value)}")
+                        except AttributeError:
+                            continue
 
-        if pbr_image_hashes:
-            sorted_pbr_image_hashes = sorted(list(pbr_image_hashes))
-            hash_inputs.append(f"ALL_UNIQUE_IMAGE_HASHES_COMBINED:{'|'.join(sorted_pbr_image_hashes)}")
-        
-        final_hash_string = f"VERSION:{HASH_VERSION}|||" + "|||".join(sorted(hash_inputs))
-        digest = hashlib.md5(final_hash_string.encode('utf-8')).hexdigest()
+                    # Unconnected Input Values
+                    for inp in node.inputs:
+                        if not inp.is_linked and hasattr(inp, 'default_value'):
+                            node_parts.append(f"INPUT_DEFAULT:{inp.identifier}={_stable_repr(inp.default_value)}")
+
+                    # Specific fix for ShaderNodeValue output values
+                    if node.type == 'VALUE' and hasattr(node.outputs[0], 'default_value'):
+                        output_val = node.outputs[0].default_value
+                        node_parts.append(f"VALUE_NODE_OUTPUT={_stable_repr(output_val)}")
+
+                    # Special Content Nodes
+                    if node.type == 'TEX_IMAGE' and node.image:
+                        image_content_hash = _hash_image(node.image, image_hash_cache)
+                        node_parts.append(f"SPECIAL_CONTENT_HASH:{image_content_hash}")
+                    elif node.type == 'ShaderNodeValToRGB':  # ColorRamp
+                        cr = node.color_ramp
+                        if cr:
+                            elements_str = [f"STOP({_stable_repr(s.position)}, {_stable_repr(s.color)})" for s in cr.elements]
+                            node_parts.append(f"SPECIAL_CONTENT_STOPS:[{','.join(elements_str)}]")
+
+                    # Queue up Node Groups
+                    if node.type == 'GROUP' and node.node_tree:
+                        if node.node_tree not in processed_trees:
+                            trees_to_process.append(node.node_tree)
+                            processed_trees.add(node.node_tree)
+
+                    all_node_recipes.append("||".join(sorted(node_parts)))
+
+                # Process links
+                for link in current_tree.links:
+                    link_repr = (f"LINK:"
+                                 f"{link.from_node.name}.{link.from_socket.identifier}->"
+                                 f"{link.to_node.name}.{link.to_socket.identifier}")
+                    all_link_recipes.append(link_repr)
+
+            recipe_parts.extend(sorted(all_node_recipes))
+            recipe_parts.extend(sorted(all_link_recipes))
+
+        # Final hash calculation
+        final_recipe_string = "|||".join(recipe_parts)
+        digest = hashlib.md5(final_recipe_string.encode('utf-8')).hexdigest()
 
         if mat_uuid:
-            global_hash_cache[mat_uuid] = digest 
-            if not force and mat_uuid not in material_hashes:
-                material_hashes[mat_uuid] = digest
+            global_hash_cache[mat_uuid] = digest
+            material_hashes[mat_uuid] = digest
+
         return digest
 
     except Exception as e:
-        print(f"[get_material_hash - CONTENT_ONLY] Error hashing mat '{mat_name_for_debug}': {type(e).__name__} - {e}", file=sys.stderr)
+        print(f"[get_material_hash - PRODUCTION] Error hashing mat '{mat_name_for_debug}': {type(e).__name__} - {e}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
         return None
+        
+def get_hashing_scene_bundle():
+    """
+    Lazily creates and manages a persistent, isolated scene for hashing operations.
+    Returns a dictionary containing the scene and its required objects, or None on failure.
+    This version is robust against being called from restricted contexts.
+    """
+    global g_hashing_scene_bundle
+
+    # --- Step 1: Rigorous Validation of Existing Bundle ---
+    if g_hashing_scene_bundle:
+        is_valid = True
+        try:
+            # Check each key and ensure its value is a valid Blender ID object
+            if not (g_hashing_scene_bundle.get('scene') and g_hashing_scene_bundle['scene'].name in bpy.data.scenes): is_valid = False
+            if not (g_hashing_scene_bundle.get('plane') and g_hashing_scene_bundle['plane'].name in bpy.data.objects): is_valid = False
+            if not (g_hashing_scene_bundle.get('hijack_mat') and g_hashing_scene_bundle['hijack_mat'].name in bpy.data.materials): is_valid = False
+            
+            if is_valid:
+                return g_hashing_scene_bundle
+            else:
+                print("[Hashing Scene] Bundle validation failed. Will try to rebuild.")
+                cleanup_hashing_scene_bundle() # Clean up the invalid bundle
+        except (ReferenceError, KeyError, AttributeError):
+            print("[Hashing Scene] Bundle reference lost. Will try to rebuild.")
+            cleanup_hashing_scene_bundle()
+
+    # --- Step 2: Lazy Creation (if bundle doesn't exist or was invalid) ---
+    print("[Hashing Scene] Attempting to create persistent hashing scene bundle...")
+    try:
+        # This is the block that was failing with '_RestrictData' error.
+        # We wrap it to catch the error and handle it gracefully.
+        scene = bpy.data.scenes.new(name=f"__hashing_scene_{uuid.uuid4().hex}")
+        
+        # This is safe because we are creating the scene from scratch.
+        scene.render.engine = 'CYCLES'
+        scene.cycles.device = 'CPU'
+        scene.render.resolution_x = 1
+        scene.render.resolution_y = 1
+
+        # Use a temporary context override to create objects without affecting the UI
+        with bpy.context.temp_override(scene=scene):
+            bpy.ops.mesh.primitive_plane_add(size=2)
+            plane = bpy.context.active_object
+        
+        plane.name = "__hashing_plane"
+        
+        cam_data = bpy.data.cameras.new(name="__hashing_cam_data")
+        cam_obj = bpy.data.objects.new("__hashing_cam", cam_data)
+        scene.collection.objects.link(cam_obj)
+        scene.camera = cam_obj
+        cam_obj.location = (0, 0, 2)
+        cam_data.type = 'ORTHO'
+        cam_data.ortho_scale = 2.0
+
+        hijack_mat = bpy.data.materials.new(name="__hashing_material")
+        hijack_mat.use_nodes = True
+        nt = hijack_mat.node_tree
+        for node in nt.nodes: nt.nodes.remove(node)
+        hijack_emission = nt.nodes.new('ShaderNodeEmission')
+        hijack_output = nt.nodes.new('ShaderNodeOutputMaterial')
+        nt.links.new(hijack_emission.outputs['Emission'], hijack_output.inputs['Surface'])
+        
+        plane.data.materials.append(hijack_mat)
+
+        g_hashing_scene_bundle = {
+            "scene": scene, "plane": plane,
+            "hijack_mat": hijack_mat, "hijack_emission": hijack_emission
+        }
+        print("[Hashing Scene] Bundle created successfully.")
+        return g_hashing_scene_bundle
+
+    except AttributeError as e:
+        if "'_RestrictData' object has no attribute 'scenes'" in str(e):
+            print("[Hashing Scene] ERROR: Cannot create hashing scene. Context is restricted. Hashing will fail until context is available.", file=sys.stderr)
+        else:
+            print(f"[Hashing Scene] CRITICAL AttributeError creating bundle: {e}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+        g_hashing_scene_bundle = None
+        return None # Return None on failure
+    except Exception as e:
+        print(f"[Hashing Scene] CRITICAL general error creating bundle: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        g_hashing_scene_bundle = None
+        return None
+
+def cleanup_hashing_scene_bundle():
+    """Safely removes the hashing scene and all its contents."""
+    global g_hashing_scene_bundle
+    if not g_hashing_scene_bundle:
+        return
+        
+    try:
+        scene = g_hashing_scene_bundle.get("scene")
+        if scene and scene.name in bpy.data.scenes:
+            # Unlink from any windows to prevent context issues on removal
+            # This is a safety measure; it shouldn't be linked to any window
+            for window in bpy.data.window_managers[0].windows:
+                if window.scene == scene:
+                    # Find any other scene to switch to
+                    other_scene = next((s for s in bpy.data.scenes if s != scene), None)
+                    if other_scene:
+                        window.scene = other_scene
+            
+            # Now it should be safe to remove. This also removes its objects, etc.
+            bpy.data.scenes.remove(scene, do_unlink=True)
+            
+    except (ReferenceError, KeyError, Exception) as e:
+        print(f"[Hash Cleanup] Error removing hashing scene: {e}")
+
+    g_hashing_scene_bundle = None
+     
+def process_dirty_materials_timer():
+    """
+    This is the new "background" process that runs on a timer.
+    It does the heavy lifting that the save_handler used to do,
+    but without blocking the UI.
+    """
+    global g_materials_are_dirty, g_material_processing_timer_active, materials_modified
+
+    # If the flag isn't set, do nothing and stop the timer from running again until needed.
+    if not g_materials_are_dirty:
+        g_material_processing_timer_active = False
+        return None # This stops the bpy.app.timer
+
+    print(f"\n[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} TIMER] Dirty flag detected. Processing materials...")
+    
+    # Reset the flag immediately to 'False' so we don't process the same changes again.
+    g_materials_are_dirty = False
+
+    # This is the heavy logic moved directly from the old save_handler
+    changed_materials_for_library_update = {}
+    hashes_to_save_to_db = {}
+    uuids_to_promote_for_recency = []
+    _session_image_hash_cache = {}
+
+    load_material_hashes()
+
+    for mat in list(bpy.data.materials):
+        if not mat or mat.name.startswith("__hashing_"):
+            continue
+        
+        actual_uuid = get_material_uuid(mat)
+        if not actual_uuid:
+            continue
+
+        db_stored_hash = material_hashes.get(actual_uuid)
+        current_hash = get_material_hash(mat, force=True, image_hash_cache=_session_image_hash_cache)
+        
+        if not current_hash:
+            continue
+
+        if db_stored_hash != current_hash:
+            materials_modified = True # Set flag for post_save_handler
+            if not mat.library:
+                changed_materials_for_library_update[actual_uuid] = mat
+            
+            hashes_to_save_to_db[actual_uuid] = current_hash
+            uuids_to_promote_for_recency.append(actual_uuid)
+    
+    if hashes_to_save_to_db:
+        material_hashes.update(hashes_to_save_to_db)
+        save_material_hashes()
+        print(f"  [TIMER] Updated {len(hashes_to_save_to_db)} hashes in the database.")
+
+    if uuids_to_promote_for_recency:
+        for uuid_str in set(uuids_to_promote_for_recency):
+            promote_material_by_recency_counter(uuid_str)
+        print(f"  [TIMER] Promoted {len(set(uuids_to_promote_for_recency))} materials for recency.")
+
+    if changed_materials_for_library_update:
+        print(f"  [TIMER] Queuing library update for {len(changed_materials_for_library_update)} materials.")
+        update_material_library(force_update=True, changed_materials_map=changed_materials_for_library_update)
+    
+    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} TIMER] Material processing finished.")
+    
+    # Keep the timer running in the background to check again after a delay.
+    return 2.0
 
 def preload_existing_thumbnails():
     global custom_icons, THUMBNAIL_FOLDER # Ensure THUMBNAIL_FOLDER is accessible
@@ -894,10 +1068,26 @@ def get_material_uuid(mat): # Unchanged (core UUID logic)
     except Exception as e: print(f"[UUID] Error setting UUID for {getattr(mat, 'name', 'Unknown')}: {e}")
     return new_id
 
+      
 def get_unique_display_name(base_name):
+    """
+    Finds a unique display name.
+    
+    SPECIAL RULE: If the base_name is exactly "Material", this function will
+    always return "Material" without attempting to add a suffix. This allows
+    multiple UUID-named materials to share the same default display name.
+    
+    For all other names, it ensures uniqueness by adding a .001 suffix if needed.
+    """
     global material_names # Ensure access to the global dictionary of finalized display names
     
-    # Check for uniqueness only against display names already assigned by the addon
+    # --- THIS IS THE FIX ---
+    # If the requested name is "Material", just return it. Do not check for uniqueness.
+    if base_name == "Material":
+        return "Material"
+    # --- END OF FIX ---
+
+    # For all other names, perform the original uniqueness check.
     existing_display_names = set(material_names.values())
 
     if base_name not in existing_display_names:
@@ -942,110 +1132,83 @@ def save_material_group_cache(version, groups): # Unchanged
 @persistent
 def initialize_material_properties():
     """
-    Ensures UUIDs exist for ALL materials.
-    Local non-"mat_" materials' datablocks are NAMED by their UUID.
-    Creates initial DB name entries. If a material's original datablock name (or its base)
-    is already a UUID, its display name defaults to "Material" (uniquified).
-    Otherwise, the display name is based on the base of its original datablock name.
+    Ensures UUIDs exist for ALL non-"mat_" materials and sets their initial display name in the database.
+    
+    LOGIC:
+    - SKIPS any material whose name starts with "mat_".
+    - If a local material's datablock name is a UUID, its display name defaults to "Material".
+    - Otherwise, the display name is based on the material's original datablock name.
+    - Uses get_unique_display_name to handle naming.
     """
     global _display_name_cache, material_names
-    print("[DEBUG DB InitProps] Running initialize_material_properties (UUID-name to 'Material' logic active)")
+    
+    print("[InitProps] Running initialize_material_properties (v3 - with 'mat_' skip logic)")
     
     local_needs_name_db_save_init = False 
-    assigned_new_uuid_count = 0
-    checked_materials_count = 0
-    renamed_datablock_count_this_run = 0
-    new_db_names_added_count = 0
-
+    
     if not material_names: 
-        print("[InitProps DB] material_names empty, attempting to load from DB...")
         load_material_names()
 
-    print("[InitProps DB] Processing materials for UUIDs and initial DB names...")
     all_mats_in_data = list(bpy.data.materials)
-    total_mats_to_process = len(all_mats_in_data)
-    print(f"[InitProps DB] Found {total_mats_to_process} materials to check in bpy.data.materials.")
 
-    for mat_idx, mat in enumerate(all_mats_in_data):
-        checked_materials_count += 1
-        if not mat:
+    for mat in all_mats_in_data:
+        if not mat or mat.name.startswith("__hashing_"):
             continue
+
+        # --- THIS IS THE CRITICAL FIX FOR YOUR SPECIAL CASE ---
+        # If the material name starts with "mat_", do not process it for UUIDs or display names.
+        if mat.name.startswith("mat_"):
+            continue
+        # --- END OF FIX ---
 
         original_datablock_name = mat.name  
-        uuid_prop_before_validation = mat.get("uuid", "")
-
-        final_uuid_for_mat = validate_material_uuid(mat, is_copy=False)  
+        final_uuid_for_mat = validate_material_uuid(mat, is_copy=False)
 
         if not final_uuid_for_mat:
-            print(f"[InitProps DB] CRITICAL: Could not get/assign valid UUID for '{original_datablock_name}'. Skipping.")
             continue
 
-        if not is_valid_uuid_format(uuid_prop_before_validation) or uuid_prop_before_validation != final_uuid_for_mat:
-            assigned_new_uuid_count += 1
-        
-        name_match_for_original = _SUFFIX_REGEX_MAT_PARSE.fullmatch(original_datablock_name)
-        base_of_original_name = original_datablock_name
-        if name_match_for_original and name_match_for_original.group(1):
-            base_of_original_name = name_match_for_original.group(1)
-            
-        # uuid_was_adopted_from_name is kept for its original potential uses (e.g. logging or other specific logic)
-        # but is not the primary driver for display_name_basis if base_of_original_name itself is a UUID.
-        uuid_was_adopted_from_name = (
-            (not is_valid_uuid_format(uuid_prop_before_validation)) and  
-            is_valid_uuid_format(base_of_original_name) and      
-            final_uuid_for_mat == base_of_original_name          
-        )
-        
+        # If this UUID is new to us, we need to assign it a display name.
         if final_uuid_for_mat not in material_names:
             display_name_basis = ""
-            # MODIFIED LOGIC for display_name_basis:
-            # If the material's original datablock name (or its base) is already a UUID,
-            # its display name basis becomes "Material".
-            # Otherwise, the display name basis becomes the base of its original datablock name.
+            
+            # Get the base name, e.g., "Rock" from "Rock.001"
+            name_match = _SUFFIX_REGEX_MAT_PARSE.fullmatch(original_datablock_name)
+            base_of_original_name = name_match.group(1) if name_match and name_match.group(1) else original_datablock_name
+            
+            # If the material's base name is a valid UUID, its display name should be "Material".
+            # Otherwise, use the base name as the starting point.
             if is_valid_uuid_format(base_of_original_name):
                 display_name_basis = "Material"
             else:
-                display_name_basis = base_of_original_name # Use the base part (e.g. "Rock" from "Rock.001")
-            
-            unique_display_name_for_db = get_unique_display_name(display_name_basis) # Will use the new get_unique_display_name
+                display_name_basis = base_of_original_name
+
+            # get_unique_display_name will handle the "Material" special case correctly.
+            unique_display_name_for_db = get_unique_display_name(display_name_basis)
             
             material_names[final_uuid_for_mat] = unique_display_name_for_db
-            new_db_names_added_count += 1
             local_needs_name_db_save_init = True
 
+        # Ensure local, non-"mat_" materials are named by their UUID and have fake user set.
         if not mat.library:
-            effective_display_name_for_mat_check = material_names.get(final_uuid_for_mat, "")
-            
-            if not effective_display_name_for_mat_check.startswith("mat_"):
-                if mat.name != final_uuid_for_mat: 
-                    try:
-                        existing_mat_with_target_name = bpy.data.materials.get(final_uuid_for_mat)
-                        if not existing_mat_with_target_name or existing_mat_with_target_name == mat:
-                            mat.name = final_uuid_for_mat
-                            renamed_datablock_count_this_run +=1
-                    except Exception as e_rename_initprops:
-                        print(f"[InitProps DB] Error renaming local datablock '{original_datablock_name}' to '{final_uuid_for_mat}': {e_rename_initprops}")
-            
-            try:
-                if not mat.use_fake_user:
+            if mat.name != final_uuid_for_mat:
+                try:
+                    existing_mat_with_target_name = bpy.data.materials.get(final_uuid_for_mat)
+                    if not existing_mat_with_target_name or existing_mat_with_target_name == mat:
+                        mat.name = final_uuid_for_mat
+                except Exception:
+                    pass
+            if not mat.use_fake_user:
+                try:
                     mat.use_fake_user = True
-            except Exception as e_fake_user_init_props:
-                print(f"[InitProps DB] Warning: Could not set use_fake_user for local mat '{getattr(mat, 'name', 'N/A')}': {e_fake_user_init_props}")
-
-        if assigned_new_uuid_count > 0 and assigned_new_uuid_count % 20 == 0 and total_mats_to_process > 0:
-                print(f"[InitProps DB] Progress: Assigned/Validated {assigned_new_uuid_count} UUIDs (checked {checked_materials_count}/{total_mats_to_process})...")
-
-    if assigned_new_uuid_count > 0:
-        print(f"[InitProps DB] Finished UUID assignment pass. Assigned/Validated {assigned_new_uuid_count} UUIDs for {checked_materials_count} materials.")
-    if renamed_datablock_count_this_run > 0:
-        print(f"[InitProps DB] Renamed {renamed_datablock_count_this_run} local non-'mat_' datablocks to their UUIDs in this run.")
+                except Exception:
+                    pass
 
     if local_needs_name_db_save_init:
-        print(f"[InitProps DB] Saving {new_db_names_added_count} newly added/updated display names to database...")
+        print("[InitProps] Saving newly added/updated display names to database...")
         save_material_names()
         _display_name_cache.clear()
 
-    print("[DEBUG DB InitProps] initialize_material_properties finished.")
+    print("[InitProps] initialize_material_properties finished.")
 
 def is_valid_uuid_format(uuid_string):
     """
@@ -1067,7 +1230,7 @@ def is_valid_uuid_format(uuid_string):
         return True
     except ValueError:
         return False
-
+     
 def is_valid_uuid_format(uuid_string):
     """
     Checks if the given string is a well-formatted UUID.
@@ -1075,20 +1238,22 @@ def is_valid_uuid_format(uuid_string):
     """
     if not isinstance(uuid_string, str) or len(uuid_string) != 36:
         return False
+    # Basic check for xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx format with 4 hyphens
     parts = uuid_string.split('-')
     if len(parts) != 5:
         return False
     if not (len(parts[0]) == 8 and len(parts[1]) == 4 and len(parts[2]) == 4 and \
             len(parts[3]) == 4 and len(parts[4]) == 12):
         return False
+    # Try to convert to UUID object for full validation of hex characters etc.
     try:
-        uuid.UUID(uuid_string)
+        uuid.UUID(uuid_string) # This will raise ValueError if format is wrong (e.g. invalid chars)
         return True
     except ValueError:
         return False
 
 # --- MODIFIED FUNCTION ---
-def validate_material_uuid(mat, is_copy=False): # In __init__.py
+def validate_material_uuid(mat, is_copy=False):
     """
     Ensures a material has a valid UUID stored in its custom property "uuid".
     Priority:
@@ -1153,313 +1318,171 @@ def process_library_queue(): # Unchanged
         except Exception as e: print(f"[LIB Queue] Error processing task: {str(e)}")
         return 0.1
     else: is_update_processing = False; return None
+  
+def _perform_library_update(force: bool = False, changed_map: dict | None = None):
+    print(f"[DEBUG LibUpdate MainAddon] Starting library update. Force: {force}, Changed Map Items: {len(changed_map) if changed_map else 0}")
 
-def _perform_library_update(force: bool = False):
-    print(f"[DEBUG LibUpdate MainAddon] Attempting library update. Force_flag_received: {force}")
-
-    global g_thumbnail_process_ongoing, g_library_update_pending, material_names, material_hashes # Ensure globals are accessible
+    global g_thumbnail_process_ongoing, g_library_update_pending
 
     if g_thumbnail_process_ongoing:
         print("[DEBUG LibUpdate MainAddon] Thumbnail generation is ongoing. Deferring library update.")
         g_library_update_pending = True
-        if force: # If the deferred update was forced, keep that forced status
+        if force:
             if hasattr(bpy.context.window_manager, 'matlist_pending_lib_update_is_forced'):
                 bpy.context.window_manager.matlist_pending_lib_update_is_forced = True
-        return False # Indicate update was deferred
-
-    # Check if a previously deferred update was forced
-    effective_force = force
-    if hasattr(bpy.context.window_manager, 'matlist_pending_lib_update_is_forced') and bpy.context.window_manager.matlist_pending_lib_update_is_forced:
-        print("[DEBUG LibUpdate MainAddon] Pending library update was flagged as forced. Applying force.")
-        effective_force = True
-        bpy.context.window_manager.matlist_pending_lib_update_is_forced = False # Reset the flag
-
-    print(f"[DEBUG LibUpdate MainAddon] Effective force for this run: {effective_force}")
-
-    load_material_hashes()
-
-    existing_names_in_lib_file = set() # Stores UUIDs (datablock names) present in material_library.blend
-
-    if os.path.exists(LIBRARY_FILE):
-        try:
-            with bpy.data.libraries.load(LIBRARY_FILE, link=False, assets_only=True) as (data_from_lib_names, _):
-                if hasattr(data_from_lib_names, 'materials'):
-                    existing_names_in_lib_file = {name for name in data_from_lib_names.materials if isinstance(name, str)}
-        except Exception as e:
-            print(f"[DEBUG LibUpdate MainAddon] Error loading names from library file '{LIBRARY_FILE}': {e}")
-    else:
-        print(f"[DEBUG LibUpdate MainAddon] Library file '{LIBRARY_FILE}' does not exist. `existing_names_in_lib_file` will be empty.")
-
-    to_transfer = []
-    processed_content_hashes_for_this_transfer_op = set()
-
-    # MODIFICATION 1: Initialize list for deferred fake user setting
-    mats_needing_fake_user_setting = []
-
-    print(f"[DEBUG LibUpdate MainAddon] Iterating {len(bpy.data.materials)} materials in current .blend file for potential transfer.")
-    for mat_idx, mat in enumerate(bpy.data.materials):
-        mat_name_debug = getattr(mat, 'name', f'InvalidMaterialObject_idx_{mat_idx}')
-        try:
-            if getattr(mat, 'library', None):
-                continue
-
-            uid = mat.get("uuid")
-            if not uid:
-                uid = validate_material_uuid(mat)
-                try:
-                    mat["uuid"] = uid
-                except Exception as e_setuuid_loop:
-                    print(f"  Warning: Could not set 'uuid' property on {mat_name_debug} during lib update check: {e_setuuid_loop}")
-
-            if not uid:
-                continue
-
-            display_name = mat_get_display_name(mat)
-            if display_name.startswith("mat_"):
-                continue
-
-            current_content_hash = get_material_hash(mat, force=True)
-
-            if not current_content_hash:
-                continue
-
-            if current_content_hash in processed_content_hashes_for_this_transfer_op and not effective_force:
-                continue
-
-            uid_is_in_library_file = uid in existing_names_in_lib_file
-            db_hash_for_this_uid = material_hashes.get(uid)
-            should_transfer = False
-            reason_for_transfer = []
-
-            if effective_force:
-                should_transfer = True
-                reason_for_transfer.append("ForcedUpdate")
-            else:
-                if not uid_is_in_library_file:
-                    should_transfer = True
-                    reason_for_transfer.append("NewUUIDToLibrary")
-                elif db_hash_for_this_uid is None:
-                    should_transfer = True
-                    reason_for_transfer.append("UUIDInLibFileButNotInDBHashCache")
-                elif current_content_hash != db_hash_for_this_uid:
-                    should_transfer = True
-                    reason_for_transfer.append("ContentChangedForExistingUUID")
-
-            if should_transfer:
-                if mat.name != uid:
-                    try:
-                        existing_mat_with_target_name = bpy.data.materials.get(uid)
-                        if existing_mat_with_target_name and existing_mat_with_target_name != mat:
-                            print(f"      WARNING: Cannot rename '{mat.name}' to UUID '{uid}' for transfer. Target name exists and is a different datablock. Skipping this material.")
-                            continue
-                        mat.name = uid
-                    except Exception as rename_err:
-                        print(f"      WARNING: Failed to rename datablock '{mat.name}' to UUID '{uid}' for transfer: {rename_err}. Skipping this material.")
-                        continue
-                
-                # MODIFICATION 2: Remove direct setting of use_fake_user from here
-                # if hasattr(mat, 'use_fake_user'):
-                #     mat.use_fake_user = True # <--- ORIGINAL ERROR LINE (REMOVED)
-
-                # MODIFICATION 3: Add to list for deferred setting
-                if mat and not mat.library: # Ensure it's local and should be processed
-                    mats_needing_fake_user_setting.append(mat)
-
-                try:
-                    current_filepath_for_origin = bpy.data.filepath if bpy.data.filepath else "UnsavedOrUnknown"
-                    mat["ml_origin_blend_file"] = current_filepath_for_origin
-                    mat["ml_origin_mat_name"] = display_name
-                    mat["ml_origin_mat_uuid"] = uid
-                except Exception as e_set_origin_prop:
-                    print(f"      Warning: Could not set origin custom properties on '{mat.name}': {e_set_origin_prop}")
-
-                print(f"      >>> ADDING '{mat.name}' (orig display name: '{display_name}', ContentHash: {current_content_hash[:8]}) TO TRANSFER LIST. Reason: {reason_for_transfer}")
-                to_transfer.append(mat)
-                processed_content_hashes_for_this_transfer_op.add(current_content_hash)
-                material_hashes[uid] = current_content_hash
-
-        except ReferenceError:
-            continue
-        except Exception as loop_error:
-            print(f"[DEBUG LibUpdate MainAddon] Error processing material {mat_name_debug} in loop: {loop_error}")
-            traceback.print_exc()
+        return False
     
-    # --- MODIFICATION 4: Insert the deferred setting of use_fake_user ---
-    if mats_needing_fake_user_setting:
-        print(f"[DEBUG LibUpdate MainAddon] Setting use_fake_user for {len(mats_needing_fake_user_setting)} materials.")
-        for mat_to_set in mats_needing_fake_user_setting:
-            try:
-                # Ensure it's a valid, local material from bpy.data before attempting to set fake user
-                if mat_to_set and mat_to_set.name in bpy.data.materials and \
-                   not mat_to_set.library and hasattr(mat_to_set, 'use_fake_user'):
-                    if not mat_to_set.use_fake_user: # Only set if not already True
-                        mat_to_set.use_fake_user = True
-            except AttributeError as e_attr: # Catch the specific error
-                print(f"  Error setting use_fake_user for {getattr(mat_to_set, 'name', 'N/A')} (AttributeError): {e_attr}", file=sys.stderr)
-                # traceback.print_exc(file=sys.stderr) # Keep commented unless detailed trace is needed
-            except Exception as e_general:
-                print(f"  Error setting use_fake_user for {getattr(mat_to_set, 'name', 'N/A')}: {e_general}", file=sys.stderr)
-                # traceback.print_exc(file=sys.stderr) # Keep commented unless detailed trace is needed
-    # --- End of MODIFICATION 4 ---
+    # --- START OF NEW SIMPLIFIED LOGIC ---
+    mats_to_transfer_map = {}
 
-    if not to_transfer:
-        print("[DEBUG LibUpdate MainAddon] Nothing to transfer to library.")
-        save_material_hashes()
+    if changed_map:
+        # This is now the primary, reliable path. Use the materials passed directly from the save handler.
+        print(f"  [LibUpdate] Processing {len(changed_map)} materials explicitly passed from save handler.")
+        mats_to_transfer_map = changed_map
+    
+    elif force:
+        # This is a fallback path for any other part of the addon that might trigger a generic forced update.
+        print("  [LibUpdate] 'force' is True but no explicit map. Falling back to checking all local materials.")
+        for mat in bpy.data.materials:
+            if mat.library or mat.name.startswith("__hashing_") or mat_get_display_name(mat).startswith("mat_"):
+                continue
+            uid = get_material_uuid(mat)
+            if uid:
+                mats_to_transfer_map[uid] = mat
+    else:
+        # If not forced and no changed map was provided, there's nothing to do.
+        print("[DEBUG LibUpdate MainAddon] No explicit changes and not forced. Nothing to transfer.")
+        return True
+    # --- END OF NEW SIMPLIFIED LOGIC ---
+
+    if not mats_to_transfer_map:
+        print("[DEBUG LibUpdate MainAddon] No materials to transfer to library after processing.")
         return True
 
-    print(f"[DEBUG LibUpdate MainAddon] Preparing to transfer {len(to_transfer)} materials.")
-    try:
-        os.makedirs(LIBRARY_FOLDER, exist_ok=True)
-    except Exception as e_mkdir_lib:
-        print(f"[DEBUG LibUpdate MainAddon] Error creating library folder '{LIBRARY_FOLDER}': {e_mkdir_lib}. Cannot proceed with transfer.")
-        return False
+    final_mats_for_write = set()
+    for uid, mat_to_write in mats_to_transfer_map.items():
+        try:
+            if mat_to_write.name != uid:
+                conflicting_mat = bpy.data.materials.get(uid)
+                if conflicting_mat and conflicting_mat != mat_to_write:
+                    if get_material_hash(conflicting_mat) == get_material_hash(mat_to_write):
+                        bpy.data.materials.remove(conflicting_mat)
+                        mat_to_write.name = uid
+                    else:
+                        print(f"      CRITICAL WARNING: Cannot rename '{mat_to_write.name}' to '{uid}'. A DIFFERENT material already has that name. Skipping.")
+                        continue
+                else:
+                    mat_to_write.name = uid
+            
+            mat_to_write.use_fake_user = True
+            
+            display_name = mat_get_display_name(mat_to_write)
+            mat_to_write["ml_origin_blend_file"] = bpy.data.filepath if bpy.data.filepath else "UnsavedOrUnknown"
+            mat_to_write["ml_origin_mat_name"] = display_name
+            mat_to_write["ml_origin_mat_uuid"] = uid
+            
+            final_mats_for_write.add(mat_to_write)
+
+        except Exception as prep_err:
+            print(f"      CRITICAL WARNING: Failed to prepare/rename representative datablock '{getattr(mat_to_write, 'name', 'N/A')}' to UUID '{uid}': {prep_err}. Skipping this material.")
+            continue
+            
+    if not final_mats_for_write:
+        print("[DEBUG LibUpdate MainAddon] No materials were successfully prepared for writing.")
+        return True
 
     tmp_dir_for_transfer = ""
     transfer_blend_file_path = ""
-    actual_mats_written_to_transfer_file = set()
-
     try:
         tmp_dir_for_transfer = tempfile.mkdtemp(prefix="matlib_transfer_")
         transfer_blend_file_path = os.path.join(tmp_dir_for_transfer, f"transfer_data_{uuid.uuid4().hex[:8]}.blend")
 
-        valid_mats_for_bpy_write = {m for m in to_transfer if isinstance(m, bpy.types.Material)}
-
-        if not valid_mats_for_bpy_write:
-            print("[DEBUG LibUpdate MainAddon] No valid material objects in the transfer list after filtering. Nothing to write.")
-            if tmp_dir_for_transfer and os.path.exists(tmp_dir_for_transfer):
-                shutil.rmtree(tmp_dir_for_transfer, ignore_errors=True)
-            save_material_hashes()
-            return True
-
-        actual_mats_written_to_transfer_file = valid_mats_for_bpy_write
-
-        print(f"[DEBUG LibUpdate MainAddon] Writing {len(actual_mats_written_to_transfer_file)} materials to transfer file: {transfer_blend_file_path}")
-        bpy.data.libraries.write(transfer_blend_file_path, actual_mats_written_to_transfer_file, fake_user=True, compress=True)
+        print(f"[DEBUG LibUpdate MainAddon] Writing {len(final_mats_for_write)} unique materials to transfer file: {transfer_blend_file_path}")
+        bpy.data.libraries.write(transfer_blend_file_path, final_mats_for_write, fake_user=True, compress=True)
         print(f"[DEBUG LibUpdate MainAddon] Successfully wrote materials to transfer file.")
+
+        print(f"[DEBUG LibUpdate MainAddon] Staging textures for transfer file '{os.path.basename(transfer_blend_file_path)}' into temp dir: {tmp_dir_for_transfer}")
+        unique_images_to_stage = {}
+
+        for mat_in_transfer_file in final_mats_for_write:
+            if mat_in_transfer_file.use_nodes and mat_in_transfer_file.node_tree:
+                for node in _get_all_nodes_recursive(mat_in_transfer_file.node_tree): # Use recursive find
+                    if node.bl_idname == 'ShaderNodeTexImage' and node.image:
+                        img_datablock = node.image
+                        if img_datablock.packed_file or not img_datablock.filepath_raw:
+                            continue
+                        
+                        source_abs_path_in_main_blender_session = bpy.path.abspath(img_datablock.filepath_raw)
+                        
+                        if not os.path.exists(source_abs_path_in_main_blender_session):
+                            print(f"  WARNING: Source texture file for staging not found at '{source_abs_path_in_main_blender_session}'. Cannot stage.")
+                            continue
+                        
+                        texture_filename_on_disk = os.path.basename(source_abs_path_in_main_blender_session)
+                        target_abs_path_in_temp_staging_dir = os.path.join(tmp_dir_for_transfer, texture_filename_on_disk)
+                        
+                        if source_abs_path_in_main_blender_session not in unique_images_to_stage:
+                            unique_images_to_stage[source_abs_path_in_main_blender_session] = target_abs_path_in_temp_staging_dir
+
+        if unique_images_to_stage:
+            print(f"[DEBUG LibUpdate MainAddon] Copying {len(unique_images_to_stage)} unique image files to temp staging area for worker...")
+            staged_count = 0; failed_copy_count = 0
+            for src_path, temp_dest_path in unique_images_to_stage.items():
+                try:
+                    shutil.copy2(src_path, temp_dest_path)
+                    staged_count +=1
+                except shutil.SameFileError:
+                    print(f"    WARNING STAGING: shutil.SameFileError encountered for '{src_path}' and '{temp_dest_path}'. This may indicate a logic issue but will be ignored.")
+                    failed_copy_count +=1
+                except Exception as e_stage_copy:
+                    print(f"    ERROR STAGING: Failed to copy '{src_path}' to '{temp_dest_path}': {e_stage_copy}")
+                    failed_copy_count +=1
+            print(f"[DEBUG LibUpdate MainAddon] Staging of {staged_count} images complete. Failed copies: {failed_copy_count}.")
+
+        if not BACKGROUND_WORKER_PY or not os.path.exists(BACKGROUND_WORKER_PY):
+            raise RuntimeError(f"Background worker script missing or path invalid: {BACKGROUND_WORKER_PY}")
+
+        def _bg_merge_thread_target(transfer_file, target_library, database_path_for_worker, temp_dir_to_cleanup_after_worker):
+            try:
+                db_file_abs_for_worker = os.path.abspath(database_path_for_worker) if database_path_for_worker else None
+                if not db_file_abs_for_worker or not os.path.exists(db_file_abs_for_worker):
+                    print(f"[BG Merge Thread] WARNING: Database file not found at '{db_file_abs_for_worker}' for worker's use.", file=sys.stderr)
+
+                cmd = [
+                    bpy.app.binary_path, "--background", "--factory-startup",
+                    "--python", BACKGROUND_WORKER_PY, "--",
+                    "--operation", "merge_library", "--transfer", transfer_file,
+                    "--target", target_library,
+                ]
+                if db_file_abs_for_worker:
+                    cmd.extend(["--db", db_file_abs_for_worker])
+
+                res = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=600)
+
+                if res.stdout: print(f"[BG Merge Thread - Worker Stdout]:\n{res.stdout}")
+                if res.stderr: print(f"[BG Merge Thread - Worker Stderr]:\n{res.stderr}")
+                if res.returncode != 0: print(f"[BG Merge Thread] Error: Worker exited with code {res.returncode}.")
+            except Exception as e:
+                print(f"[BG Merge Thread] General Error: {e}")
+            finally:
+                if temp_dir_to_cleanup_after_worker and os.path.exists(temp_dir_to_cleanup_after_worker):
+                    shutil.rmtree(temp_dir_to_cleanup_after_worker, ignore_errors=True)
+        
+        bg_thread = Thread(target=_bg_merge_thread_target, args=(
+            transfer_blend_file_path, os.path.abspath(LIBRARY_FILE),
+            os.path.abspath(DATABASE_FILE), tmp_dir_for_transfer
+        ), daemon=True)
+        bg_thread.start()
+
+        print(f"[DEBUG LibUpdate MainAddon] Background merge thread launched for {len(final_mats_for_write)} materials.")
 
     except Exception as e_write_transfer:
         print(f"[DEBUG LibUpdate MainAddon] Failed during writing of transfer file: {e_write_transfer}")
         traceback.print_exc()
-        if tmp_dir_for_transfer and os.path.exists(tmp_dir_for_transfer):
-            shutil.rmtree(tmp_dir_for_transfer, ignore_errors=True)
-        save_material_hashes()
-        return False
-
-    if actual_mats_written_to_transfer_file and tmp_dir_for_transfer:
-        print(f"[DEBUG LibUpdate MainAddon] Staging textures for transfer file '{os.path.basename(transfer_blend_file_path)}' into temp dir: {tmp_dir_for_transfer}")
-        unique_images_to_stage = {}
-
-        for mat_in_transfer_file in actual_mats_written_to_transfer_file:
-            if mat_in_transfer_file.use_nodes and mat_in_transfer_file.node_tree:
-                for node in mat_in_transfer_file.node_tree.nodes:
-                    if node.bl_idname == 'ShaderNodeTexImage' and node.image:
-                        img_datablock = node.image
-                        if img_datablock.packed_file:
-                            continue
-                        if not img_datablock.filepath_raw:
-                            continue
-
-                        original_stored_path_in_datablock = img_datablock.filepath_raw
-                        source_abs_path_in_main_blender_session = ""
-                        try:
-                            source_abs_path_in_main_blender_session = bpy.path.abspath(original_stored_path_in_datablock)
-                        except Exception as e_abs_main_session:
-                            print(f"  WARNING: Could not resolve abspath for '{original_stored_path_in_datablock}' (image '{img_datablock.name}') in main session: {e_abs_main_session}. Skipping staging for this texture.")
-                            continue
-
-                        if not os.path.exists(source_abs_path_in_main_blender_session):
-                            print(f"  WARNING: Source texture file for staging not found at '{source_abs_path_in_main_blender_session}' (from raw '{original_stored_path_in_datablock}', image '{img_datablock.name}'). Cannot stage.")
-                            continue
-                        
-                        target_abs_path_in_temp_staging_dir = ""
-                        if original_stored_path_in_datablock.startswith('//'):
-                            relative_part_from_blend_root = original_stored_path_in_datablock[2:]
-                            normalized_relative_part = relative_part_from_blend_root.replace('\\', os.sep).replace('/', os.sep)
-                            target_abs_path_in_temp_staging_dir = os.path.join(tmp_dir_for_transfer, normalized_relative_part)
-                            
-                            if source_abs_path_in_main_blender_session not in unique_images_to_stage:
-                                unique_images_to_stage[source_abs_path_in_main_blender_session] = target_abs_path_in_temp_staging_dir
-
-        if unique_images_to_stage:
-            print(f"[DEBUG LibUpdate MainAddon] Copying {len(unique_images_to_stage)} unique relatively-pathed ('//') image files to temp staging area for worker...")
-            staged_count = 0; failed_copy_count = 0
-            for src_path, temp_dest_path in unique_images_to_stage.items():
-                try:
-                    os.makedirs(os.path.dirname(temp_dest_path), exist_ok=True)
-                    shutil.copy2(src_path, temp_dest_path)
-                    staged_count +=1
-                except Exception as e_stage_copy:
-                    print(f"    ERROR STAGING: Failed to copy '{src_path}' to '{temp_dest_path}': {e_stage_copy}")
-                    failed_copy_count +=1
-            print(f"[DEBUG LibUpdate MainAddon] Staging of {staged_count} relatively-pathed images complete. Failed copies: {failed_copy_count}.")
-
-    save_material_hashes()
-    print(f"[DEBUG LibUpdate MainAddon] Updated and saved material_hashes to DB for materials processed in this update.")
-
-    if not BACKGROUND_WORKER_PY or not os.path.exists(BACKGROUND_WORKER_PY):
-        print(f"[DEBUG LibUpdate MainAddon] CRITICAL Error: Background worker script missing or path invalid: {BACKGROUND_WORKER_PY}")
-        if tmp_dir_for_transfer and os.path.exists(tmp_dir_for_transfer):
+        if 'tmp_dir_for_transfer' in locals() and tmp_dir_for_transfer and os.path.exists(tmp_dir_for_transfer):
             shutil.rmtree(tmp_dir_for_transfer, ignore_errors=True)
         return False
-
-    def _bg_merge_thread_target(transfer_file, target_library, database_path_for_worker, temp_dir_to_cleanup_after_worker):
-        try:
-            db_file_abs_for_worker = os.path.abspath(database_path_for_worker) if database_path_for_worker else None
-            if not db_file_abs_for_worker or not os.path.exists(db_file_abs_for_worker):
-                print(f"[BG Merge Thread] WARNING: Database file not found at '{db_file_abs_for_worker}' for worker's use. Origin/timestamps might not be updated by worker.", file=sys.stderr)
-
-            cmd = [
-                bpy.app.binary_path,
-                "--background", 
-                "--factory-startup", 
-                "--python", BACKGROUND_WORKER_PY,
-                "--", 
-                "--operation", "merge_library",
-                "--transfer", transfer_file, 
-                "--target", target_library,
-            ]
-            if db_file_abs_for_worker:
-                cmd.extend(["--db", db_file_abs_for_worker])
-
-            print(f"[BG Merge Thread] Executing worker command: {' '.join(cmd)}", flush=True)
-            res = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=600)
-
-            if res.stdout:
-                print(f"[BG Merge Thread - Worker Stdout For {os.path.basename(transfer_file)}]:\n{res.stdout}", flush=True)
-            if res.stderr:
-                print(f"[BG Merge Thread - Worker Stderr For {os.path.basename(transfer_file)}]:\n{res.stderr}", flush=True)
-            
-            if res.returncode != 0:
-                print(f"[BG Merge Thread] Error: Worker command for transfer '{os.path.basename(transfer_file)}' exited with code {res.returncode}.", flush=True)
-            else:
-                print(f"[BG Merge Thread] Worker for transfer '{os.path.basename(transfer_file)}' completed successfully (Code 0).", flush=True)
-
-        except subprocess.TimeoutExpired:
-            print(f"[BG Merge Thread] Error: Worker command for transfer '{os.path.basename(transfer_file)}' timed out after 600 seconds.", flush=True)
-            traceback.print_exc()
-        except Exception as e_bg_thread:
-            print(f"[BG Merge Thread] General Error in background merge thread for '{os.path.basename(transfer_file)}': {e_bg_thread}", flush=True)
-            traceback.print_exc()
-        finally:
-            if temp_dir_to_cleanup_after_worker and os.path.exists(temp_dir_to_cleanup_after_worker):
-                try:
-                    shutil.rmtree(temp_dir_to_cleanup_after_worker, ignore_errors=False)
-                    print(f"[BG Merge Thread] Cleaned up temp directory: {temp_dir_to_cleanup_after_worker}", flush=True)
-                except Exception as e_clean_final:
-                    print(f"[BG Merge Thread] Warning: Error cleaning up temp directory '{temp_dir_to_cleanup_after_worker}': {e_clean_final}", flush=True)
-
-    library_file_abs_path = os.path.abspath(LIBRARY_FILE)
-    db_file_abs_path_for_main = os.path.abspath(DATABASE_FILE)
-
-    bg_thread = Thread(target=_bg_merge_thread_target, args=(
-        transfer_blend_file_path,
-        library_file_abs_path,
-        db_file_abs_path_for_main,
-        tmp_dir_for_transfer
-    ), daemon=True)
-    bg_thread.start()
-
-    print(f"[DEBUG LibUpdate MainAddon] Background merge thread launched for {len(actual_mats_written_to_transfer_file)} materials. Transfer file: {os.path.basename(transfer_blend_file_path)}, Target Library: {os.path.basename(library_file_abs_path)}")
+        
     return True
 
 # --------------------------------------------------------------
@@ -1602,13 +1625,18 @@ def ensure_material_library(): # Unchanged
 # --------------------------
 # Material Library Functions (Unchanged)
 # --------------------------
-def update_material_library(force_update=False): # Unchanged
+def update_material_library(force_update=False, changed_materials_map=None):
     global is_update_processing
     if not is_update_processing:
-        library_update_queue.append({'type': 'UPDATE', 'force': force_update})
+        # Create the task dictionary for the queue, now including the explicit map of changes.
+        task = {
+            'type': 'UPDATE',
+            'force': force_update,
+            'changed_map': changed_materials_map or {} # Ensure it's always a dict
+        }
+        library_update_queue.append(task)
         is_update_processing = True
         bpy.app.timers.register(process_library_queue)
-    # else: print("[LIB] Update already queued") # Optional: re-enable if needed
 
 def _parse_material_suffix(name: str) -> tuple[str, int]:
     """
@@ -1646,7 +1674,6 @@ def populate_material_list(scene, *, called_from_finalize_run=False):
     print("[Populate List] Rebuilding master material list (unfiltered)...")
 
     try:
-        # Step 1: Clear old data from Blender's list and our global UI cache
         if hasattr(scene, "material_list_items"):
             scene.material_list_items.clear()
         else:
@@ -1655,13 +1682,16 @@ def populate_material_list(scene, *, called_from_finalize_run=False):
         
         material_list_cache.clear()
 
-        # Step 2: Gather all raw material data
         all_mats_data = []
         for mat in bpy.data.materials:
             if not mat or not hasattr(mat, 'name'):
                 continue
+                
+            # <<< FIX: Skip our internal hashing materials from appearing in the UI list >>>
+            if mat.name.startswith("__hashing_"):
+                continue
+
             try:
-                # This try-except block ensures that if one material is problematic, the whole process doesn't fail.
                 all_mats_data.append({
                     'mat_obj': mat,
                     'uuid': get_material_uuid(mat),
@@ -1786,212 +1816,48 @@ def initialize_db_connection_pool():
 
 # --------------------------
 # Event Handlers (save_handler and load_post_handler updated)
-# --------------------------
+# --------------------------  
+      
 @persistent
-def save_handler(dummy):
-    global materials_modified, material_names, material_hashes
-    global g_matlist_transient_tasks_for_post_save
-    global g_save_handler_start_time # <<< MODIFICATION: Access global
+def save_pre_handler(dummy):
+    """
+    ULTRA-LIGHTWEIGHT: Initializes new materials and syncs dirty ones before save.
+    """
+    global g_material_processing_timer_active, g_materials_are_dirty
 
-    # <<< MODIFICATION: Start the timer >>>
-    g_save_handler_start_time = time.time()
+    print(f"\n[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE_PRE] Triggered.")
 
-    if getattr(bpy.context.window_manager, 'matlist_save_handler_processed', False):
-        return
-    bpy.context.window_manager.matlist_save_handler_processed = True
+    # Synchronously initialize any new materials BEFORE processing them.
+    # This now correctly skips "mat_" materials.
+    initialize_material_properties()
+
+    # If materials are dirty, run the processor once, right now.
+    if g_materials_are_dirty:
+        process_dirty_materials_timer()
     
-    g_matlist_transient_tasks_for_post_save.clear()
-
-    start_time_total = time.time()
-    print(f"\n[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] ----- Starting pre-save process ({len(bpy.data.materials)} materials total) -----")
-
-    needs_metadata_update = False
-    needs_name_db_save = False
-    timestamp_updated_for_recency = False # This flag signals a sort change
-    actual_material_modifications_this_run = False 
-
-    if not material_names and bpy.data.filepath:
-        load_names_timer_start = time.time()
-        load_material_names()
-        print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] load_material_names() took {time.time() - load_names_timer_start:.4f}s.")
-
-    phase1_start_time = time.time()
-    mats_to_process_phase1 = list(bpy.data.materials)
-    uuid_assigned_in_phase1_count = 0
-    datablock_renamed_in_phase1_count = 0
-    db_name_entry_added_in_phase1_count = 0
-
-    for mat in mats_to_process_phase1:
-        if not mat: continue
-        original_datablock_name = mat.name
-        old_uuid_prop = mat.get("uuid", "")
-        current_uuid_prop = validate_material_uuid(mat, is_copy=False)
-        if old_uuid_prop != current_uuid_prop:
-            needs_metadata_update = True
-            actual_material_modifications_this_run = True
-            uuid_assigned_in_phase1_count +=1
-        current_display_name_for_processing = mat_get_display_name(mat)
-        if not current_display_name_for_processing.startswith("mat_"):
-            if current_uuid_prop:
-                if current_uuid_prop not in material_names:
-                    material_names[current_uuid_prop] = original_datablock_name
-                    db_name_entry_added_in_phase1_count +=1
-                    needs_name_db_save = True
-                    needs_metadata_update = True
-                    actual_material_modifications_this_run = True
-                if not mat.library and mat.name != current_uuid_prop:
-                    try:
-                        existing_mat_with_target_name = bpy.data.materials.get(current_uuid_prop)
-                        if not existing_mat_with_target_name or existing_mat_with_target_name == mat:
-                            mat.name = current_uuid_prop
-                            datablock_renamed_in_phase1_count +=1
-                            needs_metadata_update = True
-                            actual_material_modifications_this_run = True
-                    except Exception as rename_err:
-                        print(f"[SAVE DB] Phase 1 ERROR: Failed to rename non-'mat_' datablock '{original_datablock_name}' to UUID: {rename_err}.")
-        if not mat.library:
-            try:
-                if not mat.use_fake_user: mat.use_fake_user = True
-            except Exception: pass
-            
-    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] Phase 1 (UUIDs/Names) took {time.time() - phase1_start_time:.4f}s. Assigned: {uuid_assigned_in_phase1_count} UUIDs, Renamed: {datablock_renamed_in_phase1_count} DBs, Added: {db_name_entry_added_in_phase1_count} NameEntries.")
-
-    load_hashes_start_time = time.time()
-    load_material_hashes()
-    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] load_material_hashes() took {time.time() - load_hashes_start_time:.4f}s. ({len(material_hashes)} hashes loaded).")
-
-    phase2_start_time = time.time()
-    hashes_to_save_to_db = {}
-    uuids_to_promote_for_recency = [] 
-    hashes_actually_changed_in_db = False
-    deleted_old_thumb_count = 0
-    recalculated_hash_count = 0
-    mats_to_process_phase2 = list(bpy.data.materials)
-
-    _session_image_hash_cache = {} 
-
-    for mat in mats_to_process_phase2:
-        if not mat: continue
-        actual_uuid_for_hash_storage = mat.get("uuid")
-        if not actual_uuid_for_hash_storage:
+    # This validation loop is now partially redundant but acts as a good safety net.
+    # It also needs to skip "mat_" materials.
+    mats_to_process = list(bpy.data.materials)
+    for mat in mats_to_process:
+        if not mat or mat.name.startswith("__hashing_") or mat.name.startswith("mat_"):
             continue
         
-        db_stored_hash_for_this_uuid = material_hashes.get(actual_uuid_for_hash_storage)
-        current_hash_to_compare_with_db = db_stored_hash_for_this_uuid 
-        needs_recalc = False
-
-        if not mat.library:
-            is_dirty_from_prop = mat.get("hash_dirty", True)
-            if is_dirty_from_prop or db_stored_hash_for_this_uuid is None:
-                needs_recalc = True
-        elif db_stored_hash_for_this_uuid is None : 
-            needs_recalc = True
-
-        if needs_recalc:
-            recalculated_hash_count +=1
-            recalculated_hash = get_material_hash(mat, force=True, image_hash_cache=_session_image_hash_cache)
-            if not recalculated_hash:
-                if "hash_dirty" in mat and not mat.library: mat["hash_dirty"] = False
-                continue
-            current_hash_to_compare_with_db = recalculated_hash
-        
-        if db_stored_hash_for_this_uuid != current_hash_to_compare_with_db:
-            actual_material_modifications_this_run = True 
-            hashes_to_save_to_db[actual_uuid_for_hash_storage] = current_hash_to_compare_with_db
-            
-            uuids_to_promote_for_recency.append(actual_uuid_for_hash_storage)
-            
-            if db_stored_hash_for_this_uuid is not None:
-                hashes_actually_changed_in_db = True 
-                if not mat.library:
-                    old_thumbnail_path = get_thumbnail_path(db_stored_hash_for_this_uuid)
-                    if os.path.isfile(old_thumbnail_path):
-                        try:
-                            os.remove(old_thumbnail_path)
-                            deleted_old_thumb_count += 1
-                        except Exception as e_del_thumb:
-                            print(f"[SAVE DB] Phase 2 Error deleting old thumbnail {old_thumbnail_path}: {e_del_thumb}")
-            else:
-                hashes_actually_changed_in_db = True
-
-            blend_file_path_for_worker_task = None
-            if mat.library and mat.library.filepath:
-                blend_file_path_for_worker_task = bpy.path.abspath(mat.library.filepath)
-            elif not mat.library and bpy.data.filepath:
-                blend_file_path_for_worker_task = bpy.path.abspath(bpy.data.filepath)
-
-            if blend_file_path_for_worker_task and os.path.exists(blend_file_path_for_worker_task) and actual_uuid_for_hash_storage:
-                thumb_path_for_task = get_thumbnail_path(current_hash_to_compare_with_db) if current_hash_to_compare_with_db else None
-                if thumb_path_for_task:
-                    task_detail_for_post = {
-                        'blend_file': blend_file_path_for_worker_task,
-                        'mat_uuid': actual_uuid_for_hash_storage,
-                        'thumb_path': thumb_path_for_task,
-                        'hash_value': current_hash_to_compare_with_db,
-                        'mat_name_debug': mat.name, 
-                        'retries': 0
-                    }
-                    g_matlist_transient_tasks_for_post_save.append(task_detail_for_post)
-        
-        if "hash_dirty" in mat and not mat.library:
-            try: mat["hash_dirty"] = False
+        current_uuid = validate_material_uuid(mat, is_copy=False)
+        if not mat.library and mat.name != current_uuid:
+            try:
+                existing = bpy.data.materials.get(current_uuid)
+                if not existing or existing == mat:
+                    mat.name = current_uuid
             except Exception: pass
-
-    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] Phase 2 (Hashes) took {time.time() - phase2_start_time:.4f}s. Recalculated: {recalculated_hash_count} hashes. Deleted: {deleted_old_thumb_count} old thumbs.")
+        if not mat.library and not mat.use_fake_user:
+            try:
+                mat.use_fake_user = True
+            except Exception: pass
     
-    if uuids_to_promote_for_recency:
-        db_write_sort_order_start_time = time.time()
-        try:
-            with get_db_connection() as conn:
-                c = conn.cursor()
-                c.execute("SELECT COALESCE(MAX(sort_index), 0) FROM material_order")
-                max_index = c.fetchone()[0]
-                
-                unique_uuids_to_promote = list(dict.fromkeys(uuids_to_promote_for_recency))
-                
-                update_data = []
-                for i, uuid_str in enumerate(unique_uuids_to_promote):
-                    update_data.append((uuid_str, max_index + 1 + i))
-                
-                c.executemany("INSERT OR REPLACE INTO material_order (uuid, sort_index) VALUES (?, ?)", update_data)
-                conn.commit()
-                print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] Batched sort order update for {len(unique_uuids_to_promote)} materials took {time.time() - db_write_sort_order_start_time:.4f}s.")
-                timestamp_updated_for_recency = True
-        except Exception as e:
-            print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] BATCHED sort order update FAILED: {e}")
-            traceback.print_exc()
-
-    db_write_start_time = time.time()
-    saved_names_this_run = False
-    saved_hashes_this_run = False
-
-    if needs_name_db_save:
-        save_material_names()
-        saved_names_this_run = True
-        actual_material_modifications_this_run = True 
-    if hashes_to_save_to_db:
-        material_hashes.update(hashes_to_save_to_db)
-        save_material_hashes()
-        saved_hashes_this_run = True
-        actual_material_modifications_this_run = True 
-        
-    if saved_names_this_run or saved_hashes_this_run:
-        print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] Database write operations took {time.time() - db_write_start_time:.4f}s. (Names saved: {saved_names_this_run}, Hashes saved: {saved_hashes_this_run})")
-
-    if actual_material_modifications_this_run:
-        materials_modified = True
-
-    phase3_start_time = time.time()
-    library_update_queued_type = "None"
-    if hashes_actually_changed_in_db or needs_metadata_update : 
-        update_material_library(force_update=True) 
-        library_update_queued_type = "Forced"
-    elif hashes_to_save_to_db or needs_name_db_save or timestamp_updated_for_recency: 
-        update_material_library(force_update=False)
-        library_update_queued_type = "Non-Forced"
-        
-    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] Phase 3 (Lib Update Queue) took {time.time() - phase3_start_time:.4f}s. Queued: {library_update_queued_type}")
-    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} SAVE DB] ----- Pre-save handler total time: {time.time() - start_time_total:.4f}s. -----")
+    # Ensure the timer is running for future background checks after the save completes.
+    if not g_material_processing_timer_active:
+        bpy.app.timers.register(process_dirty_materials_timer, first_interval=2.0)
+        g_material_processing_timer_active = True
 
 @persistent
 def save_post_handler(dummy=None):
@@ -5313,38 +5179,23 @@ def create_reference_snapshot(context: bpy.types.Context) -> bool:
 
 # --------------------------
 # Depsgraph Handler (Unchanged from your version)
-# --------------------------
+# --------------------------    
 @persistent
 def depsgraph_update_handler(scene, depsgraph):
     """
-    Detects changes to materials or objects to dirty the relevant caches.
-    CORRECTED: No longer uses the obsolete 'is_updated_data' attribute.
+    ULTRA-LIGHTWEIGHT: Only detects if a material has changed.
+    It does NOT iterate or do any work. It just sets a single boolean flag.
     """
-    global materials_modified, g_used_uuids_dirty
-    try:
-        for update in depsgraph.updates:
-            # Check for changes to Material datablocks (for hashing)
-            if isinstance(update.id, bpy.types.Material):
-                material = update.id
-                try:
-                    material["hash_dirty"] = True
-                    materials_modified = True
-                except Exception:
-                    pass  # Ignore for library materials
-            
-            # Check for changes to Object datablocks (for material slots)
-            # In Blender 4.x, we no longer have `is_updated_data`.
-            # A general check for an updated Object ID is the safest and
-            # simplest way to catch potential material slot changes.
-            elif isinstance(update.id, bpy.types.Object):
-                # Any update to an object could be a material slot change.
-                # Setting a boolean flag is extremely cheap, so we do it here
-                # to be safe. The expensive part (rescan) only happens later
-                # and only if the user actually has the filter active.
-                g_used_uuids_dirty = True
+    global g_materials_are_dirty, g_used_uuids_dirty
+    # If the dirty flag is already set, we don't need to check further.
+    if g_materials_are_dirty:
+        return
 
-    except Exception as e:
-        print(f"[Depsgraph Handler] Error: {e}")
+    for update in depsgraph.updates:
+        if isinstance(update.id, bpy.types.Material):
+            g_materials_are_dirty = True
+            # No need to check for object updates here for this specific optimization
+            break # Exit early once a material change is found
 
 # --------------------------
 # Property Update Callbacks and UI Redraw (from old addon)
@@ -5794,11 +5645,11 @@ scene_props = [
 ]
 
 handler_pairs = [
-    (bpy.app.handlers.load_post, load_post_handler), # New load_post_handler
-    (bpy.app.handlers.save_pre, save_handler),       # New save_handler
-    (bpy.app.handlers.save_post, save_post_handler),   # New save_post_handler
-    (bpy.app.handlers.depsgraph_update_post, depsgraph_update_handler), # New depsgraph_update_handler
-    (bpy.app.handlers.load_post, migrate_thumbnail_files) # Kept from new function list
+    (bpy.app.handlers.load_post, load_post_handler),
+    (bpy.app.handlers.save_pre, save_pre_handler), # <-- CHANGE THIS LINE
+    (bpy.app.handlers.save_post, save_post_handler),
+    (bpy.app.handlers.depsgraph_update_post, depsgraph_update_handler),
+    (bpy.app.handlers.load_post, migrate_thumbnail_files)
 ]
 
 # --- deferred_safe_init (Unchanged in its core purpose) ---
@@ -5880,9 +5731,10 @@ def register():
     global thumbnail_worker_pool, thumbnail_monitor_timer_active, persistent_icon_template_scene
     global is_update_processing, library_update_queue, material_list_cache
     global db_connections 
-    # New batch globals
+    # New batch and async globals
     global g_thumbnail_process_ongoing, g_material_creation_timestamp_at_process_start
     global g_tasks_for_current_run, g_dispatch_lock, g_library_update_pending, g_current_run_task_hashes_being_processed
+    global g_materials_are_dirty, g_material_processing_timer_active
 
 
     print("[Register] MaterialList Addon Starting Registration...")
@@ -5913,6 +5765,8 @@ def register():
         print("[Register] CRITICAL: queue.Queue not available for db_connections!")
         
     materials_modified = False 
+    g_materials_are_dirty = False
+    g_material_processing_timer_active = False
 
     # Reset new batch globals
     g_thumbnail_process_ongoing = False
@@ -6071,6 +5925,15 @@ def register():
     else:
         print("[Register] deferred_safe_init function not found. Addon might not fully initialize.", file=sys.stderr)
 
+    get_hashing_scene_bundle()
+    print("[Register] Persistent hashing scene bundle created.")
+    
+    # --- Start the background processing timer ---
+    if not bpy.app.timers.is_registered(process_dirty_materials_timer):
+        # Start checking for dirty materials 5 seconds after addon registration.
+        bpy.app.timers.register(process_dirty_materials_timer, first_interval=5.0)
+        g_material_processing_timer_active = True
+    
     print("[Register] MaterialList Addon Registration Finished Successfully.")
 
 
@@ -6080,13 +5943,22 @@ def unregister():
     global thumbnail_pending_on_disk_check, thumbnail_generation_scheduled
     global db_connections
     global material_names, material_hashes, global_hash_cache, material_list_cache, _display_name_cache
-    # New batch globals
+    # New batch and async globals
     global g_thumbnail_process_ongoing, g_material_creation_timestamp_at_process_start
     global g_tasks_for_current_run, g_library_update_pending, g_current_run_task_hashes_being_processed
-    global list_version
+    global list_version, g_material_processing_timer_active
 
     print("[Unregister] MaterialList Addon Unregistering...")
 
+    # --- Stop Asynchronous Timers ---
+    if bpy.app.timers.is_registered(process_dirty_materials_timer):
+        bpy.app.timers.unregister(process_dirty_materials_timer)
+    g_material_processing_timer_active = False
+    print("[Unregister] Stopped material processing timer.")
+
+    cleanup_hashing_scene_bundle()
+    print("[Unregister] Hashing scene bundle cleaned up.")
+    
     if thumbnail_monitor_timer_active:
         print("[Unregister] Attempting to stop thumbnail monitor timer...")
         if bpy.app.timers.is_registered(process_thumbnail_tasks):
@@ -6105,11 +5977,10 @@ def unregister():
         if not process:
             continue
         if hasattr(process, 'poll') and process.poll() is None:
-            # Process is still running, apply the new kill logic
+            # Process is still running
             try:
                 pid = getattr(process, 'pid', 'Unknown')
                 print(f"  Worker {worker_idx + 1}: Pausing 0.1s before killing running process (PID: {pid})...")
-                # <<< MODIFICATION: Replace instant kill >>>
                 time.sleep(0.1)
                 process.kill()
                 print(f"  Worker {worker_idx + 1}: Kill signal sent for PID: {pid}.")
@@ -6135,53 +6006,39 @@ def unregister():
 
     for handler_list, func in handler_pairs:
         if func and callable(func):
-            removed_count = 0
             while func in handler_list:
                 try:
                     handler_list.remove(func)
-                    removed_count += 1
-                except ValueError:
+                except (ValueError, Exception):
                     break
-                except Exception as e_handler_unreg:
-                    print(f"[Unregister] Error removing handler {func.__name__}: {e_handler_unreg}")
-                    break
-            if removed_count > 0:
-                print(f"[Unregister] Removed handler {func.__name__} {removed_count} time(s).")
 
     for prop_name, _ in scene_props:
         if hasattr(bpy.types.Scene, prop_name):
             try:
                 delattr(bpy.types.Scene, prop_name)
-                print(f"[Unregister] Removed scene property: {prop_name}")
             except Exception as e_prop_unreg:
                 print(f"[Unregister] Error deleting scene property '{prop_name}': {e_prop_unreg}")
 
     if hasattr(bpy.types.WindowManager, 'matlist_save_handler_processed'):
         try:
             delattr(bpy.types.WindowManager, 'matlist_save_handler_processed')
-            print(f"[Unregister] Removed WindowManager.matlist_save_handler_processed")
         except Exception as e_wm_prop_unreg:
             print(f"[Unregister] Error deleting WindowManager.matlist_save_handler_processed: {e_wm_prop_unreg}")
     if hasattr(bpy.types.WindowManager, 'matlist_pending_lib_update_is_forced'):
         try:
             delattr(bpy.types.WindowManager, 'matlist_pending_lib_update_is_forced')
-            print(f"[Unregister] Removed WindowManager.matlist_pending_lib_update_is_forced")
         except Exception as e_wm_prop_unreg_force:
             print(f"[Unregister] Error deleting WindowManager.matlist_pending_lib_update_is_forced: {e_wm_prop_unreg_force}")
 
     for cls in reversed(classes):
         try:
             bpy.utils.unregister_class(cls)
-            print(f"[Unregister] Unregistered class: {cls.__name__}")
         except RuntimeError:
-            print(f"[Unregister] Class {cls.__name__} was not registered, skipping.")
-        except Exception as e_cls_unreg:
-            print(f"[Unregister] Error unregistering class {cls.__name__}: {e_cls_unreg}")
+            pass
 
     if custom_icons is not None:
         try:
             bpy.utils.previews.remove(custom_icons)
-            print(f"[Unregister] Removed custom_icons preview collection.")
         except Exception as e_preview_rem:
             print(f"[Unregister] Error removing custom_icons preview collection: {e_preview_rem}")
         custom_icons = None
@@ -6208,7 +6065,6 @@ def unregister():
     material_list_cache.clear()
     _display_name_cache.clear()
     thumbnail_generation_scheduled.clear()
-    # Clear new batch globals
     g_tasks_for_current_run.clear()
     g_current_run_task_hashes_being_processed.clear()
 
