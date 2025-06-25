@@ -24,6 +24,13 @@ import threading  # <-- THE CRITICAL FIX IS HERE
 from threading import Thread, Event, Lock
 from datetime import datetime
 from collections import deque
+import numpy as np
+import site
+try:
+    import xxhash
+    XXHASH_AVAILABLE = True
+except ImportError:
+    XXHASH_AVAILABLE = False
 
 try:
     import psutil
@@ -1840,52 +1847,6 @@ def save_pre_handler(dummy):
         bpy.app.timers.register(process_dirty_materials_timer, first_interval=2.0)
         g_material_processing_timer_active = True
     
-def non_blocking_task_collector():
-    """
-    [OPTIMIZED v2] This function is registered with a timer and acts as a
-    "Producer". It scans a small batch of materials, and if it finds a task,
-    it IMMEDIATELY queues it for the workers instead of waiting for the scan
-    to finish. This provides instant feedback to the user.
-    """
-    global g_task_collection_iterator, g_thumbnail_process_ongoing
-
-    # If the iterator hasn't been created, create it.
-    if g_task_collection_iterator is None:
-        # This generator yields one material at a time.
-        g_task_collection_iterator = (mat for mat in bpy.data.materials)
-
-    # Process a small chunk of materials in this timer tick
-    for _ in range(COLLECTION_BATCH_SIZE):
-        try:
-            # Get the next material from our generator
-            mat = next(g_task_collection_iterator)
-            if not mat or mat.name.startswith("__hashing_"):
-                continue
-
-            # Check if this specific material needs a thumbnail
-            task = get_custom_icon(mat, collect_mode=True)
-
-            # If a task is returned, queue it IMMEDIATELY
-            if isinstance(task, dict):
-                print(f"[Collector] Found task for '{mat.name}'. Queuing immediately.")
-                _queue_all_pending_tasks(single_task_list=[task])
-                ensure_thumbnail_queue_processor_running()
-
-        except StopIteration:
-            # We have processed all materials. The collection is done.
-            print("[Collector] Finished scanning all materials.")
-            g_task_collection_iterator = None
-            # We don't call finalize_thumbnail_run() here, because workers might still be busy.
-            # The process_thumbnail_tasks loop will handle finalization when all work is done.
-            return None # Stop this timer.
-        except Exception as e:
-            print(f"[Collector] Error: {e}")
-            traceback.print_exc()
-            g_task_collection_iterator = None
-            return None # Stop this timer on error
-
-    return 0.01 # Continue the timer to process the next chunk.
-
 @persistent
 def save_post_handler(dummy=None):
     """
@@ -2411,6 +2372,32 @@ class MATERIALLIST_OT_duplicate_or_localise_material(Operator):
                 traceback.print_exc()
                 return {'CANCELLED'}
 
+        return {'FINISHED'}
+
+class MATERIALLIST_OT_install_xxhash(bpy.types.Operator):
+    """Installs the 'xxhash' library for the fastest possible hashing."""
+    bl_idname = "materiallist.install_xxhash"
+    bl_label = "Install Fast Hashing (xxhash)"
+    bl_description = "Downloads and installs the 'xxhash' Python library for a significant hashing speed-up. Requires an internet connection and a restart of Blender."
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        try:
+            python_exe = sys.executable
+            # Ensure pip is available
+            subprocess.call([python_exe, "-m", "ensurepip"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # Install xxhash
+            result = subprocess.call([python_exe, "-m", "pip", "install", "xxhash"])
+
+            if result == 0:
+                self.report({'INFO'}, "'xxhash' installed successfully. Please restart Blender to enable.")
+                # We can set the flag to true now, it will be correct on next load
+                global XXHASH_AVAILABLE
+                XXHASH_AVAILABLE = True
+            else:
+                self.report({'ERROR'}, "Installation failed. Check Blender's System Console for errors.")
+        except Exception as e:
+            self.report({'ERROR'}, f"An error occurred: {e}")
         return {'FINISHED'}
 
 class MATERIALLIST_OT_pack_library_textures(Operator):
@@ -4682,36 +4669,113 @@ def process_thumbnail_tasks():
     # Continue the timer to keep monitoring.
     return 0.2
 
+def _collect_and_queue_all_tasks(tasks_to_process=None):
+    """
+    [NEW] Collects all required thumbnail tasks in one go, then efficiently
+    groups them by blend file and queues them in large batches.
+    This is called once by a timer to avoid blocking the UI on startup.
+    """
+    global g_outstanding_task_count, _ADDON_DATA_ROOT, THUMBNAIL_SIZE
+    global g_tasks_for_current_run, g_current_run_task_hashes_being_processed
+
+    # Phase 1: Collect all tasks
+    if tasks_to_process is None:
+        print("[Task Collector] Starting bulk collection of all missing thumbnails...")
+        all_tasks_found = []
+        for mat in bpy.data.materials:
+            if not mat or mat.name.startswith("__hashing_"):
+                continue
+            
+            # get_custom_icon is smart enough to not re-add tasks that are in-flight
+            task = get_custom_icon(mat, collect_mode=True)
+            if isinstance(task, dict):
+                all_tasks_found.append(task)
+        
+        g_tasks_for_current_run = all_tasks_found
+        print(f"[Task Collector] Collection finished. Found {len(all_tasks_found)} tasks.")
+    else:
+        # This path is for specific, ad-hoc tasks (e.g., after a material is duplicated)
+        g_tasks_for_current_run = tasks_to_process
+
+    if not g_tasks_for_current_run:
+        # If no tasks were found, finalize the run immediately.
+        finalize_thumbnail_run()
+        return None # Stop the timer
+
+    # Phase 2: Group tasks by the blend file they belong to
+    tasks_by_blend_file = {}
+    for task in g_tasks_for_current_run:
+        blend_file = task.get('blend_file')
+        if not blend_file or not os.path.exists(blend_file):
+            continue
+        
+        if blend_file not in tasks_by_blend_file:
+            tasks_by_blend_file[blend_file] = []
+        tasks_by_blend_file[blend_file].append(task)
+
+    if not tasks_by_blend_file:
+        finalize_thumbnail_run()
+        return None
+
+    # Phase 3: Create large, efficient batches and queue them
+    total_tasks_queued = 0
+    for blend_file, tasks_for_file in tasks_by_blend_file.items():
+        task_count_for_file = len(tasks_for_file)
+        print(f"[_queue_all_pending_tasks] Batching {task_count_for_file} tasks for '{os.path.basename(blend_file)}'...")
+        
+        # Create batches of the optimal size for each worker
+        for i in range(0, task_count_for_file, THUMBNAIL_BATCH_SIZE_PER_WORKER):
+            batch = tasks_for_file[i:i + THUMBNAIL_BATCH_SIZE_PER_WORKER]
+            thumbnail_task_queue.put({
+                "tasks": batch,
+                "blend_file": blend_file,
+                "addon_data_root": _ADDON_DATA_ROOT,
+                "size": THUMBNAIL_SIZE
+            })
+        total_tasks_queued += task_count_for_file
+
+    g_outstanding_task_count += total_tasks_queued
+    g_tasks_for_current_run.clear() # All tasks are now on the queue
+
+    # Phase 4: Ensure the worker manager is running
+    ensure_thumbnail_queue_processor_running()
+
+    return None # Ensure the one-shot timer stops
+
 def update_material_thumbnails(specific_tasks_to_process=None):
     """
-    [OPTIMIZED v2] Main initiator for a thumbnail generation "run".
-    For full scans, it now just starts the non-blocking collector timer.
+    [OPTIMIZED v3] Main initiator for a thumbnail generation "run".
+    It now uses a single-shot timer to trigger a bulk collection and
+    queuing process, avoiding the overhead of micro-batching.
     """
-    global g_thumbnail_process_ongoing, g_dispatch_lock, g_task_collection_iterator
+    global g_thumbnail_process_ongoing, g_tasks_for_current_run
+    global g_current_run_task_hashes_being_processed
 
-    if g_thumbnail_process_ongoing and specific_tasks_to_process is None: return
+    # If a full scan is already running, don't start another one.
+    if g_thumbnail_process_ongoing and specific_tasks_to_process is None:
+        return
 
-    with g_dispatch_lock:
-        if g_thumbnail_process_ongoing and specific_tasks_to_process is None: return
+    # If the call is for specific tasks, process them directly as before.
+    if specific_tasks_to_process:
+        print(f"[Thumb Update] Processing {len(specific_tasks_to_process)} specific tasks directly.")
+        _collect_and_queue_all_tasks(tasks_to_process=specific_tasks_to_process)
+        return
 
-        # Reset state for a new run
-        g_thumbnail_process_ongoing = True
-        g_tasks_for_current_run.clear()
-        g_task_collection_iterator = None # Important: reset the iterator
+    # --- For a full scan, start the bulk collection process ---
+    print("[Thumb Update] Scheduling bulk task collection...")
 
-        # Unregister any previous timer to ensure a clean start
-        if bpy.app.timers.is_registered(non_blocking_task_collector):
-            bpy.app.timers.unregister(non_blocking_task_collector)
-        
-        if specific_tasks_to_process:
-            # Specific tasks are already fast, queue them directly.
-            print(f"[Thumb Update] Processing {len(specific_tasks_to_process)} specific tasks directly.")
-            _queue_all_pending_tasks(single_task_list=specific_tasks_to_process)
-            ensure_thumbnail_queue_processor_running()
-        else:
-            # For a full scan, just start the collector. It will handle the rest.
-            print("[Thumb Update] Starting streaming task collection...")
-            bpy.app.timers.register(non_blocking_task_collector, first_interval=0.1)
+    # Reset state for the new run
+    g_thumbnail_process_ongoing = True
+    g_tasks_for_current_run.clear()
+    g_current_run_task_hashes_being_processed.clear()
+
+    # Unregister any previous timer to ensure a clean start
+    if bpy.app.timers.is_registered(_collect_and_queue_all_tasks):
+        bpy.app.timers.unregister(_collect_and_queue_all_tasks)
+    
+    # Schedule the main collection function to run once, after a short delay.
+    # This keeps the UI responsive before the collection starts.
+    bpy.app.timers.register(_collect_and_queue_all_tasks, first_interval=0.1)
 
 # --------------------------
 # Visibility–backup helpers (Unchanged)
@@ -5045,6 +5109,26 @@ def ensure_safe_preview(mat):
         print(f"[Preview] ERROR on {mat.name}: {e}")
         return False
 
+def _get_site_packages_path():
+    """
+    Finds the primary site-packages directory for the current Python environment.
+    This is used to pass the path to background workers.
+    """
+    try:
+        # For Blender, user-installed packages often go here
+        path = site.getusersitepackages()
+        if os.path.isdir(path):
+            return path
+    except Exception:
+        pass
+
+    # Fallback for other potential locations
+    for path in sys.path:
+        if "site-packages" in path and os.path.isdir(path):
+            return path
+            
+    return None
+
 # --------------------------
 # UIList and Panel Classes (from old addon, will use updated helpers)
 # --------------------------
@@ -5064,13 +5148,23 @@ class PersistentWorkerManager:
         if self.is_running:
             return
 
-        # Command to start a persistent worker that waits for JSON commands on stdin
+        # Get the site-packages path to pass to the worker
+        python_path = _get_site_packages_path()
+    
+        # --- This is the corrected command ---
+        # It launches a full Blender instance and passes the python-path for module lookups.
         cmd = [
-            bpy.app.binary_path, "--background", "--factory-startup",
+            bpy.app.binary_path,
+            "--background", 
+            "--factory-startup",
             "--python", BACKGROUND_WORKER_PY,
             "--", "--operation", "render_thumbnail_persistent"
         ]
-
+    
+        # Add the python-path so the worker can find external modules like xxhash
+        if python_path:
+            cmd.extend(["--python-path", python_path])
+        
         try:
             self.worker_process = subprocess.Popen(
                 cmd,
@@ -5147,7 +5241,7 @@ class PersistentWorkerManager:
             except json.JSONDecodeError:
                 print(f"[Worker-{self.id} STDOUT non-JSON]: {line}", file=sys.stderr)
         elif line:
-             print(f"[Worker-{self.id} STDOUT]: {line}")
+                print(f"[Worker-{self.id} STDOUT]: {line}")
 
     def _handle_stderr(self, line):
         line = line.strip()
@@ -5266,7 +5360,18 @@ class MATERIALLIST_PT_panel(bpy.types.Panel): # Ensure bpy.types.Panel is inheri
         layout = self.layout
         scene = context.scene
 
-        # --- NEW SECTION: Check for psutil dependency ---
+        # --- MODIFICATION: ADD XXHASH INSTALL BUTTON ---
+        if not XXHASH_AVAILABLE:
+            box = layout.box()
+            # --- THE FIX IS ON THE LINE BELOW ---
+            box.label(text="Optional: Faster Hashing", icon='CONSOLE') # <-- MODIFIED: Replaced 'SPEED' with a valid icon
+            box.label(text="'xxhash' library not found.")
+            box.operator("materiallist.install_xxhash", icon='CONSOLE')
+            box.label(text="Restart Blender after installation for a speed boost.")
+            layout.separator()
+        # --- END MODIFICATION ---
+
+        # --- Check for psutil dependency ---
         if psutil is None:
             box = layout.box()
             box.label(text="Resource Monitoring is Disabled.", icon='ERROR')
@@ -5300,7 +5405,7 @@ class MATERIALLIST_PT_panel(bpy.types.Panel): # Ensure bpy.types.Panel is inheri
 
         row = options_box.row(align=True)
         row.operator("materiallist.rename_material", icon='FONT_DATA',   text="Rename Display Name")
-        row.operator("materiallist.unassign_mat",     icon='PANEL_CLOSE', text="Unassign 'mat_'")
+        row.operator("materiallist.unassign_mat",      icon='PANEL_CLOSE', text="Unassign 'mat_'")
 
         # --- Reference Snapshot ---
         backup_box = layout.box()
@@ -5413,7 +5518,8 @@ classes = (
     MATERIALLIST_OT_pack_textures_internally,
     MATERIALLIST_OT_pack_textures_externally,
     MATERIALLIST_OT_trim_library,
-    MATERIALLIST_OT_install_psutil,  
+    MATERIALLIST_OT_install_psutil,
+    MATERIALLIST_OT_install_xxhash,
     MATERIALLIST_OT_prepare_material,
     MATERIALLIST_OT_assign_to_object,
     MATERIALLIST_OT_assign_to_faces,
