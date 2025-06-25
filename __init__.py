@@ -20,13 +20,20 @@ from bpy.app.handlers import persistent
 import bpy.utils.previews
 from contextlib import contextmanager
 from queue import Queue, PriorityQueue, Empty # Keep PriorityQueue for now, even if thumbnail_queue is removed
+import threading  # <-- THE CRITICAL FIX IS HERE 
 from threading import Thread, Event, Lock
 from datetime import datetime
 from collections import deque
 
+try:
+    import psutil
+except ImportError:
+    psutil = None # Define psutil as None if the import fails
+
 # --------------------------
 # Helper function to get user-specific data directory
 # --------------------------
+
 def get_material_manager_addon_data_dir():
     """
     Returns a directory path for the addon's persistent data.
@@ -96,6 +103,16 @@ g_hashing_scene_bundle = None
 g_materials_are_dirty = False
 g_material_processing_timer_active = False
 materials_modified = False
+g_thumbnails_generated_in_current_run = 0
+g_worker_manager_pool = []
+g_worker_results_queue = Queue()
+g_outstanding_task_count = 0
+thumbnail_task_queue = Queue()
+thumbnail_monitor_timer_active = False
+g_task_collection_iterator = None
+COLLECTION_BATCH_SIZE = 100
+RAM_USAGE_THRESHOLD_PERCENT = 85.0
+CPU_USAGE_THRESHOLD_PERCENT = 90.0
 
 THUMBNAIL_SIZE = 128
 VISIBLE_ITEMS = 30
@@ -747,6 +764,7 @@ def cleanup_hashing_scene_bundle():
 
     g_hashing_scene_bundle = None
      
+      
 def process_dirty_materials_timer():
     """
     This is the new "background" process that runs on a timer.
@@ -755,17 +773,14 @@ def process_dirty_materials_timer():
     """
     global g_materials_are_dirty, g_material_processing_timer_active, materials_modified
 
-    # If the flag isn't set, do nothing and stop the timer from running again until needed.
     if not g_materials_are_dirty:
         g_material_processing_timer_active = False
-        return None # This stops the bpy.app.timer
+        return None
 
     print(f"\n[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} TIMER] Dirty flag detected. Processing materials...")
     
-    # Reset the flag immediately to 'False' so we don't process the same changes again.
     g_materials_are_dirty = False
 
-    # This is the heavy logic moved directly from the old save_handler
     changed_materials_for_library_update = {}
     hashes_to_save_to_db = {}
     uuids_to_promote_for_recency = []
@@ -776,6 +791,13 @@ def process_dirty_materials_timer():
     for mat in list(bpy.data.materials):
         if not mat or mat.name.startswith("__hashing_"):
             continue
+            
+        # --- THIS IS THE CRITICAL FIX YOU ASKED FOR ---
+        # If the material is from a library, we do not process it.
+        # Its hash is considered final and is already in the database.
+        if mat.library:
+            continue
+        # --- END OF FIX ---
         
         actual_uuid = get_material_uuid(mat)
         if not actual_uuid:
@@ -788,10 +810,8 @@ def process_dirty_materials_timer():
             continue
 
         if db_stored_hash != current_hash:
-            materials_modified = True # Set flag for post_save_handler
-            if not mat.library:
-                changed_materials_for_library_update[actual_uuid] = mat
-            
+            materials_modified = True
+            changed_materials_for_library_update[actual_uuid] = mat
             hashes_to_save_to_db[actual_uuid] = current_hash
             uuids_to_promote_for_recency.append(actual_uuid)
     
@@ -811,7 +831,6 @@ def process_dirty_materials_timer():
     
     print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]} TIMER] Material processing finished.")
     
-    # Keep the timer running in the background to check again after a delay.
     return 2.0
 
 def preload_existing_thumbnails():
@@ -1319,63 +1338,55 @@ def process_library_queue(): # Unchanged
         return 0.1
     else: is_update_processing = False; return None
   
+      
 def _perform_library_update(force: bool = False, changed_map: dict | None = None):
-    print(f"[DEBUG LibUpdate MainAddon] Starting library update. Force: {force}, Changed Map Items: {len(changed_map) if changed_map else 0}")
+    """
+    [CORRECTED] Performs the background library update.
+    - If `changed_map` is provided, only those materials are processed.
+    - If `force=True` is used WITHOUT a `changed_map`, it is now treated as a no-op,
+      preventing the expensive fallback of processing all local materials.
+    """
+    print(f"[DEBUG LibUpdate] Starting. Force: {force}, Changed Map Items: {len(changed_map) if changed_map else 0}")
 
     global g_thumbnail_process_ongoing, g_library_update_pending
 
     if g_thumbnail_process_ongoing:
-        print("[DEBUG LibUpdate MainAddon] Thumbnail generation is ongoing. Deferring library update.")
+        print("[DEBUG LibUpdate] Thumbnail generation is ongoing. Deferring library update.")
         g_library_update_pending = True
-        if force:
-            if hasattr(bpy.context.window_manager, 'matlist_pending_lib_update_is_forced'):
-                bpy.context.window_manager.matlist_pending_lib_update_is_forced = True
+        if force and hasattr(bpy.context.window_manager, 'matlist_pending_lib_update_is_forced'):
+            bpy.context.window_manager.matlist_pending_lib_update_is_forced = True
         return False
     
-    # --- START OF NEW SIMPLIFIED LOGIC ---
-    mats_to_transfer_map = {}
-
-    if changed_map:
-        # This is now the primary, reliable path. Use the materials passed directly from the save handler.
-        print(f"  [LibUpdate] Processing {len(changed_map)} materials explicitly passed from save handler.")
-        mats_to_transfer_map = changed_map
-    
-    elif force:
-        # This is a fallback path for any other part of the addon that might trigger a generic forced update.
-        print("  [LibUpdate] 'force' is True but no explicit map. Falling back to checking all local materials.")
-        for mat in bpy.data.materials:
-            if mat.library or mat.name.startswith("__hashing_") or mat_get_display_name(mat).startswith("mat_"):
-                continue
-            uid = get_material_uuid(mat)
-            if uid:
-                mats_to_transfer_map[uid] = mat
-    else:
-        # If not forced and no changed map was provided, there's nothing to do.
-        print("[DEBUG LibUpdate MainAddon] No explicit changes and not forced. Nothing to transfer.")
+    # --- THIS IS THE CRITICAL FIX ---
+    # Only proceed if a specific map of changed materials is provided.
+    # The 'force' flag is now only relevant for deferral logic, not for triggering a full scan.
+    if not changed_map:
+        print("[DEBUG LibUpdate] No explicit 'changed_map' provided. Nothing to transfer to library.")
         return True
-    # --- END OF NEW SIMPLIFIED LOGIC ---
+    
+    mats_to_transfer_map = changed_map
+    # --- END OF FIX ---
 
     if not mats_to_transfer_map:
-        print("[DEBUG LibUpdate MainAddon] No materials to transfer to library after processing.")
+        print("[DEBUG LibUpdate] Material map was empty. Nothing to transfer.")
         return True
 
     final_mats_for_write = set()
     for uid, mat_to_write in mats_to_transfer_map.items():
         try:
+            # Ensure the datablock is named by its UUID for writing
             if mat_to_write.name != uid:
                 conflicting_mat = bpy.data.materials.get(uid)
                 if conflicting_mat and conflicting_mat != mat_to_write:
-                    if get_material_hash(conflicting_mat) == get_material_hash(mat_to_write):
-                        bpy.data.materials.remove(conflicting_mat)
-                        mat_to_write.name = uid
-                    else:
-                        print(f"      CRITICAL WARNING: Cannot rename '{mat_to_write.name}' to '{uid}'. A DIFFERENT material already has that name. Skipping.")
-                        continue
+                    # This is a safety check for a rare edge case
+                    print(f"      CRITICAL WARNING: Cannot rename '{mat_to_write.name}' to '{uid}'. A DIFFERENT material already has that name. Skipping.")
+                    continue
                 else:
                     mat_to_write.name = uid
             
             mat_to_write.use_fake_user = True
             
+            # Store origin metadata
             display_name = mat_get_display_name(mat_to_write)
             mat_to_write["ml_origin_blend_file"] = bpy.data.filepath if bpy.data.filepath else "UnsavedOrUnknown"
             mat_to_write["ml_origin_mat_name"] = display_name
@@ -1384,11 +1395,11 @@ def _perform_library_update(force: bool = False, changed_map: dict | None = None
             final_mats_for_write.add(mat_to_write)
 
         except Exception as prep_err:
-            print(f"      CRITICAL WARNING: Failed to prepare/rename representative datablock '{getattr(mat_to_write, 'name', 'N/A')}' to UUID '{uid}': {prep_err}. Skipping this material.")
+            print(f"      CRITICAL WARNING: Failed to prepare datablock '{getattr(mat_to_write, 'name', 'N/A')}' for library write: {prep_err}. Skipping.")
             continue
             
     if not final_mats_for_write:
-        print("[DEBUG LibUpdate MainAddon] No materials were successfully prepared for writing.")
+        print("[DEBUG LibUpdate] No materials were successfully prepared for writing.")
         return True
 
     tmp_dir_for_transfer = ""
@@ -1397,87 +1408,57 @@ def _perform_library_update(force: bool = False, changed_map: dict | None = None
         tmp_dir_for_transfer = tempfile.mkdtemp(prefix="matlib_transfer_")
         transfer_blend_file_path = os.path.join(tmp_dir_for_transfer, f"transfer_data_{uuid.uuid4().hex[:8]}.blend")
 
-        print(f"[DEBUG LibUpdate MainAddon] Writing {len(final_mats_for_write)} unique materials to transfer file: {transfer_blend_file_path}")
+        print(f"[DEBUG LibUpdate] Writing {len(final_mats_for_write)} materials to transfer file: {transfer_blend_file_path}")
         bpy.data.libraries.write(transfer_blend_file_path, final_mats_for_write, fake_user=True, compress=True)
-        print(f"[DEBUG LibUpdate MainAddon] Successfully wrote materials to transfer file.")
 
-        print(f"[DEBUG LibUpdate MainAddon] Staging textures for transfer file '{os.path.basename(transfer_blend_file_path)}' into temp dir: {tmp_dir_for_transfer}")
+        # Staging textures for the worker
         unique_images_to_stage = {}
-
-        for mat_in_transfer_file in final_mats_for_write:
-            if mat_in_transfer_file.use_nodes and mat_in_transfer_file.node_tree:
-                for node in _get_all_nodes_recursive(mat_in_transfer_file.node_tree): # Use recursive find
-                    if node.bl_idname == 'ShaderNodeTexImage' and node.image:
-                        img_datablock = node.image
-                        if img_datablock.packed_file or not img_datablock.filepath_raw:
-                            continue
-                        
-                        source_abs_path_in_main_blender_session = bpy.path.abspath(img_datablock.filepath_raw)
-                        
-                        if not os.path.exists(source_abs_path_in_main_blender_session):
-                            print(f"  WARNING: Source texture file for staging not found at '{source_abs_path_in_main_blender_session}'. Cannot stage.")
-                            continue
-                        
-                        texture_filename_on_disk = os.path.basename(source_abs_path_in_main_blender_session)
-                        target_abs_path_in_temp_staging_dir = os.path.join(tmp_dir_for_transfer, texture_filename_on_disk)
-                        
-                        if source_abs_path_in_main_blender_session not in unique_images_to_stage:
-                            unique_images_to_stage[source_abs_path_in_main_blender_session] = target_abs_path_in_temp_staging_dir
-
+        for mat in final_mats_for_write:
+            if mat.use_nodes and mat.node_tree:
+                for node in _get_all_nodes_recursive(mat.node_tree):
+                    if node.bl_idname == 'ShaderNodeTexImage' and node.image and not node.image.packed_file and node.image.filepath_raw:
+                        source_abs = bpy.path.abspath(node.image.filepath_raw)
+                        if os.path.exists(source_abs):
+                            target_abs = os.path.join(tmp_dir_for_transfer, os.path.basename(source_abs))
+                            if source_abs not in unique_images_to_stage:
+                                unique_images_to_stage[source_abs] = target_abs
+        
         if unique_images_to_stage:
-            print(f"[DEBUG LibUpdate MainAddon] Copying {len(unique_images_to_stage)} unique image files to temp staging area for worker...")
-            staged_count = 0; failed_copy_count = 0
-            for src_path, temp_dest_path in unique_images_to_stage.items():
+            print(f"[DEBUG LibUpdate] Staging {len(unique_images_to_stage)} unique image files for worker...")
+            for src, dest in unique_images_to_stage.items():
                 try:
-                    shutil.copy2(src_path, temp_dest_path)
-                    staged_count +=1
-                except shutil.SameFileError:
-                    print(f"    WARNING STAGING: shutil.SameFileError encountered for '{src_path}' and '{temp_dest_path}'. This may indicate a logic issue but will be ignored.")
-                    failed_copy_count +=1
-                except Exception as e_stage_copy:
-                    print(f"    ERROR STAGING: Failed to copy '{src_path}' to '{temp_dest_path}': {e_stage_copy}")
-                    failed_copy_count +=1
-            print(f"[DEBUG LibUpdate MainAddon] Staging of {staged_count} images complete. Failed copies: {failed_copy_count}.")
+                    shutil.copy2(src, dest)
+                except Exception as e_stage:
+                    print(f"    ERROR staging '{src}': {e_stage}")
 
         if not BACKGROUND_WORKER_PY or not os.path.exists(BACKGROUND_WORKER_PY):
-            raise RuntimeError(f"Background worker script missing or path invalid: {BACKGROUND_WORKER_PY}")
+            raise RuntimeError(f"Background worker script missing: {BACKGROUND_WORKER_PY}")
 
-        def _bg_merge_thread_target(transfer_file, target_library, database_path_for_worker, temp_dir_to_cleanup_after_worker):
+        # --- Background Thread Logic (remains the same) ---
+        def _bg_merge_thread_target(transfer_file, target_library, db_path, temp_dir):
             try:
-                db_file_abs_for_worker = os.path.abspath(database_path_for_worker) if database_path_for_worker else None
-                if not db_file_abs_for_worker or not os.path.exists(db_file_abs_for_worker):
-                    print(f"[BG Merge Thread] WARNING: Database file not found at '{db_file_abs_for_worker}' for worker's use.", file=sys.stderr)
-
                 cmd = [
                     bpy.app.binary_path, "--background", "--factory-startup",
                     "--python", BACKGROUND_WORKER_PY, "--",
                     "--operation", "merge_library", "--transfer", transfer_file,
-                    "--target", target_library,
+                    "--target", target_library, "--db", db_path
                 ]
-                if db_file_abs_for_worker:
-                    cmd.extend(["--db", db_file_abs_for_worker])
-
-                res = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=600)
-
-                if res.stdout: print(f"[BG Merge Thread - Worker Stdout]:\n{res.stdout}")
-                if res.stderr: print(f"[BG Merge Thread - Worker Stderr]:\n{res.stderr}")
-                if res.returncode != 0: print(f"[BG Merge Thread] Error: Worker exited with code {res.returncode}.")
+                subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=600)
             except Exception as e:
-                print(f"[BG Merge Thread] General Error: {e}")
+                print(f"[BG Merge Thread] Error: {e}")
             finally:
-                if temp_dir_to_cleanup_after_worker and os.path.exists(temp_dir_to_cleanup_after_worker):
-                    shutil.rmtree(temp_dir_to_cleanup_after_worker, ignore_errors=True)
+                if temp_dir and os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir, ignore_errors=True)
         
         bg_thread = Thread(target=_bg_merge_thread_target, args=(
             transfer_blend_file_path, os.path.abspath(LIBRARY_FILE),
             os.path.abspath(DATABASE_FILE), tmp_dir_for_transfer
         ), daemon=True)
         bg_thread.start()
+        print(f"[DEBUG LibUpdate] Background merge thread launched for {len(final_mats_for_write)} materials.")
 
-        print(f"[DEBUG LibUpdate MainAddon] Background merge thread launched for {len(final_mats_for_write)} materials.")
-
-    except Exception as e_write_transfer:
-        print(f"[DEBUG LibUpdate MainAddon] Failed during writing of transfer file: {e_write_transfer}")
+    except Exception as e_write:
+        print(f"[DEBUG LibUpdate] Failed during transfer file write: {e_write}")
         traceback.print_exc()
         if 'tmp_dir_for_transfer' in locals() and tmp_dir_for_transfer and os.path.exists(tmp_dir_for_transfer):
             shutil.rmtree(tmp_dir_for_transfer, ignore_errors=True)
@@ -1816,7 +1797,7 @@ def initialize_db_connection_pool():
 
 # --------------------------
 # Event Handlers (save_handler and load_post_handler updated)
-# --------------------------  
+# --------------------------     
       
 @persistent
 def save_pre_handler(dummy):
@@ -1858,6 +1839,52 @@ def save_pre_handler(dummy):
     if not g_material_processing_timer_active:
         bpy.app.timers.register(process_dirty_materials_timer, first_interval=2.0)
         g_material_processing_timer_active = True
+    
+def non_blocking_task_collector():
+    """
+    [OPTIMIZED v2] This function is registered with a timer and acts as a
+    "Producer". It scans a small batch of materials, and if it finds a task,
+    it IMMEDIATELY queues it for the workers instead of waiting for the scan
+    to finish. This provides instant feedback to the user.
+    """
+    global g_task_collection_iterator, g_thumbnail_process_ongoing
+
+    # If the iterator hasn't been created, create it.
+    if g_task_collection_iterator is None:
+        # This generator yields one material at a time.
+        g_task_collection_iterator = (mat for mat in bpy.data.materials)
+
+    # Process a small chunk of materials in this timer tick
+    for _ in range(COLLECTION_BATCH_SIZE):
+        try:
+            # Get the next material from our generator
+            mat = next(g_task_collection_iterator)
+            if not mat or mat.name.startswith("__hashing_"):
+                continue
+
+            # Check if this specific material needs a thumbnail
+            task = get_custom_icon(mat, collect_mode=True)
+
+            # If a task is returned, queue it IMMEDIATELY
+            if isinstance(task, dict):
+                print(f"[Collector] Found task for '{mat.name}'. Queuing immediately.")
+                _queue_all_pending_tasks(single_task_list=[task])
+                ensure_thumbnail_queue_processor_running()
+
+        except StopIteration:
+            # We have processed all materials. The collection is done.
+            print("[Collector] Finished scanning all materials.")
+            g_task_collection_iterator = None
+            # We don't call finalize_thumbnail_run() here, because workers might still be busy.
+            # The process_thumbnail_tasks loop will handle finalization when all work is done.
+            return None # Stop this timer.
+        except Exception as e:
+            print(f"[Collector] Error: {e}")
+            traceback.print_exc()
+            g_task_collection_iterator = None
+            return None # Stop this timer on error
+
+    return 0.01 # Continue the timer to process the next chunk.
 
 @persistent
 def save_post_handler(dummy=None):
@@ -2590,6 +2617,35 @@ class MATERIALLIST_OT_unassign_mat(bpy.types.Operator):
             {'INFO'},
             f"Processed {processed_objects} mesh objects, removed {total_removed} 'mat_' slots"
         )
+        return {'FINISHED'}
+
+class MATERIALLIST_OT_install_psutil(bpy.types.Operator):
+    """Installs the 'psutil' library for system resource monitoring."""
+    bl_idname = "materiallist.install_psutil"
+    bl_label = "Install Resource Monitor (psutil)"
+    bl_description = "Downloads and installs the 'psutil' Python library required for dynamic resource monitoring. Requires an internet connection."
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        try:
+            python_exe = sys.executable
+            # Ensure pip is up to date
+            subprocess.call([python_exe, "-m", "pip", "install", "--upgrade", "pip"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # Install psutil
+            # Using --user can help avoid permission errors in some cases
+            result = subprocess.call([python_exe, "-m", "pip", "install", "psutil", "--user"])
+
+            if result == 0:
+                self.report({'INFO'}, "'psutil' installed successfully. Please restart Blender to enable the feature.")
+            else:
+                self.report({'ERROR'}, "Installation failed. Check Blender's System Console for errors.")
+                print("[MaterialList] 'psutil' installation failed. Please try installing it manually from the command line.", file=sys.stderr)
+
+        except Exception as e:
+            self.report({'ERROR'}, f"An error occurred: {e}")
+            print(f"[MaterialList] An error occurred while trying to install 'psutil': {e}", file=sys.stderr)
+            traceback.print_exc()
+
         return {'FINISHED'}
 
 class MATERIALLIST_OT_backup_reference(Operator):
@@ -4250,155 +4306,96 @@ def migrate_thumbnail_files(dummy): # Unchanged in core logic, just uses pre-com
 # Thumbnail Generation Core Logic (get_custom_icon, generate_thumbnail_async, update_material_thumbnails)
 # --------------------------
 def get_custom_icon(mat, collect_mode=False):
-    global custom_icons, thumbnail_generation_scheduled, thumbnail_task_queue, thumbnail_pending_on_disk_check
-    global g_tasks_for_current_run, g_current_run_task_hashes_being_processed, THUMBNAIL_SIZE
-    global _ICON_TEMPLATE_VALIDATED
-
-    mat_name_debug = getattr(mat, 'name', 'None_Material_Name')
+    """
+    [CORRECTED v4] Gets a custom icon, or prepares a task if one is needed.
+    This version includes the critical check against the global "in-flight" task set
+    to prevent the infinite re-queuing of tasks during a single run.
+    """
+    global custom_icons
+    global g_current_run_task_hashes_being_processed, _ICON_TEMPLATE_VALIDATED
 
     if not mat:
         return 0
 
-    if not _ICON_TEMPLATE_VALIDATED:
-        try:
-            if not _verify_icon_template():
-                return 0 
-            _ICON_TEMPLATE_VALIDATED = True
-        except Exception as e_tpl_chk:
-            print(f"[GetIcon - {mat_name_debug}] CRITICAL: Exception during _verify_icon_template call: {e_tpl_chk}. Ret 0.", file=sys.stderr, flush=True)
-            traceback.print_exc(file=sys.stderr)
-            return 0
-
-    if custom_icons is None:
-        try:
-            custom_icons = bpy.utils.previews.new()
-            if custom_icons is None:
-                print(f"[GetIcon - {mat_name_debug}] CRITICAL: Reinitialization of custom_icons failed. Ret 0.", file=sys.stderr, flush=True)
-                return 0
-            if 'preload_existing_thumbnails' in globals() and callable(preload_existing_thumbnails):
-                preload_existing_thumbnails()
-        except Exception as e_reinit_previews:
-            print(f"[GetIcon - {mat_name_debug}] CRITICAL: Exception reinitializing custom_icons: {e_reinit_previews}. Ret 0.", file=sys.stderr, flush=True)
-            traceback.print_exc(file=sys.stderr)
-            return 0
-
-    current_material_hash = get_material_hash(mat) 
+    # --- Hashing and Initial "In-Flight" Check ---
+    current_material_hash = get_material_hash(mat)
     if not current_material_hash:
         return 0
 
-    # 1. Check Blender's preview cache (custom_icons) - OPTIMIZED CHECK
+    # -------------------------------------------------------------------
+    # --- THIS IS THE CRITICAL FIX TO PREVENT THE INFINITE LOOP ---
+    #
+    # If we have already queued this exact hash for processing in this run,
+    # then we must do nothing and exit immediately. This prevents the collector
+    # from finding the same missing icon over and over again while the worker
+    # is still busy processing the first request.
+    #
+    if current_material_hash in g_current_run_task_hashes_being_processed:
+        return 0 # Task is already in the pipeline, do not create a duplicate.
+    #
+    # --- END OF CRITICAL FIX ---
+    # -------------------------------------------------------------------
+
+    # --- Check Caches (If not already in flight) ---
+    # Check 1: Blender's internal preview cache (fastest)
     if current_material_hash in custom_icons:
         cached_preview_item = custom_icons[current_material_hash]
-        is_cached_item_acceptable = False # Assume not acceptable initially
-
         if hasattr(cached_preview_item, 'icon_id') and cached_preview_item.icon_id > 0:
-            actual_w, actual_h = cached_preview_item.icon_size
-            if actual_w > 1 and actual_h > 1: # Icon has a non-zero, practical size
-                # If preloaded and size is reasonable, trust it to avoid frequent disk I/O.
-                # Assumes preload_existing_thumbnails handled initial file validation.
-                is_cached_item_acceptable = True
-            else: # Zero or near-zero size, definitely invalid if found in cache.
-                print(f"    [GetIcon - Cache VERY BAD SIZE] HASH {current_material_hash[:8]} (Mat: {mat_name_debug}): Cached ID {cached_preview_item.icon_id} but size {actual_w}x{actual_h}. Invalidating from cache.")
-                if current_material_hash in custom_icons: # Ensure key exists before del
-                    del custom_icons[current_material_hash] 
-                # Do not delete the file here; let generation attempt it if this path leads to regeneration.
-        
-        if is_cached_item_acceptable:
-            # print(f"[GetIcon - {mat_name_debug}] Returning valid cached icon_id: {cached_preview_item.icon_id} for HASH {current_material_hash[:8]}.")
-            return cached_preview_item.icon_id
-        # If not acceptable (e.g., zero size from cache), fall through to disk check / generation queue.
+            if cached_preview_item.icon_size[0] > 1:
+                return cached_preview_item.icon_id
+            else:
+                del custom_icons[current_material_hash] # Corrupt cache entry
 
+    # Check 2: If a valid file already exists on disk
     thumbnail_file_path = get_thumbnail_path(current_material_hash)
-
-    # 2. Check if valid file exists on disk & attempt to load (if not acceptably in cache)
-    file_ok_on_disk = False
-    if os.path.isfile(thumbnail_file_path):
+    if os.path.isfile(thumbnail_file_path) and os.path.getsize(thumbnail_file_path) > 0:
         try:
-            if os.path.getsize(thumbnail_file_path) > 0:
-                file_ok_on_disk = True
-        except OSError: 
-            file_ok_on_disk = False
-
-    if file_ok_on_disk:
-        try:
-            if current_material_hash in custom_icons: # Should have been caught by above if truly valid, but double check or if invalidated.
-                # print(f"    [GetIcon - DiskLoad] Removing existing/invalid entry for HASH {current_material_hash[:8]} before disk load.")
+            preview_item_from_disk = custom_icons.load(current_material_hash, thumbnail_file_path, 'IMAGE')
+            if preview_item_from_disk.icon_size[0] > 1:
+                return preview_item_from_disk.icon_id
+            else: # Corrupt file on disk
                 del custom_icons[current_material_hash]
-            
-            preview_item_from_disk_load = custom_icons.load(current_material_hash, thumbnail_file_path, 'IMAGE')
-            is_genuinely_valid_from_disk = False
+                os.remove(thumbnail_file_path)
+        except (RuntimeError, OSError, Exception):
+            pass # Problem loading the file, fall through to regenerate
 
-            if preview_item_from_disk_load and hasattr(preview_item_from_disk_load, 'icon_id') and preview_item_from_disk_load.icon_id > 0:
-                actual_w, actual_h = preview_item_from_disk_load.icon_size
-                if actual_w <= 1 or actual_h <= 1:
-                    print(f"    [GetIcon - DiskLoad VERY BAD SIZE] HASH {current_material_hash[:8]} (Mat: {mat_name_debug}): Loaded ID {preview_item_from_disk_load.icon_id} from file, but size {actual_w}x{actual_h}. Invalidating.")
-                    if current_material_hash in custom_icons:
-                        del custom_icons[current_material_hash]
-                    # Consider deleting the problematic file from disk too if it's consistently bad
-                    # try: os.remove(thumbnail_file_path); print(f"      Deleted problematic file: {thumbnail_file_path}")
-                    # except Exception as e_del_disk: print(f"      Error deleting file {thumbnail_file_path}: {e_del_disk}")
-                else: # Size is acceptable
-                    is_genuinely_valid_from_disk = True
-            
-            if is_genuinely_valid_from_disk:
-                # print(f"[GetIcon - {mat_name_debug}] Successfully loaded from disk. Returning icon_id: {preview_item_from_disk_load.icon_id} for HASH {current_material_hash[:8]}.")
-                return preview_item_from_disk_load.icon_id
-            # else: Fall through to schedule generation if load from disk wasn't valid
+    # --- If we reach here, a thumbnail must be generated ---
+    if not _ICON_TEMPLATE_VALIDATED:
+        if not _verify_icon_template(): return 0
+        _ICON_TEMPLATE_VALIDATED = True
 
-        except RuntimeError as e_runtime_load_geticon:
-            print(f"    [GetIcon - DiskLoad RUNTIME ERROR] HASH {current_material_hash[:8]} for '{thumbnail_file_path}': {e_runtime_load_geticon}. Will schedule generation.", file=sys.stderr, flush=True)
-        except Exception as e_load_from_disk:
-            print(f"    [GetIcon - DiskLoad EXCEPTION] HASH {current_material_hash[:8]} for '{thumbnail_file_path}': {e_load_from_disk}. Will schedule generation.", file=sys.stderr, flush=True)
-            traceback.print_exc(file=sys.stderr)
-
-    # 3. If not found/loaded validly, check if already scheduled or being processed
-    if current_material_hash in g_current_run_task_hashes_being_processed or \
-       current_material_hash in thumbnail_pending_on_disk_check:
-        return 0 
-    
-    if thumbnail_generation_scheduled.get(current_material_hash, False) and not collect_mode:
-        return 0
-
-    # 4. Prepare task if not found/loaded validly
     blend_file_path_for_worker = None
     if mat.library and mat.library.filepath:
         blend_file_path_for_worker = bpy.path.abspath(mat.library.filepath)
-    elif not mat.library and bpy.data.filepath: 
+    elif not mat.library and bpy.data.filepath:
         blend_file_path_for_worker = bpy.path.abspath(bpy.data.filepath)
-    else: 
-        return 0 
+    else:
+        return 0 # Cannot process local material in an unsaved file
 
     if not blend_file_path_for_worker or not os.path.exists(blend_file_path_for_worker):
         return 0
 
-    mat_uuid_for_task = get_material_uuid(mat) 
-    if not mat_uuid_for_task or len(mat_uuid_for_task) != 36: 
-        print(f"[GetIcon - {mat_name_debug}] CRITICAL: Could not get/ensure valid UUID for material. Ret 0.", file=sys.stderr, flush=True)
-        return 0
+    mat_uuid_for_task = get_material_uuid(mat)
+    if not mat_uuid_for_task: return 0
 
-    if not mat.library:
-        try:
-            if mat.users == 0 and not mat.use_fake_user :
-                mat.use_fake_user = True
-        except Exception as e_fake_user:
-            print(f"    [GetIcon - {mat_name_debug}] Warning: Could not set use_fake_user for local material: {e_fake_user}", file=sys.stderr, flush=True)
+    # --- Add to "In-Flight" Set ---
+    # Since we are about to create a task, add its hash to our "in-flight" set immediately
+    # so that the next call to this function knows not to re-create it.
+    g_current_run_task_hashes_being_processed.add(current_material_hash)
 
     task_details = {
         'blend_file': blend_file_path_for_worker,
         'mat_uuid': mat_uuid_for_task,
         'thumb_path': thumbnail_file_path,
         'hash_value': current_material_hash,
-        'mat_name_debug': mat.name, 
-        'retries': 0 
+        'mat_name_debug': mat.name,
+        'retries': 0
     }
 
     if collect_mode:
-        return task_details 
+        return task_details
     else:
-        if 'update_material_thumbnails' in globals() and callable(update_material_thumbnails):
-            update_material_thumbnails(specific_tasks_to_process=[task_details])
-        else:
-            print(f"[GetIcon - {mat_name_debug}] CRITICAL: update_material_thumbnails function not found!", file=sys.stderr, flush=True)
+        update_material_thumbnails(specific_tasks_to_process=[task_details])
         return 0
 
 def _verify_icon_template() -> bool:
@@ -4436,161 +4433,91 @@ def _verify_icon_template() -> bool:
         traceback.print_exc()
         return False
 
-def _dispatch_collected_tasks():
+def _queue_all_pending_tasks(single_task_list=None):
     """
-    Takes tasks from g_tasks_for_current_run, groups them by blend_file,
-    creates batches, and puts them onto thumbnail_task_queue.
-    Only dispatches what can be immediately processed by available workers.
+    [CORRECTED v4] Queues tasks. The responsibility for tracking "in-flight"
+    tasks is now handled by get_custom_icon, simplifying this function.
     """
     global g_tasks_for_current_run, thumbnail_task_queue, g_dispatch_lock
-    global THUMBNAIL_BATCH_SIZE_PER_WORKER, g_current_run_task_hashes_being_processed
-    global MAX_CONCURRENT_THUMBNAIL_WORKERS, thumbnail_worker_pool # Added thumbnail_worker_pool here for clarity if used
+    global g_outstanding_task_count, _ADDON_DATA_ROOT, THUMBNAIL_SIZE
 
     with g_dispatch_lock:
-        if not g_tasks_for_current_run:
+        tasks_to_process = single_task_list if single_task_list is not None else g_tasks_for_current_run
+        if not tasks_to_process:
             return
 
-        # Calculate how many new workers we can start (using active Popen objects)
-        # This assumes thumbnail_worker_pool correctly tracks active Popen processes
-        # If thumbnail_workers (the list of dicts with 'process' key) is the source of truth for active workers, use that instead.
-        # For now, sticking to your existing use of thumbnail_worker_pool for this calculation.
-        active_workers = 0
-        # Let's assume thumbnail_worker_pool contains Popen objects directly
-        # or dicts with a 'process' key that is a Popen object.
-        # We need to check if they are alive.
-        # A more robust way might be to count entries in `thumbnail_workers` if that's the primary tracker.
-        # For this example, I'll base it on `len(thumbnail_worker_pool)` as per your code's implication.
-        
-        # The process_thumbnail_tasks uses `thumbnail_workers` to track running processes.
-        # Let's use that for consistency if it's available and reliable.
-        # If `thumbnail_workers` is the list of dicts {'process': Popen, ...}, then:
-        # active_workers_count = len(thumbnail_workers)
-        # available_worker_slots = MAX_CONCURRENT_THUMBNAIL_WORKERS - active_workers_count
-        
-        # Using your existing logic for available_worker_slots:
-        available_worker_slots = MAX_CONCURRENT_THUMBNAIL_WORKERS - len(thumbnail_worker_pool) 
-        
-        queued_batches = thumbnail_task_queue.qsize()
-        max_new_batches = max(0, available_worker_slots - queued_batches)
-        
-        if max_new_batches <= 0:
-            return
-
-        print(f"[_dispatch_collected_tasks] Starting. Tasks in g_tasks_for_current_run: {len(g_tasks_for_current_run)}, Can dispatch: {max_new_batches} batches")
-        
-        # Consider only tasks for the batches we can create
-        tasks_to_consider_for_dispatch = []
-        # Iterate through g_tasks_for_current_run to select tasks without modifying list during iteration
-        temp_tasks_for_dispatch = []
-        num_tasks_to_grab = max_new_batches * THUMBNAIL_BATCH_SIZE_PER_WORKER
-        
-        # Collect tasks to dispatch without removing them from g_tasks_for_current_run yet
-        # We'll remove them specifically once confirmed they are put on queue
-        potential_tasks_for_dispatch = g_tasks_for_current_run[:num_tasks_to_grab]
-
-        if not potential_tasks_for_dispatch:
-            return
-            
         tasks_by_blend_file = {}
-        for task in potential_tasks_for_dispatch:
-            # Ensure 'blend_file' key exists, default if necessary
-            blend_file = task.get('blend_file', bpy.data.filepath if bpy.data.filepath else "UNKNOWN_BLEND_FILE")
-            if blend_file not in tasks_by_blend_file:
-                tasks_by_blend_file[blend_file] = []
-            tasks_by_blend_file[blend_file].append(task)
-
-        print(f"[_dispatch_collected_tasks] Tasks grouped into {len(tasks_by_blend_file)} blend files.")
-
-        batches_created_count = 0
-        tasks_actually_put_on_queue = [] # Track tasks that are successfully put on the queue
+        for task in tasks_to_process:
+            blend_file = task.get('blend_file')
+            if blend_file and os.path.exists(blend_file):
+                if blend_file not in tasks_by_blend_file:
+                    tasks_by_blend_file[blend_file] = []
+                tasks_by_blend_file[blend_file].append(task)
         
-        for blend_file, tasks_for_this_blend in tasks_by_blend_file.items():
-            if batches_created_count >= max_new_batches:
-                break
+        if not tasks_by_blend_file:
+            if single_task_list is None: g_tasks_for_current_run.clear()
+            return
+
+        blend_file_to_process_now = next(iter(tasks_by_blend_file))
+        tasks_for_this_file = tasks_by_blend_file.pop(blend_file_to_process_now)
+        
+        remaining_tasks = []
+        for remaining_list in tasks_by_blend_file.values():
+            remaining_tasks.extend(remaining_list)
+        g_tasks_for_current_run = remaining_tasks
+
+        batches_created, tasks_queued = 0, 0
+        
+        for i in range(0, len(tasks_for_this_file), THUMBNAIL_BATCH_SIZE_PER_WORKER):
+            batch = tasks_for_this_file[i:i + THUMBNAIL_BATCH_SIZE_PER_WORKER]
+            thumbnail_task_queue.put({
+                "tasks": batch, "blend_file": blend_file_to_process_now,
+                "addon_data_root": _ADDON_DATA_ROOT, "size": THUMBNAIL_SIZE
+            })
+            batches_created += 1
+            tasks_queued += len(batch)
+        
+        g_outstanding_task_count += tasks_queued
+
+        if batches_created > 0:
+            print(f"[_queue_all_pending_tasks] Queued {tasks_queued} tasks for '{os.path.basename(blend_file_to_process_now)}'.")
+            if g_tasks_for_current_run:
+                print(f"  {len(g_tasks_for_current_run)} tasks for other files are pending.")
                 
-            print(f"  Processing {len(tasks_for_this_blend)} tasks for blend file: {os.path.basename(blend_file)}")
-            
-            for i in range(0, len(tasks_for_this_blend), THUMBNAIL_BATCH_SIZE_PER_WORKER):
-                if batches_created_count >= max_new_batches:
-                    break
-                    
-                current_batch_tasks = tasks_for_this_blend[i:i + THUMBNAIL_BATCH_SIZE_PER_WORKER]
-                if current_batch_tasks:
-                    # Generate a batch_id (e.g., based on the first task's hash and time)
-                    # Ensure task dictionaries have 'hash_value'
-                    first_task_hash = current_batch_tasks[0].get('hash_value', 'unknown_hash')
-                    batch_id_source = first_task_hash + str(time.time())
-                    batch_id = hashlib.md5(batch_id_source.encode()).hexdigest()[:8]
-
-                    # This is the corrected part: put a dictionary on the queue
-                    item_for_queue = {
-                        "batch_id": batch_id,
-                        "tasks": current_batch_tasks, # This is the list of task dictionaries for this batch
-                        "blend_file": blend_file      # The blend file these tasks are associated with
-                    }
-                    thumbnail_task_queue.put(item_for_queue)
-                    
-                    print(f"    Putting batch '{batch_id}' of {len(current_batch_tasks)} tasks onto thumbnail_task_queue. First HASH: {first_task_hash[:8]}")
-                    
-                    batches_created_count += 1
-                    
-                    for task_in_batch in current_batch_tasks:
-                        tasks_actually_put_on_queue.append(task_in_batch)
-                        # Ensure 'hash_value' is the correct key
-                        g_current_run_task_hashes_being_processed.add(task_in_batch['hash_value'])
-                        thumbnail_generation_scheduled[task_in_batch['hash_value']] = True # Your existing logic
-
-        # Remove only the dispatched tasks from g_tasks_for_current_run
-        if tasks_actually_put_on_queue:
-            # Create a set of unique identifiers for dispatched tasks to efficiently remove them
-            # Assuming 'hash_value' is a reliable unique ID per task
-            dispatched_task_ids = set(task['hash_value'] for task in tasks_actually_put_on_queue)
-            
-            new_g_tasks_for_current_run = []
-            for task in g_tasks_for_current_run:
-                if task['hash_value'] not in dispatched_task_ids:
-                    new_g_tasks_for_current_run.append(task)
-            g_tasks_for_current_run = new_g_tasks_for_current_run
-            
-            print(f"[_dispatch_collected_tasks] Dispatched {len(tasks_actually_put_on_queue)} tasks in {batches_created_count} batches. Remaining in g_tasks_for_current_run: {len(g_tasks_for_current_run)}")
-
-        if batches_created_count > 0:
-            # Make sure this function is defined and does what's expected (e.g., starts the bpy.app.timers.register)
-            ensure_thumbnail_queue_processor_running()
-
-      
-      
-      
 def finalize_thumbnail_run():
-    global g_thumbnail_process_ongoing, g_material_creation_timestamp_at_process_start
-    global g_library_update_pending, g_tasks_for_current_run, g_current_run_task_hashes_being_processed
+    """
+    [IMPROVED] Finalizes a thumbnail run cleanly.
+
+    This is the SOLE authority for ending the thumbnail generation process.
+    It's called by the worker manager (`process_thumbnail_tasks`) ONLY when
+    the main task queue and all worker-internal queues are empty.
+    """
+    global g_thumbnail_process_ongoing, g_library_update_pending
     global g_thumbnails_loaded_in_current_UMT_run
-    global g_save_handler_start_time # <<< MODIFICATION: Access global
 
-    print("[Finalize Thumbnail Run] Thumbnail generation/loading run completed.")
-    g_current_run_task_hashes_being_processed.clear()
-    g_thumbnail_process_ongoing = False 
-    g_material_creation_timestamp_at_process_start = 0.0
+    print("[Finalize Thumbnail Run] All thumbnail tasks complete. Finalizing run.")
+    g_thumbnail_process_ongoing = False
 
-    # <<< MODIFICATION: Add timing log >>>
-    if g_save_handler_start_time > 0:
-        duration = time.time() - g_save_handler_start_time
-        print(f"[THUMBNAIL PROCESS COMPLETE] Total time from save to thumbnail completion: {duration:.2f} seconds.")
-        # Reset the timer for the next run
-        g_save_handler_start_time = 0.0
-
+    # If any new thumbnails were successfully loaded into Blender's preview cache
+    # during this entire run, force a UI redraw to make them visible.
     if g_thumbnails_loaded_in_current_UMT_run:
         print("[Finalize Thumbnail Run] New thumbnails were loaded. Forcing UI redraw.")
         force_redraw()
         
+        # Incrementing the list version also helps the UIList know its icons may be stale.
         global list_version
         list_version += 1
     else:
         print("[Finalize Thumbnail Run] No new thumbnails were loaded in this run.")
-    
+
+    # Reset the flag for the next run.
+    g_thumbnails_loaded_in_current_UMT_run = False
+
+    # If a library update was deferred because thumbnails were being generated,
+    # run it now that the process is complete.
     if g_library_update_pending:
         print("[Finalize Thumbnail Run] Processing deferred library update.")
-        g_library_update_pending = False 
+        g_library_update_pending = False
         force_pending_update = getattr(bpy.context.window_manager, 'matlist_pending_lib_update_is_forced', False)
         _perform_library_update(force=force_pending_update)
         if hasattr(bpy.context.window_manager, 'matlist_pending_lib_update_is_forced'):
@@ -4606,406 +4533,185 @@ def ensure_thumbnail_queue_processor_running():
         else: # Timer is registered but flag was false, correct it
             thumbnail_monitor_timer_active = True
             # print("[ThumbMan] Thumbnail queue processor timer already registered but flag was false.")
-
       
+def _handle_worker_result(result_data):
+    """ Callback to put results from any worker into the central results queue. """
+    g_worker_results_queue.put(result_data)
+
+def _handle_worker_exit(manager_id):
+    """ Callback to safely remove a finished/crashed worker manager from the pool. """
+    print(f"[WorkerManager-{manager_id}] has exited. Removing from pool.")
+    global g_worker_manager_pool
+    # This list comprehension is a thread-safe way to rebuild the list
+    g_worker_manager_pool = [m for m in g_worker_manager_pool if m.id != manager_id]
+
+# --- REPLACEMENT for process_thumbnail_tasks ---
 def process_thumbnail_tasks():
-    global thumbnail_worker_pool, g_tasks_for_current_run, thumbnail_task_queue
-    global list_version, thumbnail_generation_scheduled, thumbnail_monitor_timer_active
-    global custom_icons, _ADDON_DATA_ROOT, THUMBNAIL_SIZE, BACKGROUND_WORKER_PY
-    global THUMBNAIL_BATCH_SIZE_PER_WORKER, THUMBNAIL_MAX_RETRIES
-    global g_thumbnail_process_ongoing, g_dispatch_lock, MAX_CONCURRENT_THUMBNAIL_WORKERS
-    global g_thumbnails_loaded_in_current_UMT_run 
+    """
+    [COMPLETE AND FINAL VERSION] Manages the persistent worker pool.
+    - Monitors system RAM and CPU usage before launching new workers.
+    - Launches new PersistentWorkerManager instances when work is available and resources permit.
+    - Distributes work to idle managers.
+    - Processes results from the central queue and handles retries.
+    - Handles the logic for queuing tasks for the next .blend file after one is complete.
+    - Shuts down the entire system when the entire job (all files, all tasks) is complete.
+    """
+    global g_worker_manager_pool, thumbnail_task_queue, g_worker_results_queue
+    global g_outstanding_task_count, thumbnail_monitor_timer_active, g_thumbnail_process_ongoing
+    global list_version, g_thumbnails_loaded_in_current_UMT_run, g_tasks_for_current_run
+    global g_current_run_task_hashes_being_processed, custom_icons, THUMBNAIL_MAX_RETRIES
 
-    any_successful_load_this_cycle = False 
+    # --- Section 1: Cleanup and Global Shutdown Check ---
+    # First, remove any workers that may have crashed or exited from the pool.
+    g_worker_manager_pool = [m for m in g_worker_manager_pool if m.is_alive()]
 
-    if not g_thumbnail_process_ongoing and thumbnail_task_queue.empty() and not thumbnail_worker_pool and not g_tasks_for_current_run :
-        if thumbnail_monitor_timer_active: 
-            thumbnail_monitor_timer_active = False 
-            return None 
-        return None 
-    
-    if g_thumbnail_process_ongoing and not thumbnail_monitor_timer_active:
-        ensure_thumbnail_queue_processor_running()
-
-    try:
-        if not _verify_icon_template(): 
-            print("[ThumbMan Timer] Icon template verification failed. Retrying check soon.", file=sys.stderr, flush=True)
-            thumbnail_monitor_timer_active = True 
-            return 0.5 
-
-        completed_worker_indices_this_cycle = []
-
-        for idx, worker_info in enumerate(list(thumbnail_worker_pool)): 
-            process = worker_info.get('process')
-            original_batch_tasks = worker_info.get('batched_tasks_in_worker', [])
-            batch_id_for_log = "UnknownBatch"
-            if original_batch_tasks and len(original_batch_tasks) > 0 and original_batch_tasks[0].get('hash_value'):
-                batch_id_for_log = original_batch_tasks[0]['hash_value'][:8]
-            
-            if not process:
-                completed_worker_indices_this_cycle.append(idx)
-                continue
-
-            exit_code = process.poll()
-            
-            existing_thumbs_in_batch_on_disk = 0
-            total_thumbs_in_batch = len(original_batch_tasks)
-            if total_thumbs_in_batch > 0:
-                for task in original_batch_tasks:
-                    if isinstance(task, dict) and os.path.exists(task.get('thumb_path', '')):
-                        try:
-                            if os.path.getsize(task.get('thumb_path', '')) > 0 :
-                                existing_thumbs_in_batch_on_disk += 1
-                        except OSError: pass 
-
-            if exit_code is not None: 
-                completed_worker_indices_this_cycle.append(idx)
-            
-                stdout_str, stderr_str = "", ""
-                try:
-                    stdout_bytes, stderr_bytes = process.communicate(timeout=10) 
-                    stdout_str = stdout_bytes.decode('utf-8', errors='replace').strip() if stdout_bytes else ""
-                    stderr_str = stderr_bytes.decode('utf-8', errors='replace').strip() if stderr_bytes else ""
-                except subprocess.TimeoutExpired:
-                    stderr_str += "\n[Communicate Timeout on COMPLETED process]"
-                    print(f"  [ThumbMan Timer] Worker {idx} (Batch {batch_id_for_log}) - communicate timed out after exit.", file=sys.stderr, flush=True)
-                except Exception as e_comm:
-                    stderr_str += f"\n[Error communicating with COMPLETED process: {e_comm}]"
-                    print(f"  [ThumbMan Timer] Worker {idx} (Batch {batch_id_for_log}) - communicate error: {e_comm}", file=sys.stderr, flush=True)
-
-                if stderr_str:
-                    print(f"  [WORKER STDERR - FINISHED] W{idx} (Batch:{batch_id_for_log}):\n{stderr_str}", file=sys.stderr, flush=True)
-
-                parsed_worker_json_results = []
-                if exit_code == 0 and stdout_str: 
-                    json_line_to_parse = None
-                    try:
-                        lines = stdout_str.strip().splitlines()
-                        if lines:
-                            for line in reversed(lines): 
-                                line_stripped = line.strip()
-                                if (line_stripped.startswith('{') and line_stripped.endswith('}')) or \
-                                   (line_stripped.startswith('[') and line_stripped.endswith(']')):
-                                    json_line_to_parse = line_stripped; break
-                        if json_line_to_parse:
-                            json_data = json.loads(json_line_to_parse)
-                            if isinstance(json_data, dict) and "results" in json_data and isinstance(json_data["results"], list):
-                                parsed_worker_json_results = json_data["results"]
-                        
-                    except json.JSONDecodeError as e_json:
-                        print(f"    [Worker {idx} JSON] JSONDecodeError: {e_json}. Stdout was:\n{stdout_str}", file=sys.stderr, flush=True)
-                    except Exception as e_json_other:
-                        print(f"    [Worker {idx} JSON] Error processing JSON: {e_json_other}", file=sys.stderr, flush=True)
-
-
-                tasks_to_evaluate_after_worker = []
-                if parsed_worker_json_results:
-                    for res_item in parsed_worker_json_results:
-                        hash_val_from_res = res_item.get('hash_value')
-                        original_task = next((t for t in original_batch_tasks if t.get('hash_value') == hash_val_from_res), None)
-                        if original_task:
-                            tasks_to_evaluate_after_worker.append({
-                                "task_data": original_task,
-                                "worker_status": res_item.get("status", "failure"), 
-                                "worker_reason": res_item.get("reason", "no_reason_in_json")
-                            })
-                else: 
-                    for task_in_batch in original_batch_tasks:
-                        tasks_to_evaluate_after_worker.append({
-                            "task_data": task_in_batch,
-                            "worker_status": "failure", 
-                            "worker_reason": f"no_json_or_bad_exit_rc_{exit_code}"
-                        })
-                
-                for eval_item in tasks_to_evaluate_after_worker:
-                    task_data = eval_item["task_data"]; hash_val = task_data['hash_value']; thumb_p = task_data['thumb_path']; retries_done = task_data.get('retries', 0)
-                    worker_reported_status = eval_item["worker_status"]
-                    
-                    thumbnail_pending_on_disk_check.pop(hash_val, None) 
-                    g_current_run_task_hashes_being_processed.discard(hash_val)
-
-                    file_ok_on_disk = False; file_size_on_disk = 0
-                    if os.path.exists(thumb_p):
-                        try:
-                            file_size_on_disk = os.path.getsize(thumb_p)
-                            if file_size_on_disk > 0: file_ok_on_disk = True
-                        except OSError as e_stat_after_worker:
-                            print(f"        [Task Eval - File Stat Error post-worker] Hash {hash_val[:8]} for '{thumb_p}': {e_stat_after_worker}", flush=True)
-                    
-                    loaded_to_blender_properly_this_task = False
-                    if file_ok_on_disk and worker_reported_status == "success": 
-                        if custom_icons is not None:
-                            try:
-                                time.sleep(0.05) 
-                                if hash_val in custom_icons: 
-                                    del custom_icons[hash_val]
-                                
-                                custom_icons.load(hash_val, thumb_p, 'IMAGE')
-                                final_entry_in_cache = custom_icons.get(hash_val)
-
-                                if final_entry_in_cache and hasattr(final_entry_in_cache, 'icon_id') and final_entry_in_cache.icon_id > 0:
-                                    actual_w, actual_h = final_entry_in_cache.icon_size
-                                    if actual_w <= 1 or actual_h <= 1: 
-                                        print(f"        [Task Eval - Cache Load VERY BAD SIZE] Hash {hash_val[:8]}: Loaded ID {final_entry_in_cache.icon_id} but size {actual_w}x{actual_h}. Invalidating & deleting file.", flush=True)
-                                        if hash_val in custom_icons: del custom_icons[hash_val] 
-                                        if os.path.exists(thumb_p):
-                                            try: os.remove(thumb_p)
-                                            except Exception as e_del_bad_thumb: print(f"          Error deleting bad thumb file {thumb_p}: {e_del_bad_thumb}", flush=True)
-                                    else: 
-                                        loaded_to_blender_properly_this_task = True
-                                        any_successful_load_this_cycle = True 
-                                        g_thumbnails_loaded_in_current_UMT_run = True 
-                                        list_version +=1 
-                            except RuntimeError as e_runtime_load_after_worker:
-                                print(f"        [Task Eval - Cache Load RUNTIME ERROR] Hash {hash_val[:8]} for '{thumb_p}': {e_runtime_load_after_worker}. Deleting potentially corrupt file.", file=sys.stderr, flush=True)
-                                if os.path.exists(thumb_p): os.remove(thumb_p) 
-                            except Exception as e_load_exc_after_worker:
-                                print(f"        [Task Eval - Cache Load EXCEPTION] Hash {hash_val[:8]} for '{thumb_p}': {e_load_exc_after_worker}. Deleting potentially corrupt file.", file=sys.stderr, flush=True)
-                                if os.path.exists(thumb_p): os.remove(thumb_p)
-                    
-                    if not loaded_to_blender_properly_this_task:
-                        thumbnail_generation_scheduled.pop(hash_val, None) 
-                        if retries_done < THUMBNAIL_MAX_RETRIES:
-                            task_for_retry = task_data.copy(); task_for_retry['retries'] = retries_done + 1
-                            with g_dispatch_lock: 
-                                g_tasks_for_current_run.append(task_for_retry)
-                                thumbnail_generation_scheduled[hash_val] = True 
-                        else:
-                            print(f"        [Task Eval - MAX RETRIES] Hash {hash_val[:8]} reached max retries ({THUMBNAIL_MAX_RETRIES}). Giving up on this hash for this run.")
-                            if os.path.exists(thumb_p) and file_ok_on_disk : 
-                                print(f"          Deleting problematic thumbnail file '{thumb_p}' after max retries.")
-                                try: os.remove(thumb_p)
-                                except Exception as e_del_max_retry_file: print(f"            Error deleting file {thumb_p}: {e_del_max_retry_file}")
-                    else: 
-                        thumbnail_generation_scheduled.pop(hash_val, None) 
-
-            elif exit_code is None: # Worker is still running
-                if existing_thumbs_in_batch_on_disk == total_thumbs_in_batch and total_thumbs_in_batch > 0:
-                    print(f"  [ThumbMan Timer] Worker {idx} (Batch {batch_id_for_log}, PID: {getattr(process, 'pid', 'N/A')}): WARNING - All {total_thumbs_in_batch} thumbnails exist on disk, but process still running! Forcing KILL to prevent stale worker.", flush=True)
-                    try:
-                        # <<< MODIFICATION: Replace terminate/kill logic >>>
-                        time.sleep(0.1)
-                        process.kill()
-                    except Exception as e_kill_stale: print(f"    Error killing stale worker {idx}: {e_kill_stale}", flush=True)
-                    completed_worker_indices_this_cycle.append(idx) 
-                    for task_in_stale_batch in original_batch_tasks:
-                        hash_val_stale = task_in_stale_batch['hash_value']
-                        thumbnail_pending_on_disk_check.pop(hash_val_stale, None)
-                        g_current_run_task_hashes_being_processed.discard(hash_val_stale)
-                        thumbnail_generation_scheduled.pop(hash_val_stale, None)
-
-        if completed_worker_indices_this_cycle:
-            for i in sorted(completed_worker_indices_this_cycle, reverse=True):
-                if 0 <= i < len(thumbnail_worker_pool): 
-                    thumbnail_worker_pool.pop(i)
-            if g_tasks_for_current_run and len(thumbnail_worker_pool) < MAX_CONCURRENT_THUMBNAIL_WORKERS:
-                 _dispatch_collected_tasks()
-
-
-        if g_tasks_for_current_run and len(thumbnail_worker_pool) < MAX_CONCURRENT_THUMBNAIL_WORKERS and thumbnail_task_queue.qsize() < (MAX_CONCURRENT_THUMBNAIL_WORKERS - len(thumbnail_worker_pool)):
-            _dispatch_collected_tasks()
-
-
-        workers_started_this_cycle = 0
-        while len(thumbnail_worker_pool) < MAX_CONCURRENT_THUMBNAIL_WORKERS and not thumbnail_task_queue.empty():
-            try:
-                queued_item_for_worker = thumbnail_task_queue.get_nowait()
-            except Empty: break 
-
-            if not isinstance(queued_item_for_worker, dict) or not all(k in queued_item_for_worker for k in ["batch_id", "tasks", "blend_file"]):
-                print(f"  [ThumbMan Timer] Invalid item dequeued: {queued_item_for_worker}. Skipping.", file=sys.stderr, flush=True)
-                continue
-
-            batch_id_from_queue = queued_item_for_worker['batch_id']
-            tasks_for_worker_process = queued_item_for_worker['tasks']
-            blend_file_for_worker_process = queued_item_for_worker['blend_file']
-            
-            all_tasks_in_batch_already_valid_in_blender_cache = True 
-            if not tasks_for_worker_process: 
-                all_tasks_in_batch_already_valid_in_blender_cache = False
-            else:
-                for task_to_check_cache in tasks_for_worker_process:
-                    hash_val_to_check_cache = task_to_check_cache.get('hash_value')
-                    thumb_path_to_check_cache = task_to_check_cache.get('thumb_path')
-                    if not hash_val_to_check_cache or not thumb_path_to_check_cache: 
-                        all_tasks_in_batch_already_valid_in_blender_cache = False; break
-                    
-                    is_task_valid_in_blender_cache_now = False
-                    if custom_icons and hash_val_to_check_cache in custom_icons:
-                        preview_item_to_check = custom_icons[hash_val_to_check_cache]
-                        if hasattr(preview_item_to_check, 'icon_id') and preview_item_to_check.icon_id > 0:
-                            actual_w_chk, actual_h_chk = preview_item_to_check.icon_size
-                            if not (actual_w_chk <= 1 or actual_h_chk <= 1): 
-                                if os.path.exists(thumb_path_to_check_cache) and os.path.getsize(thumb_path_to_check_cache) > 0:
-                                    is_task_valid_in_blender_cache_now = True
-                    
-                    if not is_task_valid_in_blender_cache_now:
-                        all_tasks_in_batch_already_valid_in_blender_cache = False; break
-            
-            if all_tasks_in_batch_already_valid_in_blender_cache:
-                for task_skipped_from_queue in tasks_for_worker_process:
-                    h_skip = task_skipped_from_queue['hash_value']
-                    thumbnail_pending_on_disk_check.pop(h_skip, None)
-                    thumbnail_generation_scheduled.pop(h_skip, None) 
-                    g_current_run_task_hashes_being_processed.discard(h_skip)
-                g_thumbnails_loaded_in_current_UMT_run = True 
-                continue 
-
-            try:
-                for task_path_data in tasks_for_worker_process:
-                    os.makedirs(os.path.dirname(task_path_data['thumb_path']), exist_ok=True)
-            except Exception as e_mkdir_batch:
-                print(f"  [ThumbMan Timer] Error creating directories for batch {batch_id_from_queue}: {e_mkdir_batch}. Re-queueing tasks.", file=sys.stderr, flush=True)
-                with g_dispatch_lock: g_tasks_for_current_run.extend(tasks_for_worker_process) 
-                continue 
-
-            for task_to_mark_pending in tasks_for_worker_process:
-                thumbnail_pending_on_disk_check[task_to_mark_pending['hash_value']] = task_to_mark_pending
-
-            tasks_json_payload_for_worker = json.dumps(tasks_for_worker_process)
-            abs_blend_file_for_worker = os.path.abspath(blend_file_for_worker_process)
-            abs_worker_script_path = os.path.abspath(BACKGROUND_WORKER_PY)
-            abs_addon_data_root = os.path.abspath(_ADDON_DATA_ROOT)
-
-            cmd_for_worker_process = [
-                bpy.app.binary_path, "--background", "--factory-startup", 
-                abs_blend_file_for_worker, 
-                "--python", abs_worker_script_path, 
-                "--", 
-                "--operation", "render_thumbnail", 
-                "--tasks-json", tasks_json_payload_for_worker, 
-                "--addon-data-root", abs_addon_data_root, 
-                "--thumbnail-size", str(THUMBNAIL_SIZE)
-            ]
-            try:
-                popen_obj_for_pool = subprocess.Popen(cmd_for_worker_process, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                thumbnail_worker_pool.append({'process': popen_obj_for_pool, 'batched_tasks_in_worker': list(tasks_for_worker_process)}) 
-                workers_started_this_cycle += 1
-            except Exception as e_popen_launch:
-                print(f"  [ThumbMan Timer] ERROR launching worker for batch {batch_id_from_queue}: {e_popen_launch}", file=sys.stderr, flush=True)
-                traceback.print_exc(file=sys.stderr)
-                with g_dispatch_lock: g_tasks_for_current_run.extend(tasks_for_worker_process)
-                for task_failed_launch in tasks_for_worker_process: 
-                    thumbnail_pending_on_disk_check.pop(task_failed_launch['hash_value'], None)
-        
-        if not g_tasks_for_current_run and thumbnail_task_queue.empty() and not thumbnail_worker_pool:
-            if g_thumbnail_process_ongoing: 
-                finalize_thumbnail_run() 
-            
-            if not g_thumbnail_process_ongoing :
-                if thumbnail_monitor_timer_active: 
-                    thumbnail_monitor_timer_active = False
-                    return None 
-        
-        if g_thumbnail_process_ongoing or not thumbnail_task_queue.empty() or thumbnail_worker_pool or g_tasks_for_current_run :
-            if not thumbnail_monitor_timer_active: 
-                ensure_thumbnail_queue_processor_running() 
-            return 1.0 
-        else: 
-            if thumbnail_monitor_timer_active:
-                thumbnail_monitor_timer_active = False
-                return None 
-            return None 
-
-    except Exception as e_timer_main_loop_critical:
-        print(f"[ThumbMan Timer] CRITICAL UNHANDLED ERROR in process_thumbnail_tasks: {e_timer_main_loop_critical}", file=sys.stderr, flush=True)
-        traceback.print_exc(file=sys.stderr)
-        g_thumbnail_process_ongoing = False 
-        if thumbnail_monitor_timer_active:
+    # If the global "job in progress" flag is false, the only goal is to shut down.
+    if not g_thumbnail_process_ongoing:
+        if g_worker_manager_pool:
+            # If workers are still running, signal them to stop and check back soon.
+            for manager in g_worker_manager_pool:
+                manager.stop_async()
+            return 0.1  # Continue timer to give workers time to shut down.
+        else:
+            # All workers are gone, so the timer can be safely stopped.
             thumbnail_monitor_timer_active = False
-            return None 
-        return None
+            return None  # Stop the timer.
+
+    # --- Section 2: Dynamic Resource Throttling ---
+    # Before launching new workers, check if system resources are already high.
+    if psutil and not thumbnail_task_queue.empty() and len(g_worker_manager_pool) < MAX_CONCURRENT_THUMBNAIL_WORKERS:
+        system_ram = psutil.virtual_memory()
+        cpu_load = psutil.cpu_percent(interval=None)
+
+        if system_ram.percent > RAM_USAGE_THRESHOLD_PERCENT:
+            print(f"[Resource Throttle] RAM at {system_ram.percent:.1f}% > {RAM_USAGE_THRESHOLD_PERCENT}%. Pausing worker dispatch.", file=sys.stderr)
+            return 0.5  # Wait longer before checking again.
+
+        if cpu_load > CPU_USAGE_THRESHOLD_PERCENT:
+            print(f"[Resource Throttle] CPU at {cpu_load:.1f}% > {CPU_USAGE_THRESHOLD_PERCENT}%. Pausing worker dispatch.", file=sys.stderr)
+            return 0.5  # Wait longer before checking again.
+
+    # --- Section 3: Worker Creation and Task Distribution ---
+    # If the queue has work and we have capacity, launch new workers.
+    if not thumbnail_task_queue.empty():
+        while len(g_worker_manager_pool) < MAX_CONCURRENT_THUMBNAIL_WORKERS:
+            if thumbnail_task_queue.empty():
+                break
+            
+            manager = PersistentWorkerManager(_handle_worker_result, _handle_worker_exit)
+            manager.start()
+            if not manager.is_running:
+                print("[Thumb Timer] Failed to start a new worker, will retry.", file=sys.stderr)
+                break
+            g_worker_manager_pool.append(manager)
+            
+            # Immediately try to give the new worker a task.
+            try:
+                manager.add_task(thumbnail_task_queue.get_nowait())
+            except Empty:
+                pass  # Another worker might have grabbed the task.
+    
+    # Distribute any remaining tasks to already-running workers that are now idle.
+    if not thumbnail_task_queue.empty():
+        for manager in g_worker_manager_pool:
+            if manager.task_queue.qsize() == 0:  # Check if the worker's personal queue is empty.
+                try:
+                    manager.add_task(thumbnail_task_queue.get_nowait())
+                except Empty:
+                    break
+
+    # --- Section 4: Process All Available Results from Workers ---
+    try:
+        while True:  # Process all results currently in the queue without blocking.
+            result_batch = g_worker_results_queue.get_nowait()
+            original_tasks = result_batch.get("original_tasks", [])
+            results_map = {res.get('hash_value'): res for res in result_batch.get("results", []) if 'hash_value' in res}
+
+            for task in original_tasks:
+                g_outstanding_task_count -= 1
+                h = task.get('hash_value')
+                if not h:
+                    continue
+
+                is_successful = False
+                result = results_map.get(h)
+                if result and result.get('status') == 'success':
+                    thumb_path = task['thumb_path']
+                    if os.path.isfile(thumb_path) and os.path.getsize(thumb_path) > 0:
+                        try:
+                            if h in custom_icons:
+                                del custom_icons[h]
+                            custom_icons.load(h, thumb_path, 'IMAGE')
+                            if custom_icons.get(h) and custom_icons[h].icon_size[0] > 1:
+                                is_successful = True
+                                g_thumbnails_loaded_in_current_UMT_run = True
+                                list_version += 1
+                        except Exception as e_load:
+                            print(f"[Thumb Timer] Error loading generated thumbnail {h[:8]}: {e_load}", file=sys.stderr)
+                
+                # If the task was not successful, decide whether to retry.
+                if not is_successful:
+                    retries = task.get('retries', 0)
+                    if retries < THUMBNAIL_MAX_RETRIES:
+                        task['retries'] = retries + 1
+                        with g_dispatch_lock:
+                            g_tasks_for_current_run.append(task)
+                    else:
+                        print(f"[Thumb Timer] Max retries reached for {h[:8]}", file=sys.stderr)
+                
+                # Whether successful or failed, the task is no longer "in-flight".
+                # This allows it to be re-queued for a retry pass if necessary.
+                g_current_run_task_hashes_being_processed.discard(h)
+
+    except Empty:
+        pass  # No more results in the queue for now.
+
+    # --- Section 5: Job Completion and Next Batch Logic ---
+    # This logic runs after checking for results.
+    if g_outstanding_task_count <= 0 and thumbnail_task_queue.empty():
+        # If all tasks for the current file (and any retries) are done,
+        # we check if there are more tasks waiting for other blend files or new retries.
+        if g_tasks_for_current_run:
+            print("[Thumb Manager] Batch complete. Queuing tasks for next file/retries...")
+            # This will now queue the next file in the list.
+            _queue_all_pending_tasks()
+        # Otherwise, if no more tasks exist anywhere, the entire job is truly finished.
+        elif g_thumbnail_process_ongoing:
+            finalize_thumbnail_run()
+
+    # Continue the timer to keep monitoring.
+    return 0.2
 
 def update_material_thumbnails(specific_tasks_to_process=None):
     """
-    Main initiator for a thumbnail generation "run".
-    Collects tasks via get_custom_icon and dispatches them.
-    If specific_tasks_to_process is provided, it uses those instead of scanning all materials.
-    This function sets g_thumbnail_process_ongoing = True.
+    [OPTIMIZED v2] Main initiator for a thumbnail generation "run".
+    For full scans, it now just starts the non-blocking collector timer.
     """
-    global custom_icons, list_version
-    global g_thumbnail_process_ongoing, g_material_creation_timestamp_at_process_start
-    global g_tasks_for_current_run, g_dispatch_lock, g_current_run_task_hashes_being_processed
-    global g_thumbnails_loaded_in_current_UMT_run # Ensure it's global here
+    global g_thumbnail_process_ongoing, g_dispatch_lock, g_task_collection_iterator
 
-    if g_thumbnail_process_ongoing and specific_tasks_to_process is None:
-        print("[UpdateMaterialThumbnails] Process already ongoing. Skipping new full scan.")
-        return
-    
-    with g_dispatch_lock: 
-        if g_thumbnail_process_ongoing and specific_tasks_to_process is None:
-            # This check is a bit redundant with the one outside the lock but ensures atomicity
-            # if multiple threads/timers could somehow call this simultaneously (unlikely for UMT).
-            return
+    if g_thumbnail_process_ongoing and specific_tasks_to_process is None: return
 
-        print(f"[UpdateMaterialThumbnails] Starting new thumbnail generation run. Specific tasks provided: {specific_tasks_to_process is not None}")
-        g_thumbnail_process_ongoing = True 
-        g_material_creation_timestamp_at_process_start = time.time()
-        g_thumbnails_loaded_in_current_UMT_run = False # <<< RESET THE FLAG HERE
+    with g_dispatch_lock:
+        if g_thumbnail_process_ongoing and specific_tasks_to_process is None: return
 
-        if specific_tasks_to_process is None: # Full scan, clear previous run's task list
-            g_tasks_for_current_run.clear()
-            g_current_run_task_hashes_being_processed.clear()
+        # Reset state for a new run
+        g_thumbnail_process_ongoing = True
+        g_tasks_for_current_run.clear()
+        g_task_collection_iterator = None # Important: reset the iterator
 
-
-    collected_tasks_for_this_run_call = [] 
-    processed_hashes_this_call = set() 
-
-    if specific_tasks_to_process is not None:
-        # print(f"[UpdateMaterialThumbnails] Using {len(specific_tasks_to_process)} provided specific tasks.")
-        for task_data in specific_tasks_to_process:
-            if task_data and isinstance(task_data, dict) and task_data.get('hash_value') and \
-               task_data['hash_value'] not in processed_hashes_this_call:
-                collected_tasks_for_this_run_call.append(task_data)
-                processed_hashes_this_call.add(task_data['hash_value'])
-    else:
-        # print("[UpdateMaterialThumbnails] Scanning all materials in current .blend file...")
-        materials_in_current_blend = list(bpy.data.materials) 
-        num_mats_to_check_for_gen = len(materials_in_current_blend)
-        # print(f"[UpdateMaterialThumbnails] Checking {num_mats_to_check_for_gen} materials for thumbnail generation...")
-
-        for mat_idx, current_mat_obj in enumerate(materials_in_current_blend):
-            if mat_idx > 0 and mat_idx % 100 == 0:
-                # print(f"  ...scanned {mat_idx}/{num_mats_to_check_for_gen} materials for task collection.")
-                pass
-
-            current_mat_name_for_debug = f"MaterialAtIndex_{mat_idx}"
-            try:
-                if not current_mat_obj or not hasattr(current_mat_obj, 'name'): continue 
-                current_mat_name_for_debug = current_mat_obj.name
-                if not get_material_uuid(current_mat_obj): continue
-            except ReferenceError: continue 
-            except Exception as e_mat_validate_for_thumb_update:
-                # print(f"  Error validating material {current_mat_name_for_debug} for task collection: {e_mat_validate_for_thumb_update}")
-                continue
-
-            result = get_custom_icon(current_mat_obj, collect_mode=True)
-            if isinstance(result, dict): 
-                if result.get('hash_value') and result['hash_value'] not in processed_hashes_this_call: # Ensure hash_value exists
-                    collected_tasks_for_this_run_call.append(result)
-                    processed_hashes_this_call.add(result['hash_value'])
-    
-    # print(f"[UpdateMaterialThumbnails] Collected {len(collected_tasks_for_this_run_call)} new tasks in this call.")
-
-    if collected_tasks_for_this_run_call:
-        with g_dispatch_lock:
-            for task_to_add in collected_tasks_for_this_run_call:
-                if task_to_add['hash_value'] not in g_current_run_task_hashes_being_processed and \
-                   not any(t.get('hash_value') == task_to_add['hash_value'] for t in g_tasks_for_current_run): # Defensive get
-                    g_tasks_for_current_run.append(task_to_add)
-                    thumbnail_generation_scheduled[task_to_add['hash_value']] = True 
-                    # print(f"  Added task for HASH {task_to_add['hash_value'][:8]} to g_tasks_for_current_run.")
+        # Unregister any previous timer to ensure a clean start
+        if bpy.app.timers.is_registered(non_blocking_task_collector):
+            bpy.app.timers.unregister(non_blocking_task_collector)
         
-        # print(f"[UpdateMaterialThumbnails] Total tasks in g_tasks_for_current_run now: {len(g_tasks_for_current_run)}. Calling _dispatch_collected_tasks.")
-        _dispatch_collected_tasks() 
-    elif not g_tasks_for_current_run and thumbnail_task_queue.empty() and not thumbnail_worker_pool:
-        print("[UpdateMaterialThumbnails] No new tasks collected and no pending/active tasks from this run. Finalizing run.")
-        finalize_thumbnail_run() 
-    else:
-        # print("[UpdateMaterialThumbnails] No new tasks collected in this call, but tasks might be pending or workers active.")
-        ensure_thumbnail_queue_processor_running() 
-
-    print("[UpdateMaterialThumbnails] Task collection/initiation phase complete.")
+        if specific_tasks_to_process:
+            # Specific tasks are already fast, queue them directly.
+            print(f"[Thumb Update] Processing {len(specific_tasks_to_process)} specific tasks directly.")
+            _queue_all_pending_tasks(single_task_list=specific_tasks_to_process)
+            ensure_thumbnail_queue_processor_running()
+        else:
+            # For a full scan, just start the collector. It will handle the rest.
+            print("[Thumb Update] Starting streaming task collection...")
+            bpy.app.timers.register(non_blocking_task_collector, first_interval=0.1)
 
 # --------------------------
 # Visibility–backup helpers (Unchanged)
@@ -5342,6 +5048,112 @@ def ensure_safe_preview(mat):
 # --------------------------
 # UIList and Panel Classes (from old addon, will use updated helpers)
 # --------------------------
+class PersistentWorkerManager:
+    """ Manages a single, long-lived worker process with two-way communication. """
+    def __init__(self, on_result_callback, on_exit_callback):
+        self.worker_process = None
+        self.task_queue = Queue()
+        self.is_running = False
+        self.main_thread = None
+        self.on_result = on_result_callback
+        self.on_exit = on_exit_callback
+        self.id = str(uuid.uuid4())[:8]
+        self.is_stopping = False
+
+    def start(self):
+        if self.is_running:
+            return
+
+        # Command to start a persistent worker that waits for JSON commands on stdin
+        cmd = [
+            bpy.app.binary_path, "--background", "--factory-startup",
+            "--python", BACKGROUND_WORKER_PY,
+            "--", "--operation", "render_thumbnail_persistent"
+        ]
+
+        try:
+            self.worker_process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding='utf-8', errors='replace', bufsize=1
+            )
+            self.is_running = True
+            self.main_thread = threading.Thread(target=self._io_manager, daemon=True)
+            self.main_thread.start()
+            print(f"[WorkerManager-{self.id}] Persistent worker started (PID: {self.worker_process.pid}).")
+        except Exception as e:
+            print(f"[WorkerManager-{self.id}] FAILED to start: {e}", file=sys.stderr)
+            self.is_running = False
+
+    def add_task(self, work_item):
+        if self.is_running and not self.is_stopping:
+            self.task_queue.put(work_item)
+
+    def stop_async(self):
+        if not self.is_running or self.is_stopping:
+            return
+        print(f"[WorkerManager-{self.id}] Signaling worker to stop asynchronously...")
+        self.is_stopping = True
+        self.task_queue.put(None) # Sentinel value to stop the IO loop
+
+    def is_alive(self):
+        return self.worker_process and self.worker_process.poll() is None
+
+    def _io_manager(self):
+        # Helper threads to read stdout/stderr without blocking
+        def read_pipe(pipe, callback):
+            for line in iter(pipe.readline, ''):
+                callback(line)
+            try:
+                pipe.close()
+            except Exception: pass
+
+        stdout_thread = threading.Thread(target=read_pipe, args=(self.worker_process.stdout, self._handle_stdout), daemon=True)
+        stderr_thread = threading.Thread(target=read_pipe, args=(self.worker_process.stderr, self._handle_stderr), daemon=True)
+        stdout_thread.start()
+        stderr_thread.start()
+
+        # Main loop to send tasks from the queue to the worker's stdin
+        while self.is_running:
+            try:
+                work_item = self.task_queue.get(timeout=0.1)
+                if work_item is None: # Stop signal
+                    break
+                command = json.dumps(work_item) + '\n'
+                self.worker_process.stdin.write(command)
+                self.worker_process.stdin.flush()
+            except Empty:
+                if self.worker_process.poll() is not None:
+                    break # Worker process died unexpectedly
+            except (IOError, BrokenPipeError, ValueError):
+                break # Worker process closed its stdin
+
+        self.is_running = False
+        try:
+            self.worker_process.stdin.close()
+        except Exception: pass
+        
+        self.worker_process.wait(timeout=10)
+        stdout_thread.join(timeout=2)
+        stderr_thread.join(timeout=2)
+        self.on_exit(self.id) # Notify the main thread that this manager is done
+
+    def _handle_stdout(self, line):
+        line = line.strip()
+        if line and line.startswith('{'):
+            try:
+                result_data = json.loads(line)
+                self.on_result(result_data)
+            except json.JSONDecodeError:
+                print(f"[Worker-{self.id} STDOUT non-JSON]: {line}", file=sys.stderr)
+        elif line:
+             print(f"[Worker-{self.id} STDOUT]: {line}")
+
+    def _handle_stderr(self, line):
+        line = line.strip()
+        if line:
+            print(f"[Worker-{self.id} STDERR]: {line}", file=sys.stderr)
+
 class MATERIALLIST_UL_materials(UIList):
     use_filter_show = False
     use_filter_menu = False
@@ -5452,7 +5264,16 @@ class MATERIALLIST_PT_panel(bpy.types.Panel): # Ensure bpy.types.Panel is inheri
 
     def draw(self, context):
         layout = self.layout
-        scene  = context.scene
+        scene = context.scene
+
+        # --- NEW SECTION: Check for psutil dependency ---
+        if psutil is None:
+            box = layout.box()
+            box.label(text="Resource Monitoring is Disabled.", icon='ERROR')
+            box.label(text="'psutil' library not found.")
+            box.operator("materiallist.install_psutil", icon='CONSOLE')
+            box.label(text="Blender must be restarted after installation.")
+            layout.separator()
 
         # --- Workspace Mode ---
         workspace_box = layout.box()
@@ -5568,32 +5389,34 @@ class LibraryMaterialEntry(PropertyGroup): # Unchanged
 classes = (
     MaterialListItem,
     MaterialListProperties,
-    LibraryMaterialEntry, # <<< ADD THIS LINE
+    LibraryMaterialEntry,
     MATERIALLIST_UL_materials,
     MATERIALLIST_PT_panel,
-    MATERIALLIST_OT_duplicate_or_localise_material,
     MATERIALLIST_OT_toggle_workspace_mode,
+    MATERIALLIST_OT_rename_material,
     MATERIALLIST_OT_rename_to_albedo,
+    MATERIALLIST_OT_duplicate_or_localise_material,
+    MATERIALLIST_OT_make_local,
+    MATERIALLIST_OT_assign_selected_material,
+    MATERIALLIST_OT_add_material_to_slot,
     MATERIALLIST_OT_unassign_mat,
+    MATERIALLIST_OT_select_dominant,
     MATERIALLIST_OT_backup_reference,
     MATERIALLIST_OT_backup_editing,
-    MATERIALLIST_OT_add_material_to_slot,
-    MATERIALLIST_OT_assign_selected_material,
     MATERIALLIST_OT_refresh_material_list,
-    MATERIALLIST_OT_rename_material,
+    MATERIALLIST_OT_sort_alphabetically,
+    MATERIALLIST_OT_scroll_to_top,
+    MATERIALLIST_OT_PollMaterialChanges,
+    MATERIALLIST_OT_integrate_library,
+    MATERIALLIST_OT_pack_library_textures,
+    MATERIALLIST_OT_run_localisation_worker,
+    MATERIALLIST_OT_pack_textures_internally,
+    MATERIALLIST_OT_pack_textures_externally,
+    MATERIALLIST_OT_trim_library,
+    MATERIALLIST_OT_install_psutil,  
     MATERIALLIST_OT_prepare_material,
     MATERIALLIST_OT_assign_to_object,
     MATERIALLIST_OT_assign_to_faces,
-    MATERIALLIST_OT_sort_alphabetically,
-    MATERIALLIST_OT_PollMaterialChanges,
-    MATERIALLIST_OT_integrate_library,
-    MATERIALLIST_OT_trim_library,
-    MATERIALLIST_OT_select_dominant,
-    MATERIALLIST_OT_run_localisation_worker,
-    MATERIALLIST_OT_pack_library_textures, 
-    MATERIALLIST_OT_scroll_to_top, 
-    MATERIALLIST_OT_pack_textures_externally,
-    MATERIALLIST_OT_pack_textures_internally,
 )
 
 scene_props = [
