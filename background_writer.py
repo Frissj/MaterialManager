@@ -841,103 +841,106 @@ def cleanup_hashing_scene_bundle():
         print(f"[Hash Cleanup] Error removing hashing scene: {e}")
 
     g_hashing_scene_bundle = None
+    
+def main_render_thumbnail_batch(args_batch_render):
+    """
+    [DEFINITIVE FIX] Processes a batch of thumbnail tasks without re-calculating hashes.
 
-def main_render_thumbnail_batch(args_batch_render): # Mostly same as before
-    print(f"[BG Worker - Thumb Batch Op] STARTING Batch. AddonData: {args_batch_render.addon_data_root}", file=sys.stderr)
-    global ICON_TEMPLATE_FILE_WORKER, THUMBNAIL_SIZE_WORKER
+    This version TRUSTS the hash value provided by the main addon. It no longer
+    performs its own hashing, which eliminates any possible inconsistencies between
+    the main session and the worker environment. This is the key to solving the
+    missing thumbnail problem for local materials that have been modified but not yet saved.
+    """
+    global ICON_TEMPLATE_FILE_WORKER, THUMBNAIL_SIZE_WORKER, persistent_icon_template_scene_worker
+
+    # --- Setup ---
+    # Initialize paths and load the task list from the command-line arguments.
     ICON_TEMPLATE_FILE_WORKER = os.path.join(args_batch_render.addon_data_root, "icon_generation_template.blend")
     THUMBNAIL_SIZE_WORKER = args_batch_render.thumbnail_size
     json_output_payload = {"results": []}
 
-    if not os.path.exists(ICON_TEMPLATE_FILE_WORKER):
-        print(f"[BG Worker - Thumb Batch Op] FATAL: Icon template missing: '{ICON_TEMPLATE_FILE_WORKER}'.", file=sys.stderr)
-        # Populate errors for all tasks if template is missing
-        try: tasks_for_early_failure = json.loads(args_batch_render.tasks_json)
-        except: tasks_for_early_failure = []
-        for task_info in tasks_for_early_failure:
+    try:
+        tasks_to_process_in_batch = json.loads(args_batch_render.tasks_json)
+    except json.JSONDecodeError as e_json:
+        print(f"[BG Worker] FATAL: Could not decode tasks_json: {e_json}", file=sys.stderr)
+        # Attempt to create error results for all tasks if possible
+        json_output_payload["error"] = "tasks_json_decode_error"
+        json_output_payload["message"] = str(e_json)
+        print(json.dumps(json_output_payload))
+        sys.stdout.flush()
+        return 1
+
+    # --- Template Loading ---
+    # Load the dedicated scene for rendering thumbnails.
+    render_scene_instance_for_batch = load_icon_template_scene_bg_worker()
+    if not render_scene_instance_for_batch:
+        print(f"[BG Worker] FATAL: Failed to load icon template scene. Batch fails.", file=sys.stderr)
+        for task_info in tasks_to_process_in_batch:
             json_output_payload["results"].append({
-                "hash_value": task_info.get('hash_value', f"NO_HASH_TPL_MISSING_{str(uuid.uuid4())[:4]}"),
-                "thumb_path": task_info.get('thumb_path', "NO_PATH_TPL_MISSING"),
-                "status": "failure", "reason": "worker_icon_template_file_missing"
+                "hash_value": task_info.get('hash_value', 'unknown'),
+                "status": "failure", "reason": "worker_template_scene_load_failed"
             })
         print(json.dumps(json_output_payload))
         sys.stdout.flush()
         return 1
 
-    try: tasks_to_process_in_batch = json.loads(args_batch_render.tasks_json)
-    except json.JSONDecodeError as e_json:
-        print(f"[BG Worker - Thumb Batch Op] FATAL: Could not decode tasks_json: {e_json}", file=sys.stderr)
-        json_output_payload["error"] = "tasks_json_decode_error"; json_output_payload["message"] = str(e_json)
-        print(json.dumps(json_output_payload)); sys.stdout.flush()
-        return 1
-    
-    if not tasks_to_process_in_batch:
-        print("[BG Worker - Thumb Batch Op] No tasks in JSON. Exiting gracefully.", file=sys.stderr)
-        print(json.dumps(json_output_payload)); sys.stdout.flush()
-        return 0
-
-    render_scene_instance_for_batch = load_icon_template_scene_bg_worker()
-    if not render_scene_instance_for_batch:
-        print(f"[BG Worker - Thumb Batch Op] FATAL: Failed to load icon template scene. Batch fails.", file=sys.stderr)
-        for task_info in tasks_to_process_in_batch:
-            json_output_payload["results"].append({
-                "hash_value": task_info.get('hash_value', f"NO_HASH_SCENE_FAIL_{str(uuid.uuid4())[:4]}"),
-                "thumb_path": task_info.get('thumb_path', "NO_PATH_SCENE_FAIL"),
-                "status": "failure", "reason": "worker_template_scene_load_failed"
-            })
-        print(json.dumps(json_output_payload)); sys.stdout.flush()
-        return 1
-    
-    # Pre-fill results with failure status
+    # --- CORE FIX: Process tasks without re-hashing ---
     for task_info in tasks_to_process_in_batch:
-         json_output_payload["results"].append({
-            "hash_value": task_info.get('hash_value'), "thumb_path": task_info.get('thumb_path'),
-            "status": "failure", "reason": "processing_not_attempted_or_early_exit"
-        })
+        # Get all necessary info directly from the task dictionary sent by the main addon.
+        task_hash = task_info.get('hash_value')
+        task_mat_uuid = task_info.get('mat_uuid')
+        task_thumb_path = task_info.get('thumb_path') # The worker will save to this exact path.
 
-    for task_index, current_task_info in enumerate(tasks_to_process_in_batch):
-        current_task_result_dict = json_output_payload["results"][task_index] # Get the pre-filled dict
-        task_hash = current_task_info.get('hash_value')
-        task_thumb_path = current_task_info.get('thumb_path')
-        task_mat_uuid = current_task_info.get('mat_uuid')
-        task_mat_name_debug = current_task_info.get('mat_name_debug', 'N/A_DEBUG_NAME')
+        # Basic validation of the task data.
+        if not all([task_hash, task_mat_uuid, task_thumb_path]):
+            json_output_payload["results"].append({
+                "hash_value": task_hash or 'unknown_task',
+                "status": "failure", "reason": "incomplete_task_data"
+            })
+            continue
 
-        if not all([task_hash, task_thumb_path, task_mat_uuid]):
-            current_task_result_dict["reason"] = "Task data incomplete"; continue
+        # Find the material in the blend file using its UUID.
+        material_object_to_render = get_material_by_uuid_worker(task_mat_uuid)
 
-        material_object_to_render = bpy.data.materials.get(task_mat_uuid) # Primary lookup by UUID (datablock name)
-        if not material_object_to_render: # Fallback by custom prop "uuid"
-            material_object_to_render = next((m for m in bpy.data.materials if m.get("uuid") == task_mat_uuid), None)
-        if not material_object_to_render and task_mat_name_debug: # Fallback by debug name if UUID fails (less reliable)
-             material_object_to_render = bpy.data.materials.get(task_mat_name_debug)
-        
         if not material_object_to_render:
-            current_task_result_dict["reason"] = f"Material UUID '{task_mat_uuid}' not found"; continue
-        
-        try:
-            render_success = create_sphere_preview_thumbnail_bg_worker(
-                material_object_to_render, task_thumb_path, render_scene_instance_for_batch
-            )
-            if render_success and os.path.exists(task_thumb_path) and os.path.getsize(task_thumb_path) > 0:
-                current_task_result_dict["status"] = "success"
-                current_task_result_dict["reason"] = "thumbnail_rendered_successfully"
-            else:
-                current_task_result_dict["reason"] = "render_call_ok_but_file_invalid_or_missing" if render_success else "render_function_returned_false"
-        except Exception as e_render_item:
-            current_task_result_dict["reason"] = f"exception_in_render_call:_{type(e_render_item).__name__}"
-            print(f"  EXCEPTION rendering task for {task_mat_name_debug}: {e_render_item}", file=sys.stderr)
-            traceback.print_exc(file=sys.stderr)
-    
-    # Cleanup the scene used for this batch
-    global persistent_icon_template_scene_worker # Ensure it's the global being cleared
+            json_output_payload["results"].append({
+                "hash_value": task_hash,
+                "status": "failure", "reason": f"material_uuid_not_found_{task_mat_uuid}"
+            })
+            continue
+
+        # ** NO HASHING IS PERFORMED HERE. **
+        # The worker proceeds directly to rendering the found material and saves it
+        # using the path/hash provided by the main addon, solving the stale file problem.
+        render_success = create_sphere_preview_thumbnail_bg_worker(
+            material_object_to_render, task_thumb_path, render_scene_instance_for_batch
+        )
+
+        # Report the outcome for this specific task.
+        if render_success:
+            json_output_payload["results"].append({
+                "hash_value": task_hash,
+                "status": "success", "reason": "thumbnail_rendered_successfully"
+            })
+        else:
+            json_output_payload["results"].append({
+                "hash_value": task_hash,
+                "status": "failure", "reason": "render_function_returned_false"
+            })
+
+    # --- Cleanup ---
+    # Clean up the template scene that was loaded for this batch.
     if persistent_icon_template_scene_worker and persistent_icon_template_scene_worker.name in bpy.data.scenes:
-        try: bpy.data.scenes.remove(persistent_icon_template_scene_worker, do_unlink=True)
-        except Exception as e_clean: print(f"[BG Worker - Thumb Batch Op] Error cleaning template scene: {e_clean}", file=sys.stderr)
+        try:
+            bpy.data.scenes.remove(persistent_icon_template_scene_worker, do_unlink=True)
+        except Exception:
+            pass
     persistent_icon_template_scene_worker = None
 
-    print(json.dumps(json_output_payload)); sys.stdout.flush()
+    # Print the final JSON results to stdout for the main addon to read.
+    print(json.dumps(json_output_payload))
+    sys.stdout.flush()
     return 0
-# --- End Thumbnail Rendering ---
 
 # --- Library Merging Functions ---
 def _load_and_process_blend_file(filepath, is_target_file): # Same as before
@@ -1673,93 +1676,205 @@ def main_process_pack_internal(args):
     return 0
 
 # --- Main Entry Point for the Worker Script ---
+      
 def main_worker_entry():
+    """
+    [COMPLETE & CORRECTED] Main entry point for the worker script.
+
+    This function parses the command-line arguments to determine the requested
+    operation. It dispatches to the `persistent_worker_loop` for the new,
+    long-lived worker model, while retaining the ability to call other
+    single-shot operations like 'merge_library'.
+    """
+    # This sleep can be helpful to ensure Blender is fully initialized in background mode.
+    time.sleep(0.2)
     print(f"[BG Worker - Entry] Worker started. Full argv: {sys.argv}", file=sys.stderr)
-    time.sleep(0.2) # Brief pause
-    print(f"[BG Worker - Entry] Current .blend file context (loaded by -b): {bpy.data.filepath if bpy.data.filepath else 'Unsaved/None'}", file=sys.stderr)
+    print(f"[BG Worker - Entry] Current .blend file context (if any loaded by -b): {bpy.data.filepath if bpy.data.filepath else 'Unsaved/None'}", file=sys.stderr)
     sys.stderr.flush()
 
     parser = argparse.ArgumentParser(description="Background worker for MaterialList Addon.")
-    parser.add_argument("--operation", 
-                        choices=['merge_library', 'render_thumbnail', 
-                                 'pack_to_external', 'pack_to_internal'], # Added new choices
-                        required=True,
-                        help="The operation to perform.")
+    parser.add_argument(
+        "--operation",
+        choices=['merge_library', 'render_thumbnail', 'pack_to_external', 'pack_to_internal', 'render_thumbnail_persistent'],
+        required=True,
+        help="The operation to perform."
+    )
 
     # Args for 'merge_library'
     parser.add_argument("--transfer", help="Path to the transfer .blend file (for merge_library).")
     parser.add_argument("--target", help="Path to the target (main) library .blend file (for merge_library).")
     parser.add_argument("--db", help="Path to the addon's SQLite database file (for merge_library timestamps).")
 
-    # Args for 'render_thumbnail'
+    # Args for 'render_thumbnail' (single-shot batch)
     parser.add_argument("--tasks-json", help="JSON string detailing a batch of thumbnail tasks.")
     parser.add_argument("--addon-data-root", help="Path to the addon's main data directory (for icon_template.blend).")
     parser.add_argument("--thumbnail-size", type=int, help="Target size for thumbnails.")
 
     # Args for 'pack_to_external' and 'pack_to_internal'
-    # Note: --target-blend-file is implicitly handled by Blender's -b <file> argument
-    # We still add it for clarity in arg parsing if needed, but it's the one bpy.data.filepath refers to.
-    # parser.add_argument("--target-blend-file", help="Path to the .blend file to be processed (for packing ops).") # Redundant if -b is used
     parser.add_argument("--library-file", help="Path to the central material_library.blend (for identifying lib materials).")
     parser.add_argument("--external-dir-name", help="Directory name for unpacking external textures (for pack_to_external).")
-    
+
     try:
         # Get arguments after '--'
         app_args = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else sys.argv[1:]
     except ValueError:
-        app_args = sys.argv[1:] # Fallback if '--' is missing
+        app_args = sys.argv[1:]
         print(f"[BG Worker - Entry] Warning: '--' separator not found in sys.argv. Parsing from sys.argv[1:].", file=sys.stderr)
 
     if not app_args:
-        print(f"[BG Worker - Entry] No arguments provided to worker after '--' (or at all). Exiting.", file=sys.stderr)
+        print(f"[BG Worker - Entry] No arguments provided to worker. Exiting.", file=sys.stderr)
         parser.print_help(sys.stderr)
         return 1 # Error: No arguments
 
     args = parser.parse_args(app_args)
 
-    if args.operation == 'merge_library':
-        if not all([args.transfer, args.target]): # --db is optional for the operation itself
-            parser.error("--transfer and --target arguments are required for 'merge_library' operation.")
-            # parser.error exits with code 2
-        return main_merge_library(args)
+    # --- Operation Dispatcher ---
+
+    if args.operation == 'render_thumbnail_persistent':
+        # Enter the new, long-lived worker loop. This function will not return.
+        persistent_worker_loop()
+        return 0 # Should not be reached, as the loop is infinite until stdin closes.
+
     elif args.operation == 'render_thumbnail':
-        if not args.tasks_json:
-            parser.error("--tasks-json argument is required for 'render_thumbnail' operation.")
-        if not all([args.addon_data_root, args.thumbnail_size is not None]):
-             parser.error("--addon-data-root and --thumbnail-size are required with --tasks-json for 'render_thumbnail'.")
+        # This is the original, single-shot batch operation.
+        if not all([args.tasks_json, args.addon_data_root, args.thumbnail_size is not None]):
+            parser.error("--tasks-json, --addon-data-root, and --thumbnail-size are required for 'render_thumbnail'.")
         return main_render_thumbnail_batch(args)
-    elif args.operation == 'pack_to_external': # New operation
-        if not args.external_dir_name or not args.library_file:
-            # Note: target_blend_file is assumed to be loaded by Blender via `-b`
-            parser.error("--external-dir-name and --library-file are required for 'pack_to_external'.")
+
+    elif args.operation == 'merge_library':
+        if not all([args.transfer, args.target]):
+            parser.error("--transfer and --target are required for 'merge_library'.")
+        return main_merge_library(args)
+
+    elif args.operation == 'pack_to_external':
+        if not all([args.library_file, args.external_dir_name]):
+            parser.error("--library-file and --external-dir-name are required for 'pack_to_external'.")
         return main_process_pack_external(args)
-    elif args.operation == 'pack_to_internal': # New operation
+
+    elif args.operation == 'pack_to_internal':
         if not args.library_file:
-            # Note: target_blend_file is assumed to be loaded by Blender via `-b`
             parser.error("--library-file is required for 'pack_to_internal'.")
         return main_process_pack_internal(args)
+
     else:
-        # This case should ideally not be reached due to 'choices' in parser
+        # This case should not be reached due to 'choices' in the parser.
         print(f"[BG Worker - Entry] Unknown operation specified: {args.operation}", file=sys.stderr)
-        return 1 # General error
+        return 1
+      
+def persistent_worker_loop():
+    """ [CORRECTED & COMPLETE] Main loop for a persistent worker. Includes original tasks in output. """
+    global ICON_TEMPLATE_FILE_WORKER, THUMBNAIL_SIZE_WORKER, persistent_icon_template_scene_worker
+
+    current_blend_file = None
+    render_scene_for_batch = None
+
+    for line in sys.stdin:
+        try:
+            command = json.loads(line)
+            
+            # Command format: {"blend_file": "path", "tasks": [...], "addon_data_root": "path", "size": 128}
+            blend_file_path = command.get("blend_file")
+            tasks = command.get("tasks", [])
+            addon_data = command.get("addon_data_root")
+            thumb_size = command.get("size")
+            
+            if not all([blend_file_path, tasks, addon_data, thumb_size]):
+                continue
+
+            # Load new .blend file and template ONLY if they have changed
+            if blend_file_path != current_blend_file:
+                # A new file is being processed, we must clear the old state.
+                bpy.ops.wm.open_mainfile(filepath=blend_file_path)
+                current_blend_file = blend_file_path
+                
+                # Force template scene to reload for the new context
+                if persistent_icon_template_scene_worker and persistent_icon_template_scene_worker.name in bpy.data.scenes:
+                    try: bpy.data.scenes.remove(persistent_icon_template_scene_worker)
+                    except Exception: pass
+                persistent_icon_template_scene_worker = None
+                render_scene_for_batch = None # Mark scene as invalid
+            
+            if not render_scene_for_batch:
+                ICON_TEMPLATE_FILE_WORKER = os.path.join(addon_data, "icon_generation_template.blend")
+                THUMBNAIL_SIZE_WORKER = thumb_size
+                render_scene_for_batch = load_icon_template_scene_bg_worker()
+            
+            # --- THE CORE CHANGE IS HERE ---
+            # The output payload must include the original task list for the main addon to process retries.
+            json_output_payload = {
+                "original_tasks": tasks,
+                "results": []
+            }
+
+            if not render_scene_for_batch:
+                for task in tasks:
+                    json_output_payload["results"].append({"hash_value": task.get('hash_value'), "status": "failure", "reason": "template_load_failed"})
+            else:
+                for task in tasks:
+                    # Use a helper that is safe to call within the worker script
+                    material_to_render = get_material_by_uuid_worker(task.get('mat_uuid'))
+                    
+                    if not material_to_render:
+                        json_output_payload["results"].append({"hash_value": task.get('hash_value'), "status": "failure", "reason": "material_not_found"})
+                        continue
+                    
+                    success = create_sphere_preview_thumbnail_bg_worker(
+                        material_to_render, task.get('thumb_path'), render_scene_for_batch
+                    )
+                    
+                    if success and os.path.isfile(task.get('thumb_path')) and os.path.getsize(task.get('thumb_path')) > 0:
+                        json_output_payload["results"].append({"hash_value": task.get('hash_value'), "status": "success"})
+                    else:
+                        json_output_payload["results"].append({"hash_value": task.get('hash_value'), "status": "failure", "reason": "render_call_or_file_invalid"})
+
+            # Write the result of this entire batch to stdout
+            print(json.dumps(json_output_payload))
+            sys.stdout.flush()
+
+        except json.JSONDecodeError:
+            continue
+        except Exception as e:
+            print(f"[Persistent Worker ERROR]: {e}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+            sys.stderr.flush()
+
+# This is a local helper for the worker script, to avoid dependency on the main addon's cache.
+def get_material_by_uuid_worker(uuid_str: str):
+    if not uuid_str: return None
+    mat_by_name = bpy.data.materials.get(uuid_str)
+    if mat_by_name: return mat_by_name
+    for m in bpy.data.materials:
+        if m.get("uuid") == uuid_str:
+            return m
+    return None
+
+def get_material_by_uuid_worker(uuid_str: str):
+    """
+    A helper function for the worker script to find a material by its UUID.
+    It first checks the material's datablock name and then falls back to checking
+    the 'uuid' custom property.
+    """
+    if not uuid_str:
+        return None
+    # Primary lookup by datablock name, which should be the UUID for managed materials.
+    mat_by_name = bpy.data.materials.get(uuid_str)
+    if mat_by_name:
+        return mat_by_name
+    # Fallback to iterating and checking the custom property.
+    for m in bpy.data.materials:
+        if m.get("uuid") == uuid_str:
+            return m
+    return None
 
 if __name__ == "__main__":
-    final_exit_code = 1 # Default to error
+    # The __main__ block remains the same, it just needs to call the new entry point.
+    final_exit_code = 1
     try:
-        final_exit_code = main_worker_entry()
-    except SystemExit as e_sysexit: # Catches parser.error() which raises SystemExit
-        final_exit_code = e_sysexit.code if isinstance(e_sysexit.code, int) else 1 # Use exit code from SystemExit
-        if final_exit_code != 0: # Argparse usually prints its own error message to stderr
-            print(f"[BG Worker - __main__] Argparse SystemExit with code: {final_exit_code}.", file=sys.stderr)
-    except Exception as e_global_worker:
-        print(f"[BG Worker - __main__] === Unhandled Global Exception in Worker === ", file=sys.stderr)
-        print(f"Error Type: {type(e_global_worker).__name__}", file=sys.stderr)
-        print(f"Error Message: {e_global_worker}", file=sys.stderr)
+        final_exit_code = main_worker_entry() or 0
+    except Exception as e:
+        print(f"[BG Worker __main__] Unhandled Exception: {e}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
-        final_exit_code = 3 # Different code for unhandled exceptions in worker's main
+        final_exit_code = 3
     finally:
-        print(f"[BG Worker - __main__] Worker process exiting with code: {final_exit_code}", file=sys.stderr)
-        sys.stderr.flush() # Ensure all error logs are written
-        sys.stdout.flush() # Ensure any JSON payload is written
-        bpy.ops.wm.quit_blender() # Ensure Blender quits cleanly after script execution
+        bpy.ops.wm.quit_blender()
         sys.exit(final_exit_code)
