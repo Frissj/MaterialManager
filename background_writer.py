@@ -15,17 +15,6 @@ import math
 import bmesh
 from contextlib import contextmanager
 from collections import deque
-import numpy as np
-try:
-    # Use the much faster xxhash library if available
-    import xxhash
-    HASHER = xxhash.xxh64
-    print("[BG Worker] Using xxhash for hashing.", file=sys.stderr)
-except ImportError:
-    # Fallback to the standard (slower) md5 if xxhash is not installed
-    import hashlib
-    HASHER = hashlib.md5
-    print("[BG Worker] xxhash not found, falling back to md5.", file=sys.stderr)
 # sys is already imported
 
 # --- Globals for Thumbnail Rendering Part (initialized by functions) ---
@@ -36,7 +25,6 @@ HASH_VERSION_FOR_WORKER = "v_RTX_REMIX_PBR_COMPREHENSIVE_2_CONTENT_ONLY"
 global_hash_cache = {}
 material_hashes = {}
 g_hashing_scene_bundle = None
-HASHER = None 
 
 def _float_repr(f):
     """Consistent, standardized string representation for float values."""
@@ -158,7 +146,7 @@ def _hash_image(img, image_hash_cache):
     if hasattr(img, 'packed_file') and img.packed_file and hasattr(img.packed_file, 'data') and img.packed_file.data:
         try:
             data_to_hash = bytes(img.packed_file.data[:131072])
-            calculated_digest = HASHER(data_to_hash).hexdigest() # MODIFIED LINE
+            calculated_digest = hashlib.md5(data_to_hash).hexdigest()
         except Exception as e_pack:
             print(f"[_hash_image Warning] Hash failed on packed data for '{img.name}': {e_pack}", file=sys.stderr)
 
@@ -168,13 +156,13 @@ def _hash_image(img, image_hash_cache):
             if os.path.isfile(resolved_abs_path):
                 with open(resolved_abs_path, "rb") as f:
                     data_from_file = f.read(131072)
-                calculated_digest = HASHER(data_from_file).hexdigest() # MODIFIED LINE
+                calculated_digest = hashlib.md5(data_from_file).hexdigest()
         except Exception as e_file:
             print(f"[_hash_image Warning] Hash failed on file '{img.filepath_raw}': {e_file}", file=sys.stderr)
 
     if calculated_digest is None:
         fallback_data = f"FALLBACK|{getattr(img, 'name_full', 'N/A')}|{getattr(img, 'source', 'N/A')}"
-        calculated_digest = HASHER(fallback_data.encode('utf-8')).hexdigest() # MODIFIED LINE
+        calculated_digest = hashlib.md5(fallback_data.encode('utf-8')).hexdigest()
 
     if image_hash_cache is not None:
         image_hash_cache[cache_key] = calculated_digest
@@ -350,6 +338,8 @@ def get_material_hash(mat, force=True, image_hash_cache=None):
     groups and their exposed slider values, including a specific fix for uniform
     parameter nodes (ShaderNodeValue).
     """
+    # Incrementing the version ensures that any materials hashed with older,
+    # incorrect logic will be re-hashed and their thumbnails updated correctly.
     HASH_VERSION = "v_STRUCTURAL_ROBUST_TRAVERSAL_2"
 
     if not mat:
@@ -438,9 +428,7 @@ def get_material_hash(mat, force=True, image_hash_cache=None):
 
         # Final hash calculation
         final_recipe_string = "|||".join(recipe_parts)
-        # --- MODIFIED LINE ---
-        digest = HASHER(final_recipe_string.encode('utf-8')).hexdigest()
-        # --- END MODIFICATION ---
+        digest = hashlib.md5(final_recipe_string.encode('utf-8')).hexdigest()
 
         if mat_uuid:
             global_hash_cache[mat_uuid] = digest
@@ -1271,33 +1259,56 @@ def _handle_texture_packing_internal(material):
 
 def calculate_image_pixel_hash(blender_image_object):
     """
-    [OPTIMIZED] Calculates a hash for a Blender image's pixel data directly
-    from memory using numpy for maximum speed. Avoids all disk I/O.
+    Calculates a hash for a Blender image's pixel data by saving it temporarily to PNG format.
+    Returns MD5 hex digest or a string indicating error/no data.
     """
     if not blender_image_object:
+        print(f"    [PackExternal - HashCalc] Received None image object.", file=sys.stderr)
         return "ERROR_NONE_IMAGE_OBJECT"
-        
-    if not blender_image_object.has_data or blender_image_object.size[0] == 0 or blender_image_object.size[1] == 0:
-        return f"NO_DATA_FOR_IMAGE_{''.join(filter(str.isalnum, blender_image_object.name[:30]))}"
+
+    if blender_image_object.size[0] == 0 or blender_image_object.size[1] == 0 or not blender_image_object.has_data:
+        no_data_hash_val = f"NO_DATA_FOR_IMAGE_{''.join(filter(str.isalnum, blender_image_object.name_full[:30]))}"
+        print(f"    [PackExternal - HashCalc] Image '{blender_image_object.name_full}' has no data or zero dimensions. Hash: {no_data_hash_val}", file=sys.stderr)
+        return no_data_hash_val
+
+    temp_img_copy = None
+    temp_dir_for_hash = tempfile.mkdtemp(prefix="bml_hash_temp_")
+    sanitized_img_name_part = "".join(c if c.isalnum() else '_' for c in blender_image_object.name_full[:40])
+    temp_filepath_for_hash = os.path.join(temp_dir_for_hash, f"temp_hash_{sanitized_img_name_part}.png")
 
     try:
-        # Pre-allocate a numpy array of the correct size.
-        # This is faster than creating a Python list and appending.
-        pixel_count = len(blender_image_object.pixels)
-        pixels = np.empty(pixel_count, dtype=np.float32)
+        temp_img_copy = blender_image_object.copy()
+        if not temp_img_copy:
+            raise RuntimeError(f"Image.copy() failed for '{blender_image_object.name_full}'.")
         
-        # Directly copy all pixel data into the numpy array in one fast C-level operation.
-        blender_image_object.pixels.foreach_get(pixels)
+        temp_img_copy.name = f"__{blender_image_object.name_full[:50]}_temp_hash_copy"
+        temp_img_copy.filepath_raw = temp_filepath_for_hash 
+        temp_img_copy.file_format = 'PNG'
+        
+        temp_img_copy.save_render(filepath=temp_filepath_for_hash)
 
-        # The hasher operates on the raw byte representation of the entire pixel array.
-        hasher = HASHER() # Use the globally defined hasher (xxhash or md5)
-        hasher.update(pixels.tobytes())
-        return hasher.hexdigest()
+        hasher = hashlib.md5()
+        with open(temp_filepath_for_hash, 'rb') as f_hash:
+            while True:
+                data_chunk = f_hash.read(65536)
+                if not data_chunk:
+                    break
+                hasher.update(data_chunk)
+        hex_digest = hasher.hexdigest()
+        return hex_digest
 
-    except Exception as e:
-        print(f"  [PackExternal - HashCalc] ERROR calculating in-memory pixel hash for '{blender_image_object.name}': {e}", file=sys.stderr)
-        traceback.print_exc(file=sys.stderr)
-        return f"ERROR_HASH_CALC_{''.join(filter(str.isalnum, blender_image_object.name[:30]))}"
+    except Exception as e_hash_calc:
+        print(f"    [PackExternal - HashCalc] ERROR calculating pixel hash for '{blender_image_object.name_full}': {type(e_hash_calc).__name__} - {e_hash_calc}", file=sys.stderr)
+        return f"ERROR_HASH_CALC_{''.join(filter(str.isalnum, blender_image_object.name_full[:30]))}"
+    finally:
+        if temp_img_copy and temp_img_copy.name in bpy.data.images: # Check if it exists before removal
+            try:
+                temp_img_copy.user_clear()
+                bpy.data.images.remove(temp_img_copy, do_unlink=True)
+            except Exception: # Ignore errors during cleanup of temp object
+                pass 
+        if os.path.exists(temp_dir_for_hash): # Check existence before rmtree
+            shutil.rmtree(temp_dir_for_hash, ignore_errors=True)
 
 def hash_file_on_disk(filepath_on_disk):
     """Calculates MD5 hash of a file already on disk."""
@@ -1665,14 +1676,21 @@ def main_process_pack_internal(args):
     return 0
 
 # --- Main Entry Point for the Worker Script ---
+      
 def main_worker_entry():
     """
-    [FINAL VERSION] Main entry point for the worker script.
-    Injects required python path, then initializes modules and dispatches operations.
-    All GPU configuration has been removed.
+    [COMPLETE & CORRECTED] Main entry point for the worker script.
+
+    This function parses the command-line arguments to determine the requested
+    operation. It dispatches to the `persistent_worker_loop` for the new,
+    long-lived worker model, while retaining the ability to call other
+    single-shot operations like 'merge_library'.
     """
     # This sleep can be helpful to ensure Blender is fully initialized in background mode.
     time.sleep(0.2)
+    print(f"[BG Worker - Entry] Worker started. Full argv: {sys.argv}", file=sys.stderr)
+    print(f"[BG Worker - Entry] Current .blend file context (if any loaded by -b): {bpy.data.filepath if bpy.data.filepath else 'Unsaved/None'}", file=sys.stderr)
+    sys.stderr.flush()
 
     parser = argparse.ArgumentParser(description="Background worker for MaterialList Addon.")
     parser.add_argument(
@@ -1681,73 +1699,68 @@ def main_worker_entry():
         required=True,
         help="The operation to perform."
     )
-    # Argument to receive the site-packages path from the main addon
-    parser.add_argument("--python-path", help="An additional path to add to sys.path for module lookups.")
-    
-    # All other existing arguments
+
+    # Args for 'merge_library'
     parser.add_argument("--transfer", help="Path to the transfer .blend file (for merge_library).")
     parser.add_argument("--target", help="Path to the target (main) library .blend file (for merge_library).")
     parser.add_argument("--db", help="Path to the addon's SQLite database file (for merge_library timestamps).")
+
+    # Args for 'render_thumbnail' (single-shot batch)
     parser.add_argument("--tasks-json", help="JSON string detailing a batch of thumbnail tasks.")
     parser.add_argument("--addon-data-root", help="Path to the addon's main data directory (for icon_template.blend).")
     parser.add_argument("--thumbnail-size", type=int, help="Target size for thumbnails.")
+
+    # Args for 'pack_to_external' and 'pack_to_internal'
     parser.add_argument("--library-file", help="Path to the central material_library.blend (for identifying lib materials).")
     parser.add_argument("--external-dir-name", help="Directory name for unpacking external textures (for pack_to_external).")
 
-    # Parse arguments immediately to get the python_path
     try:
+        # Get arguments after '--'
         app_args = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else sys.argv[1:]
     except ValueError:
         app_args = sys.argv[1:]
-    
+        print(f"[BG Worker - Entry] Warning: '--' separator not found in sys.argv. Parsing from sys.argv[1:].", file=sys.stderr)
+
+    if not app_args:
+        print(f"[BG Worker - Entry] No arguments provided to worker. Exiting.", file=sys.stderr)
+        parser.print_help(sys.stderr)
+        return 1 # Error: No arguments
+
     args = parser.parse_args(app_args)
 
-    # --- THIS IS THE CRITICAL FIX ---
-    # 1. Inject the path at the absolute earliest opportunity.
-    if args.python_path and os.path.isdir(args.python_path) and args.python_path not in sys.path:
-        sys.path.insert(0, args.python_path)
-        print(f"[BG Worker - Entry] Injected python path: {args.python_path}", file=sys.stderr)
+    # --- Operation Dispatcher ---
 
-    # 2. NOW that the path is injected, attempt to import xxhash and set the global.
-    global HASHER
-    try:
-        import xxhash
-        HASHER = xxhash.xxh64
-        print("[BG Worker - Entry] Using xxhash for hashing.", file=sys.stderr)
-    except ImportError:
-        import hashlib
-        HASHER = hashlib.md5
-        print("[BG Worker - Entry] xxhash not found, falling back to md5.", file=sys.stderr)
-    # --- END FIX ---
-
-    print(f"[BG Worker - Entry] Worker started. Full argv: {sys.argv}", file=sys.stderr)
-    print(f"[BG Worker - Entry] Current .blend file context (if any loaded by -b): {bpy.data.filepath if bpy.data.filepath else 'Unsaved/None'}", file=sys.stderr)
-    sys.stderr.flush()
-
-    # --- Operation Dispatcher (now free of GPU logic) ---
     if args.operation == 'render_thumbnail_persistent':
+        # Enter the new, long-lived worker loop. This function will not return.
         persistent_worker_loop()
-        return 0
+        return 0 # Should not be reached, as the loop is infinite until stdin closes.
+
     elif args.operation == 'render_thumbnail':
+        # This is the original, single-shot batch operation.
         if not all([args.tasks_json, args.addon_data_root, args.thumbnail_size is not None]):
             parser.error("--tasks-json, --addon-data-root, and --thumbnail-size are required for 'render_thumbnail'.")
         return main_render_thumbnail_batch(args)
+
     elif args.operation == 'merge_library':
         if not all([args.transfer, args.target]):
             parser.error("--transfer and --target are required for 'merge_library'.")
         return main_merge_library(args)
+
     elif args.operation == 'pack_to_external':
         if not all([args.library_file, args.external_dir_name]):
             parser.error("--library-file and --external-dir-name are required for 'pack_to_external'.")
         return main_process_pack_external(args)
+
     elif args.operation == 'pack_to_internal':
         if not args.library_file:
             parser.error("--library-file is required for 'pack_to_internal'.")
         return main_process_pack_internal(args)
+
     else:
+        # This case should not be reached due to 'choices' in the parser.
         print(f"[BG Worker - Entry] Unknown operation specified: {args.operation}", file=sys.stderr)
         return 1
-        
+      
 def persistent_worker_loop():
     """ [CORRECTED & COMPLETE] Main loop for a persistent worker. Includes original tasks in output. """
     global ICON_TEMPLATE_FILE_WORKER, THUMBNAIL_SIZE_WORKER, persistent_icon_template_scene_worker
