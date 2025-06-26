@@ -463,26 +463,10 @@ def update_material_timestamp_in_db(db_path, material_uuid):
 
 # --- Thumbnail Rendering Functions ---
 def load_icon_template_scene_bg_worker():
-    global persistent_icon_template_scene_worker, ICON_TEMPLATE_FILE_WORKER, THUMBNAIL_SIZE_WORKER
+    global ICON_TEMPLATE_FILE_WORKER, THUMBNAIL_SIZE_WORKER
     preview_obj_name = "IconPreviewObject"
     camera_obj_name = "IconTemplateCam"
     expected_template_scene_name = "IconTemplateScene"
-
-    if persistent_icon_template_scene_worker:
-        try:
-            if persistent_icon_template_scene_worker.name in bpy.data.scenes and \
-               bpy.data.scenes[persistent_icon_template_scene_worker.name] == persistent_icon_template_scene_worker and \
-               persistent_icon_template_scene_worker.objects.get(preview_obj_name) and \
-               persistent_icon_template_scene_worker.camera and \
-               persistent_icon_template_scene_worker.camera.name == camera_obj_name:
-                return persistent_icon_template_scene_worker
-            if persistent_icon_template_scene_worker.name in bpy.data.scenes:
-                 if len(bpy.data.scenes) > 1 or (bpy.context.window and bpy.context.window.scene != persistent_icon_template_scene_worker): # Basic safety
-                    try: bpy.data.scenes.remove(persistent_icon_template_scene_worker, do_unlink=True)
-                    except: pass
-            persistent_icon_template_scene_worker = None
-        except (ReferenceError, AttributeError, Exception):
-            persistent_icon_template_scene_worker = None
 
     if not ICON_TEMPLATE_FILE_WORKER or not os.path.exists(ICON_TEMPLATE_FILE_WORKER):
         print(f"[BG Worker - Template] FATAL: Icon template file missing or path not set: '{ICON_TEMPLATE_FILE_WORKER}'", file=sys.stderr)
@@ -539,15 +523,13 @@ def load_icon_template_scene_bg_worker():
             if hasattr(eevee_settings_obj, 'taa_render_samples'): eevee_settings_obj.taa_render_samples = 16
             elif hasattr(eevee_settings_obj, 'samples'): eevee_settings_obj.samples = 16
         
-        persistent_icon_template_scene_worker = loaded_scene_from_blend_file
-        return persistent_icon_template_scene_worker
+        return loaded_scene_from_blend_file
     except Exception as e:
         print(f"[BG Worker - Template] CRITICAL ERROR loading/configuring template: {e}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
         if loaded_scene_from_blend_file and loaded_scene_from_blend_file.name in bpy.data.scenes:
             try: bpy.data.scenes.remove(loaded_scene_from_blend_file, do_unlink=True)
             except Exception: pass
-        persistent_icon_template_scene_worker = None
         return None
 
 def _get_all_image_nodes_recursive(node_tree):
@@ -1763,7 +1745,7 @@ def main_worker_entry():
       
 def persistent_worker_loop():
     """ [CORRECTED & COMPLETE] Main loop for a persistent worker. Includes original tasks in output. """
-    global ICON_TEMPLATE_FILE_WORKER, THUMBNAIL_SIZE_WORKER, persistent_icon_template_scene_worker
+    global ICON_TEMPLATE_FILE_WORKER, THUMBNAIL_SIZE_WORKER
 
     current_blend_file = None
     render_scene_for_batch = None
@@ -1787,11 +1769,6 @@ def persistent_worker_loop():
                 bpy.ops.wm.open_mainfile(filepath=blend_file_path)
                 current_blend_file = blend_file_path
                 
-                # Force template scene to reload for the new context
-                if persistent_icon_template_scene_worker and persistent_icon_template_scene_worker.name in bpy.data.scenes:
-                    try: bpy.data.scenes.remove(persistent_icon_template_scene_worker)
-                    except Exception: pass
-                persistent_icon_template_scene_worker = None
                 render_scene_for_batch = None # Mark scene as invalid
             
             if not render_scene_for_batch:
@@ -1799,7 +1776,6 @@ def persistent_worker_loop():
                 THUMBNAIL_SIZE_WORKER = thumb_size
                 render_scene_for_batch = load_icon_template_scene_bg_worker()
             
-            # --- THE CORE CHANGE IS HERE ---
             # The output payload must include the original task list for the main addon to process retries.
             json_output_payload = {
                 "original_tasks": tasks,
